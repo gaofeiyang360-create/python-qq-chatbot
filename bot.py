@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 #CODE BY 飞扬nb
 import sys
 import asyncio
@@ -13,36 +14,50 @@ from typing import Optional, Dict, Any, List, Tuple
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 
-# ==================== 配置文件加载 ====================
+# ==================== 配置文件加载（实时读取） ====================
 if getattr(sys, 'frozen', False):
     BASE_DIR = Path(sys.executable).parent
 else:
     BASE_DIR = Path(__file__).parent
 
 CONFIG_FILE = BASE_DIR / "config.json"
+
+# 默认配置（仅用于首次生成）
 DEFAULT_CONFIG = {
     "bots": [
         {
-            "APP_ID": "YOUAPPID",
-            "APP_SECRET": "YOUSECRET"
+            "APP_ID": "APPID",
+            "APP_SECRET": "APPSECRET"
         }
     ],
-    "AI_API_URL": "YOUBASEURL",
-    "AI_API_KEY": "YOUKEY",
     "AI_MAX_MSG_LEN": 1500,
-    "MODEL_JUDGE": "deepseek-v4-flash",
-    "MODEL_MAIN": "deepseek-v4-pro",
-    "MODEL_VISION": "qwen-vl-max",
-    "BOT_NAME": "AI缺省名称",
     "CONTEXT_LIMIT": 15,
     "JUDGE_CONTEXT_LIMIT": 10,
     "COOLDOWN_SECONDS": 2,
     "COMPRESS_THRESHOLD": 25,
     "MAX_WORKERS": 20,
-    "SYSTEM_PROMPT": "自定义提示词"  # 新增：自定义系统提示词字段
+    "SYSTEM_PROMPT": "提示词",
+    "models": {
+        "judge": {
+            "base_url": "BASEURL",
+            "api_key": "KEY",
+            "model_name": "MODEL"
+        },
+        "main": {
+            "base_url": "BASEURL",
+            "api_key": "KEY",
+            "model_name": "MODEL"
+        },
+        "vision": {
+            "base_url": "BASEURL",
+            "api_key": "KEY",
+            "model_name": "MODEL"
+        }
+    }
 }
 
-def load_config():
+def get_config():
+    """实时读取配置文件（每次调用均从磁盘读取）"""
     if not CONFIG_FILE.exists():
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=2)
@@ -51,29 +66,52 @@ def load_config():
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
-config = load_config()
+# ==================== 配置项动态获取函数 ====================
+def get_bots():
+    """仅在启动时调用，返回机器人列表（不动态更新）"""
+    return get_config().get("bots", [])
 
-# ==================== 配置赋值 ====================
-BOTS = config.get("bots", [])
+def get_ai_max_msg_len():
+    return get_config().get("AI_MAX_MSG_LEN", 1500)
+
+def get_context_limit():
+    return get_config().get("CONTEXT_LIMIT", 15)
+
+def get_judge_context_limit():
+    return get_config().get("JUDGE_CONTEXT_LIMIT", 10)
+
+def get_cooldown_seconds():
+    return get_config().get("COOLDOWN_SECONDS", 2)
+
+def get_compress_threshold():
+    return get_config().get("COMPRESS_THRESHOLD", 25)
+
+def get_max_workers():
+    return get_config().get("MAX_WORKERS", 20)
+
+def get_system_prompt():
+    return get_config().get("SYSTEM_PROMPT", "you are a helpful ai")
+
+def get_model_config(model_key: str) -> Dict[str, str]:
+    """返回指定模型的基础配置（base_url, api_key, model_name）"""
+    config = get_config()
+    models = config.get("models", {})
+    if model_key not in models:
+        raise ValueError(f"配置中未找到模型 '{model_key}' 的配置，请检查 models 字段。")
+    return models[model_key]
+
+# ==================== 启动时固定配置 ====================
+# BOTS 只在启动时读取，运行时不再更新
+BOTS = get_bots()
 if not BOTS:
     print("错误：配置文件中没有机器人信息，请添加 'bots' 数组。")
     sys.exit(1)
 
-AI_API_URL = config["AI_API_URL"]
-AI_API_KEY = config["AI_API_KEY"]
-AI_MAX_MSG_LEN = config["AI_MAX_MSG_LEN"]
-MODEL_JUDGE = config["MODEL_JUDGE"]
-MODEL_MAIN = config["MODEL_MAIN"]
-MODEL_VISION = config["MODEL_VISION"]
-BOT_NAME = config.get("BOT_NAME", "灵泽集AI")
-CONTEXT_LIMIT = config["CONTEXT_LIMIT"]
-JUDGE_CONTEXT_LIMIT = config["JUDGE_CONTEXT_LIMIT"]
-COOLDOWN_SECONDS = config["COOLDOWN_SECONDS"]
-COMPRESS_THRESHOLD = config["COMPRESS_THRESHOLD"]
-MAX_WORKERS = config.get("MAX_WORKERS", 20)
-SYSTEM_PROMPT = config.get("SYSTEM_PROMPT", "you are a helpful ai")  # 读取自定义提示词
+# BOT_NAME 由 WebSocket Ready 事件动态设置，不读取配置文件
+BOT_NAME = "灵泽集AI"  # 默认值，后续会被覆盖
 
-# ==================== 自定义线程池 ====================
+# 线程池在启动时创建，大小使用启动时的配置
+MAX_WORKERS = get_max_workers()
 _executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
 # ==================== 数据存储路径 ====================
@@ -274,7 +312,8 @@ def append_message(thread_key: str, role: str, content: str, is_summary: bool = 
         if m.get("is_summary"):
             last_summary_idx = i
     msg_count = len(hist) - (last_summary_idx + 1)
-    if msg_count > COMPRESS_THRESHOLD and not hist[-1].get("is_summary"):
+    threshold = get_compress_threshold()
+    if msg_count > threshold and not hist[-1].get("is_summary"):
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
@@ -282,7 +321,11 @@ def append_message(thread_key: str, role: str, content: str, is_summary: bool = 
         except:
             pass
 
-def get_history(thread_key: str, max_len: int = AI_MAX_MSG_LEN, limit: int = CONTEXT_LIMIT) -> List[Dict]:
+def get_history(thread_key: str, max_len: int = None, limit: int = None) -> List[Dict]:
+    if max_len is None:
+        max_len = get_ai_max_msg_len()
+    if limit is None:
+        limit = get_context_limit()
     hist = load_history(thread_key)
     if not hist:
         return []
@@ -429,7 +472,7 @@ async def recognize_media(media_type: str, media_url: str, filename: str = "媒�
 
     try:
         messages = [{"role": "user", "content": content_parts}]
-        result = await call_ai(messages, MODEL_VISION, temperature=0.3)
+        result = await call_ai(messages, "vision", temperature=0.3)
         if result and "（AI 未返回有效内容）" not in result:
             set_cached_media(cache_key, result, media_type, filename, media_url, height, width)
             return result
@@ -463,25 +506,21 @@ def parse_forwarded_chatlog(text: str) -> Tuple[str, List[Dict]]:
                 filename = filename_match.group(1) if filename_match else "未知文件"
                 raw_type = type_match.group(1) if type_match else ""
                 media_type = "unknown"
-                # 优先根据文件扩展名判断是否为图片或视频
                 ext = Path(filename).suffix.lower()
                 if ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg']:
                     media_type = "image"
                 elif ext in ['.mp4', '.avi', '.mov', '.wmv', '.flv', '.mkv', '.webm']:
                     media_type = "video"
                 else:
-                    # 若扩展名无法判断，再根据文本描述
                     if "图片" in raw_type:
                         media_type = "image"
                     elif "视频" in raw_type:
                         media_type = "video"
                     elif "文件" in raw_type:
-                        # 文本文件判断
                         if ext in TEXT_FILE_EXTS:
                             media_type = "text_file"
                         else:
                             media_type = "binary_file"
-                # 注意：如果 raw_type 本身就写了“图片”或“视频”，上面已经覆盖了
 
                 size_info = size_match.group(1) if size_match else ""
                 height = int(dimension_match.group(2)) if dimension_match else 0
@@ -518,7 +557,6 @@ def is_text_file(filename: str) -> bool:
     ext = Path(filename).suffix.lower()
     return ext in TEXT_FILE_EXTS
 
-# 判断是否为图片或视频扩展名
 def is_image_or_video_file(filename: str) -> bool:
     ext = Path(filename).suffix.lower()
     return ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.mkv', '.webm']
@@ -624,7 +662,6 @@ async def fetch_webpage_content(url: str) -> Optional[str]:
             print(f"[网页] 检测到媒体类型: {media_type}，返回 __MEDIA_URL__")
             return f"__MEDIA_URL__:{media_type}:{url}"
 
-        # 非媒体，获取完整文本
         response = await loop.run_in_executor(
             _executor,
             lambda: requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
@@ -645,19 +682,25 @@ async def summarize_content_if_needed(content: str, max_len: int = 5000, summary
         return content
     prompt = f"请将以下网页内容压缩为一篇摘要，字数控制在{summary_len}字以内：\n{content[:3000]}"
     try:
-        summary = await call_ai([{"role": "user", "content": prompt}], MODEL_JUDGE, temperature=0.3)
+        summary = await call_ai([{"role": "user", "content": prompt}], "judge", temperature=0.3)
         return summary if summary else content[:200] + "...（摘要生成失败）"
     except:
         return content[:200] + "...（摘要生成失败）"
 
-# ---------- AI 调用 ----------
-async def call_ai(messages: List[Dict], model: str, stream: bool = False, temperature: float = 0.7) -> str:
+# ---------- AI 调用（使用模型标识，实时读取配置） ----------
+async def call_ai(messages: List[Dict], model_key: str, stream: bool = False, temperature: float = 0.7) -> str:
+    """调用AI接口，model_key 为 'judge', 'main', 'vision' 等"""
+    model_cfg = get_model_config(model_key)
+    base_url = model_cfg["base_url"]
+    api_key = model_cfg["api_key"]
+    model_name = model_cfg["model_name"]
+
     headers = {
-        "Authorization": f"Bearer {AI_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
     payload = {
-        "model": model,
+        "model": model_name,
         "messages": messages,
         "stream": stream,
         "temperature": temperature,
@@ -667,10 +710,10 @@ async def call_ai(messages: List[Dict], model: str, stream: bool = False, temper
     loop = asyncio.get_event_loop()
     try:
         start_time = time.time()
-        print(f"[AI调用] 开始请求，模型: {model}")
+        print(f"[AI调用] 开始请求，模型: {model_key} -> {model_name}")
         response = await loop.run_in_executor(
             _executor,
-            lambda: requests.post(AI_API_URL, json=payload, headers=headers, timeout=360)
+            lambda: requests.post(base_url, json=payload, headers=headers, timeout=360)
         )
         elapsed = time.time() - start_time
         print(f"[AI调用] 请求完成，耗时 {elapsed:.2f} 秒")
@@ -747,7 +790,7 @@ async def should_reply_in_group(history: List[Dict], current_message: str, menti
     ]
 
     try:
-        result = await call_ai(judge_messages, MODEL_JUDGE, stream=False, temperature=0.2)
+        result = await call_ai(judge_messages, "judge", stream=False, temperature=0.2)
         result_clean = result.strip().lower()
         print(f"[AI Judge 结果] {result_clean}")
         return "是" in result_clean or "yes" in result_clean
@@ -767,7 +810,8 @@ async def generate_and_insert_summary(thread_key: str, retries: int = 3):
                 if msg.get("is_summary"):
                     last_summary_idx = i
             start_idx = last_summary_idx + 1
-            if len(hist) - start_idx <= COMPRESS_THRESHOLD:
+            threshold = get_compress_threshold()
+            if len(hist) - start_idx <= threshold:
                 return
             end_idx = len(hist) - 10
             if end_idx <= start_idx:
@@ -791,7 +835,7 @@ async def generate_and_insert_summary(thread_key: str, retries: int = 3):
             try:
                 summary = await call_ai(
                     [{"role": "user", "content": f"请将以下对话历史压缩为一篇摘要，字数控制在200-400字之间：\n{content_for_summary}"}],
-                    MODEL_JUDGE,
+                    "judge",
                     temperature=0.3
                 )
                 if summary and "（AI 未返回有效内容）" not in summary:
@@ -811,7 +855,7 @@ async def generate_and_insert_summary(thread_key: str, retries: int = 3):
             for i, msg in enumerate(hist):
                 if msg.get("is_summary"):
                     last_summary_idx = i
-            if len(hist) - (last_summary_idx + 1) <= COMPRESS_THRESHOLD:
+            if len(hist) - (last_summary_idx + 1) <= threshold:
                 return
             if hist and hist[-1].get("is_summary"):
                 return
@@ -831,6 +875,7 @@ async def generate_and_insert_summary(thread_key: str, retries: int = 3):
 
 # ---------- 生成回复（包含群记忆） ----------
 async def generate_reply(thread_key: str, user_message: str, username: str, msg_type: str, raw_message_json: str) -> str:
+    global BOT_NAME
     # 全局记忆
     global_mem = get_global_memory()
     if global_mem:
@@ -884,9 +929,10 @@ async def generate_reply(thread_key: str, user_message: str, username: str, msg_
     else:
         memory_text = f"【全局长期记忆】\n{global_memory_text}"
 
-    # 使用配置文件中的 SYSTEM_PROMPT 作为基础提示词
+    # 从配置文件实时获取 SYSTEM_PROMPT
+    sys_prompt = get_system_prompt()
     system_prompt = (
-        f"{SYSTEM_PROMPT}\n"  # 配置文件中的自定义提示词
+        f"{sys_prompt}\n"
         f"你的名字是 {BOT_NAME}，用户可能会用这个名字称呼你。\n"
         f"{memory_text}\n"
         "在群聊中，如果需要提及某位用户，请直接使用“@用户名”的形式，例如“@张三”。\n"
@@ -905,7 +951,7 @@ async def generate_reply(thread_key: str, user_message: str, username: str, msg_
     if not messages or messages[-1]["role"] != "user":
         messages.append({"role": "user", "content": user_message})
     try:
-        reply = await call_ai(messages, MODEL_MAIN, stream=False)
+        reply = await call_ai(messages, "main", stream=False)
         return reply
     except Exception as e:
         print(f"[AI Reply Error] {e}")
@@ -945,7 +991,7 @@ async def organize_global_memory(retries: int = 3):
             )
             result = await call_ai(
                 [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
-                MODEL_MAIN,
+                "main",
                 temperature=0.3
             )
             lines = result.strip().split('\n')
@@ -1015,7 +1061,7 @@ async def organize_qun_memory(group_id: str, retries: int = 3):
             )
             result = await call_ai(
                 [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
-                MODEL_MAIN,
+                "main",
                 temperature=0.3
             )
             lines = result.strip().split('\n')
@@ -1107,7 +1153,7 @@ async def auto_manage_memory(thread_key: str, user_message: str, reply: str, con
     )
 
     try:
-        result = await call_ai([{"role": "user", "content": prompt}], MODEL_JUDGE, temperature=0.2)
+        result = await call_ai([{"role": "user", "content": prompt}], "judge", temperature=0.2)
         json_match = re.search(r'```json\s*(\{.*?\})\s*```', result, re.DOTALL)
         if json_match:
             json_str = json_match.group(1)
@@ -1448,7 +1494,7 @@ async def handle_processed_message(parsed: Dict, thread_key: str, merged_content
     elif msg_type == "group" and parsed.get("is_at_me", False):
         should_reply = True
     elif msg_type == "group" and not parsed.get("is_at_me", False):
-        recent_history = get_recent_history(thread_key, JUDGE_CONTEXT_LIMIT)
+        recent_history = get_recent_history(thread_key, get_judge_context_limit())
         should_reply = await should_reply_in_group(recent_history, merged_content, mentions)
         print(f"[AI Judge] 判定结果: {should_reply}")
 
@@ -1606,18 +1652,15 @@ async def handle_message(data: Dict, bot_client: BotClient):
         if not url:
             continue
 
-        # 根据 content_type 或扩展名判断媒体类型
         media_type = None
         if content_type.startswith("image/"):
             media_type = "image"
         elif content_type.startswith("video/"):
             media_type = "video"
         elif content_type == "file":
-            # 对于 file 类型，根据扩展名判断
             media_type = get_media_type_from_filename(filename)
 
         if media_type:
-            # 图片或视频：走媒体识别流程
             height = att.get("height", 0)
             width = att.get("width", 0)
             summary = await recognize_media(media_type, url, filename, height, width)
@@ -1631,7 +1674,6 @@ async def handle_message(data: Dict, bot_client: BotClient):
                 block = f"[收到视频：{filename}]===视频{filename}摘要开始===\n{summary}\n===视频{filename}摘要结束==="
             extra_content_parts.append(block)
         elif content_type == "file" and is_text_file(filename):
-            # 文本文件：下载内容
             try:
                 response = await loop.run_in_executor(
                     _executor,
@@ -1649,9 +1691,7 @@ async def handle_message(data: Dict, bot_client: BotClient):
                     extra_content_parts.append(f"[文件：{filename}] 下载失败")
             except Exception as e:
                 extra_content_parts.append(f"[文件：{filename}] 下载异常: {e}")
-        # 其他类型附件忽略
 
-    # 引用媒体
     ref_media = parsed.get("ref_media", [])
     for ref in ref_media:
         content_type = ref.get("content_type", "")
@@ -1926,7 +1966,8 @@ async def handle_message(data: Dict, bot_client: BotClient):
         del pending_timers[thread_key]
 
     async def timer_task():
-        await asyncio.sleep(COOLDOWN_SECONDS)
+        cooldown = get_cooldown_seconds()
+        await asyncio.sleep(cooldown)
         if thread_key in pending_queues and pending_queues[thread_key]:
             if thread_key in pending_process_tasks:
                 old_task = pending_process_tasks[thread_key]
@@ -1975,8 +2016,7 @@ async def main_connection(bot_client: BotClient):
                 user_info = ready_data.get("user", {})
                 bot_username = user_info.get("username", "灵泽集AI")
                 bot_client.bot_name = bot_username
-                if BOT_NAME == "灵泽集AI":
-                    BOT_NAME = bot_username
+                BOT_NAME = bot_username  # 使用 WebSocket 返回的名称，不读取配置文件
                 print(f"[收到 Ready] 机器人名字: {bot_username}")
                 break
             else:
