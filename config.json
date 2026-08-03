@@ -1,21 +1,32 @@
 {
   "bots": [
     {
-      "APP_ID": "YOUAPPID",
-      "APP_SECRET": "YOUSECRET"
+      "APP_ID": "APPID",
+      "APP_SECRET": "APPSECRET"
     }
   ],
-  "AI_API_URL": "YOUBASEURL",
-  "AI_API_KEY": "YOUKEY",
   "AI_MAX_MSG_LEN": 1500,
-  "MODEL_JUDGE": "deepseek-v4-flash",
-  "MODEL_MAIN": "deepseek-v4-pro",
-  "MODEL_VISION": "qwen-vl-max",
-  "BOT_NAME": "AI缺省名称",
   "CONTEXT_LIMIT": 15,
   "JUDGE_CONTEXT_LIMIT": 10,
   "COOLDOWN_SECONDS": 2,
   "COMPRESS_THRESHOLD": 25,
   "MAX_WORKERS": 20,
-  "SYSTEM_PROMPT": "自定义提示词"
+  "SYSTEM_PROMPT": "提示词",
+  "models": {
+    "judge": {
+      "base_url": "BASEURL",
+      "api_key": "KEY",
+      "model_name": "MODEL"
+    },
+    "main": {
+      "base_url": "BASEURL",
+      "api_key": "KEY",
+      "model_name": "MODEL"
+    },
+    "vision": {
+      "base_url": "BASEURL",
+      "api_key": "KEY",
+      "model_name": "MODEL"
+    }
+  }
 }
