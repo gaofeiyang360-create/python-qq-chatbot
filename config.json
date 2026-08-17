@@ -1,8 +1,13 @@
 {
   "bots": [
     {
-      "APP_ID": "APPID",
-      "APP_SECRET": "APPSECRET"
+      "APP_ID": "xxx",
+      "APP_SECRET": "xxx",
+      "SYSTEM_PROMPT": "你是一个幽默风趣的AI助手",
+      "ISOLATE_GLOBAL_MEMORY": 0,
+      "ENABLED": 1,
+      "AUTO_WELCOME": 1,
+      "GROUP_MANAGE_WHITELIST": []
     }
   ],
   "AI_MAX_MSG_LEN": 1500,
@@ -11,22 +16,22 @@
   "COOLDOWN_SECONDS": 2,
   "COMPRESS_THRESHOLD": 25,
   "MAX_WORKERS": 20,
-  "SYSTEM_PROMPT": "提示词",
+  "SYSTEM_PROMPT": "you are a helpful ai",
   "models": {
     "judge": {
-      "base_url": "BASEURL",
-      "api_key": "KEY",
-      "model_name": "MODEL"
+      "base_url": "xxx",
+      "api_key": "xxx",
+      "model_name": "deepseek-v4-flash"
     },
     "main": {
-      "base_url": "BASEURL",
-      "api_key": "KEY",
-      "model_name": "MODEL"
+      "base_url": "xxx",
+      "api_key": "xxx",
+      "model_name": "deepseek-v4-pro"
     },
     "vision": {
-      "base_url": "BASEURL",
-      "api_key": "KEY",
-      "model_name": "MODEL"
+      "base_url": "xxx",
+      "api_key": "xxx",
+      "model_name": "qwen-vl-max"
     }
   }
 }

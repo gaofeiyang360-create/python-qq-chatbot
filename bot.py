@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 
 # ==================== 配置文件加载（实时读取） ====================
 if getattr(sys, 'frozen', False):
@@ -21,13 +22,18 @@ else:
     BASE_DIR = Path(__file__).parent
 
 CONFIG_FILE = BASE_DIR / "config.json"
+MIRROR_FILE = BASE_DIR / "mirror.json"
 
-# 默认配置（仅用于首次生成）
 DEFAULT_CONFIG = {
     "bots": [
         {
-            "APP_ID": "APPID",
-            "APP_SECRET": "APPSECRET"
+            "APP_ID": "xxx",
+            "APP_SECRET": "xxx",
+            "SYSTEM_PROMPT": "你是一个幽默风趣的AI助手",
+            "ISOLATE_GLOBAL_MEMORY": 0,
+            "ENABLED": 1,
+            "AUTO_WELCOME": 1,
+            "GROUP_MANAGE_WHITELIST": []   # 新增：群ID白名单，只有在此列表中的群才启用群管理
         }
     ],
     "AI_MAX_MSG_LEN": 1500,
@@ -36,28 +42,27 @@ DEFAULT_CONFIG = {
     "COOLDOWN_SECONDS": 2,
     "COMPRESS_THRESHOLD": 25,
     "MAX_WORKERS": 20,
-    "SYSTEM_PROMPT": "提示词",
+    "SYSTEM_PROMPT": "you are a helpful ai",
     "models": {
         "judge": {
-            "base_url": "BASEURL",
-            "api_key": "KEY",
-            "model_name": "MODEL"
+            "base_url": "xxx",
+            "api_key": "xxx",
+            "model_name": "deepseek-v4-flash"
         },
         "main": {
-            "base_url": "BASEURL",
-            "api_key": "KEY",
-            "model_name": "MODEL"
+            "base_url": "xxx",
+            "api_key": "xxx",
+            "model_name": "deepseek-v4-pro"
         },
         "vision": {
-            "base_url": "BASEURL",
-            "api_key": "KEY",
-            "model_name": "MODEL"
+            "base_url": "xxx",
+            "api_key": "xxx",
+            "model_name": "qwen-vl-max"
         }
     }
 }
 
 def get_config():
-    """实时读取配置文件（每次调用均从磁盘读取）"""
     if not CONFIG_FILE.exists():
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=2)
@@ -66,10 +71,51 @@ def get_config():
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
-# ==================== 配置项动态获取函数 ====================
 def get_bots():
-    """仅在启动时调用，返回机器人列表（不动态更新）"""
     return get_config().get("bots", [])
+
+def get_bot_isolate_flag(app_id: str) -> bool:
+    bots = get_bots()
+    for bot in bots:
+        if bot.get("APP_ID") == app_id:
+            return bot.get("ISOLATE_GLOBAL_MEMORY", 0) == 1
+    return False
+
+def get_bot_system_prompt(app_id: str) -> Optional[str]:
+    bots = get_bots()
+    for bot in bots:
+        if bot.get("APP_ID") == app_id:
+            return bot.get("SYSTEM_PROMPT")
+    return None
+
+def get_bot_enabled(app_id: str) -> bool:
+    bots = get_bots()
+    for bot in bots:
+        if bot.get("APP_ID") == app_id:
+            return bot.get("ENABLED", 1) == 1
+    return True
+
+def get_bot_auto_welcome(app_id: str) -> bool:
+    bots = get_bots()
+    for bot in bots:
+        if bot.get("APP_ID") == app_id:
+            return bot.get("AUTO_WELCOME", 0) == 1
+    return False
+
+# 新增：获取机器人群管理白名单（群ID列表）
+def get_bot_group_manage_whitelist(app_id: str) -> List[str]:
+    bots = get_bots()
+    for bot in bots:
+        if bot.get("APP_ID") == app_id:
+            return bot.get("GROUP_MANAGE_WHITELIST", [])
+    return []
+
+# 新增：判断指定群是否启用群管理
+def is_group_manage_enabled(app_id: str, group_id: str) -> bool:
+    whitelist = get_bot_group_manage_whitelist(app_id)
+    return group_id in whitelist
+
+# 移除旧的 get_bot_group_manage_enabled 函数（已废弃）
 
 def get_ai_max_msg_len():
     return get_config().get("AI_MAX_MSG_LEN", 1500)
@@ -89,119 +135,150 @@ def get_compress_threshold():
 def get_max_workers():
     return get_config().get("MAX_WORKERS", 20)
 
-def get_system_prompt():
+def get_global_system_prompt():
     return get_config().get("SYSTEM_PROMPT", "you are a helpful ai")
 
 def get_model_config(model_key: str) -> Dict[str, str]:
-    """返回指定模型的基础配置（base_url, api_key, model_name）"""
     config = get_config()
     models = config.get("models", {})
     if model_key not in models:
         raise ValueError(f"配置中未找到模型 '{model_key}' 的配置，请检查 models 字段。")
     return models[model_key]
 
-# ==================== 启动时固定配置 ====================
-# BOTS 只在启动时读取，运行时不再更新
 BOTS = get_bots()
 if not BOTS:
     print("错误：配置文件中没有机器人信息，请添加 'bots' 数组。")
     sys.exit(1)
 
-# BOT_NAME 由 WebSocket Ready 事件动态设置，不读取配置文件
-BOT_NAME = "灵泽集AI"  # 默认值，后续会被覆盖
+BOT_NAME = "灵泽集AI"
 
-# 线程池在启动时创建，大小使用启动时的配置
 MAX_WORKERS = get_max_workers()
 _executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
-# ==================== 数据存储路径 ====================
 MEMORY_FILE = BASE_DIR / "memory.json"
 HISTORY_DIR = BASE_DIR / "history"
 MEDIA_CACHE_DIR = BASE_DIR / "media_cache"
 QUN_MEMORY_DIR = BASE_DIR / "qun_memory"
+C2C_MEMORY_DIR = BASE_DIR / "c2c_memory"
+BOT_MEMORY_DIR = BASE_DIR / "bot_memory"
 HISTORY_DIR.mkdir(exist_ok=True)
 MEDIA_CACHE_DIR.mkdir(exist_ok=True)
 QUN_MEMORY_DIR.mkdir(exist_ok=True)
+C2C_MEMORY_DIR.mkdir(exist_ok=True)
+BOT_MEMORY_DIR.mkdir(exist_ok=True)
 
-# ==================== 迁移旧数据 ====================
 def migrate_old_data():
     old_file = BASE_DIR / "threads.json"
-    if not old_file.exists():
-        return
-    if MEMORY_FILE.exists() and any(HISTORY_DIR.glob("*.json")):
-        return
-    print("[迁移] 检测到旧的 threads.json，正在迁移...")
-    with open(old_file, "r", encoding="utf-8") as f:
-        old = json.load(f)
-    memory_data = {
-        "global_memory": old.get("global_memory", []),
-        "user_mapping": old.get("user_mapping", {})
-    }
-    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(memory_data, f, ensure_ascii=False, indent=2)
-    for key, val in old.items():
-        if key in ("global_memory", "user_mapping"):
-            continue
-        if isinstance(val, dict) and "history" in val:
-            hist_file = HISTORY_DIR / f"{key}.json"
-            with open(hist_file, "w", encoding="utf-8") as f:
-                json.dump(val["history"], f, ensure_ascii=False, indent=2)
-    backup = old_file.with_suffix(".json.bak")
-    old_file.rename(backup)
-    print(f"[迁移] 完成，旧文件备份为 {backup}")
+    if old_file.exists() and not (MEMORY_FILE.exists() and any(HISTORY_DIR.glob("*.json"))):
+        print("[迁移] 检测到旧的 threads.json，正在迁移...")
+        with open(old_file, "r", encoding="utf-8") as f:
+            old = json.load(f)
+        memory_data = {"global_memory": old.get("global_memory", []), "enabled": 1}
+        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(memory_data, f, ensure_ascii=False, indent=2)
+        if "user_mapping" in old and old["user_mapping"]:
+            with open(MIRROR_FILE, "w", encoding="utf-8") as f:
+                json.dump(old["user_mapping"], f, ensure_ascii=False, indent=2)
+        for key, val in old.items():
+            if key in ("global_memory", "user_mapping"):
+                continue
+            if isinstance(val, dict) and "history" in val:
+                hist_file = HISTORY_DIR / f"{key}.json"
+                with open(hist_file, "w", encoding="utf-8") as f:
+                    json.dump(val["history"], f, ensure_ascii=False, indent=2)
+        backup = old_file.with_suffix(".json.bak")
+        old_file.rename(backup)
+        print(f"[迁移] 完成，旧文件备份为 {backup}")
+    else:
+        if MEMORY_FILE.exists():
+            with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if "user_mapping" in data and data["user_mapping"]:
+                with open(MIRROR_FILE, "w", encoding="utf-8") as f:
+                    json.dump(data["user_mapping"], f, ensure_ascii=False, indent=2)
+                del data["user_mapping"]
+                with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                print("[迁移] 已将 user_mapping 迁移到 mirror.json")
 
 migrate_old_data()
 
-# ==================== 全局数据读写 ====================
-def load_memory() -> Dict:
-    if MEMORY_FILE.exists():
-        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"global_memory": [], "user_mapping": {}}
+# ==================== 全局记忆 ====================
+def get_global_memory_file(app_id: Optional[str] = None) -> Path:
+    if app_id:
+        isolate = get_bot_isolate_flag(app_id)
+        if isolate:
+            return BASE_DIR / f"memory_{app_id}.json"
+    return MEMORY_FILE
 
-def save_memory(data: Dict):
-    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+def load_memory(app_id: Optional[str] = None) -> Dict:
+    file_path = get_global_memory_file(app_id)
+    if file_path.exists():
+        with open(file_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"global_memory": [], "enabled": 1}
+
+def save_memory(data: Dict, app_id: Optional[str] = None):
+    file_path = get_global_memory_file(app_id)
+    with open(file_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-def get_global_memory() -> List[str]:
-    return load_memory().get("global_memory", [])
+def get_global_memory(app_id: Optional[str] = None) -> List[str]:
+    return load_memory(app_id).get("global_memory", [])
 
-def set_global_memory(memory_list: List[str]):
-    data = load_memory()
+def set_global_memory(memory_list: List[str], app_id: Optional[str] = None):
+    data = load_memory(app_id)
     data["global_memory"] = memory_list
-    save_memory(data)
+    save_memory(data, app_id)
 
-def add_global_memory(text: str):
-    mem = get_global_memory()
+def add_global_memory(text: str, app_id: Optional[str] = None):
+    mem = get_global_memory(app_id)
     mem.append(text)
-    set_global_memory(mem)
+    set_global_memory(mem, app_id)
 
-def remove_global_memory(index: int) -> bool:
-    mem = get_global_memory()
+def remove_global_memory(index: int, app_id: Optional[str] = None) -> bool:
+    mem = get_global_memory(app_id)
     if 0 <= index < len(mem):
         mem.pop(index)
-        set_global_memory(mem)
+        set_global_memory(mem, app_id)
         return True
     return False
 
-def replace_global_memory(index: int, new_text: str) -> bool:
-    mem = get_global_memory()
+def replace_global_memory(index: int, new_text: str, app_id: Optional[str] = None) -> bool:
+    mem = get_global_memory(app_id)
     if 0 <= index < len(mem):
         mem[index] = new_text
-        set_global_memory(mem)
+        set_global_memory(mem, app_id)
         return True
     return False
 
-def clear_global_memory():
-    set_global_memory([])
+def clear_global_memory(app_id: Optional[str] = None):
+    set_global_memory([], app_id)
+
+def get_global_memory_enabled(app_id: Optional[str] = None) -> bool:
+    return load_memory(app_id).get("enabled", 1) == 1
+
+def set_global_memory_enabled(enabled: bool, app_id: Optional[str] = None):
+    data = load_memory(app_id)
+    data["enabled"] = 1 if enabled else 0
+    save_memory(data, app_id)
+
+# ---------- 用户映射表 ----------
+def load_mirror() -> Dict:
+    if MIRROR_FILE.exists():
+        with open(MIRROR_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+def save_mirror(data: Dict):
+    with open(MIRROR_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 def get_user_mapping() -> Dict:
-    return load_memory().get("user_mapping", {})
+    return load_mirror()
 
 def set_user_mapping(mapping: Dict):
-    data = load_memory()
-    data["user_mapping"] = mapping
-    save_memory(data)
+    save_mirror(mapping)
 
 def get_user_name(qq_id: str) -> Optional[str]:
     return get_user_mapping().get(qq_id)
@@ -259,33 +336,137 @@ def replace_qun_memory(group_id: str, index: int, new_text: str) -> bool:
 def clear_qun_memory(group_id: str):
     set_qun_memory_list(group_id, [])
 
-def enable_qun_memory(group_id: str):
+def get_qun_memory_enabled(group_id: str) -> bool:
+    return get_qun_memory(group_id).get("enabled", 1) == 1
+
+def set_qun_memory_enabled(group_id: str, enabled: bool):
     data = get_qun_memory(group_id)
-    data["enabled"] = 1
+    data["enabled"] = 1 if enabled else 0
     set_qun_memory(group_id, data)
 
-def disable_qun_memory(group_id: str):
-    data = get_qun_memory(group_id)
-    data["enabled"] = 0
-    set_qun_memory(group_id, data)
-
-def transfer_memory_to_global(group_id: str, index: int) -> bool:
+def transfer_memory_to_global(group_id: str, index: int, app_id: Optional[str] = None) -> bool:
     qun_mem = get_qun_memory_list(group_id)
     if 0 <= index < len(qun_mem):
         text = qun_mem.pop(index)
         set_qun_memory_list(group_id, qun_mem)
-        add_global_memory(text)
+        add_global_memory(text, app_id)
         return True
     return False
 
-def transfer_memory_to_qun(group_id: str, index: int) -> bool:
-    global_mem = get_global_memory()
+def transfer_memory_to_qun(group_id: str, index: int, app_id: Optional[str] = None) -> bool:
+    global_mem = get_global_memory(app_id)
     if 0 <= index < len(global_mem):
         text = global_mem.pop(index)
-        set_global_memory(global_mem)
+        set_global_memory(global_mem, app_id)
         add_qun_memory(group_id, text)
         return True
     return False
+
+# ---------- 私聊记忆 ----------
+def get_c2c_memory(user_id: str) -> Dict:
+    file_path = C2C_MEMORY_DIR / f"{user_id}.json"
+    if file_path.exists():
+        with open(file_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"enabled": 1, "memory": []}
+
+def set_c2c_memory(user_id: str, data: Dict):
+    file_path = C2C_MEMORY_DIR / f"{user_id}.json"
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def get_c2c_memory_list(user_id: str) -> List[str]:
+    return get_c2c_memory(user_id).get("memory", [])
+
+def set_c2c_memory_list(user_id: str, memory_list: List[str]):
+    data = get_c2c_memory(user_id)
+    data["memory"] = memory_list
+    set_c2c_memory(user_id, data)
+
+def add_c2c_memory(user_id: str, text: str):
+    mem = get_c2c_memory_list(user_id)
+    mem.append(text)
+    set_c2c_memory_list(user_id, mem)
+
+def remove_c2c_memory(user_id: str, index: int) -> bool:
+    mem = get_c2c_memory_list(user_id)
+    if 0 <= index < len(mem):
+        mem.pop(index)
+        set_c2c_memory_list(user_id, mem)
+        return True
+    return False
+
+def replace_c2c_memory(user_id: str, index: int, new_text: str) -> bool:
+    mem = get_c2c_memory_list(user_id)
+    if 0 <= index < len(mem):
+        mem[index] = new_text
+        set_c2c_memory_list(user_id, mem)
+        return True
+    return False
+
+def clear_c2c_memory(user_id: str):
+    set_c2c_memory_list(user_id, [])
+
+def get_c2c_memory_enabled(user_id: str) -> bool:
+    return get_c2c_memory(user_id).get("enabled", 1) == 1
+
+def set_c2c_memory_enabled(user_id: str, enabled: bool):
+    data = get_c2c_memory(user_id)
+    data["enabled"] = 1 if enabled else 0
+    set_c2c_memory(user_id, data)
+
+# ---------- 机器人记忆 ----------
+def get_bot_memory(app_id: str) -> Dict:
+    file_path = BOT_MEMORY_DIR / f"{app_id}.json"
+    if file_path.exists():
+        with open(file_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"enabled": 1, "memory": []}
+
+def set_bot_memory(app_id: str, data: Dict):
+    file_path = BOT_MEMORY_DIR / f"{app_id}.json"
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def get_bot_memory_list(app_id: str) -> List[str]:
+    return get_bot_memory(app_id).get("memory", [])
+
+def set_bot_memory_list(app_id: str, memory_list: List[str]):
+    data = get_bot_memory(app_id)
+    data["memory"] = memory_list
+    set_bot_memory(app_id, data)
+
+def add_bot_memory(app_id: str, text: str):
+    mem = get_bot_memory_list(app_id)
+    mem.append(text)
+    set_bot_memory_list(app_id, mem)
+
+def remove_bot_memory(app_id: str, index: int) -> bool:
+    mem = get_bot_memory_list(app_id)
+    if 0 <= index < len(mem):
+        mem.pop(index)
+        set_bot_memory_list(app_id, mem)
+        return True
+    return False
+
+def replace_bot_memory(app_id: str, index: int, new_text: str) -> bool:
+    mem = get_bot_memory_list(app_id)
+    if 0 <= index < len(mem):
+        mem[index] = new_text
+        set_bot_memory_list(app_id, mem)
+        return True
+    return False
+
+def clear_bot_memory(app_id: str):
+    set_bot_memory_list(app_id, [])
+
+def get_bot_memory_enabled(app_id: str) -> bool:
+    return get_bot_memory(app_id).get("enabled", 1) == 1
+
+def set_bot_memory_enabled(app_id: str, enabled: bool):
+    data = get_bot_memory(app_id)
+    data["enabled"] = 1 if enabled else 0
+    set_bot_memory(app_id, data)
 
 # ---------- 聊天记录 ----------
 def load_history(thread_key: str) -> List[Dict]:
@@ -399,10 +580,6 @@ def set_cached_media(
     path = get_media_cache_path(cache_key)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-
-def media_has_cache(media_type: str, filename: str, height: int = 0, width: int = 0) -> bool:
-    cache_key = get_media_cache_key(media_type, filename, height, width)
-    return get_media_cache_path(cache_key).exists()
 
 def get_media_cache_key(media_type: str, filename: str, height: int = 0, width: int = 0) -> str:
     raw = f"{media_type}_{filename}_{height}x{width}"
@@ -687,9 +864,8 @@ async def summarize_content_if_needed(content: str, max_len: int = 5000, summary
     except:
         return content[:200] + "...（摘要生成失败）"
 
-# ---------- AI 调用（使用模型标识，实时读取配置） ----------
+# ---------- AI 调用 ----------
 async def call_ai(messages: List[Dict], model_key: str, stream: bool = False, temperature: float = 0.7) -> str:
-    """调用AI接口，model_key 为 'judge', 'main', 'vision' 等"""
     model_cfg = get_model_config(model_key)
     base_url = model_cfg["base_url"]
     api_key = model_cfg["api_key"]
@@ -741,7 +917,7 @@ def compute_similarity(text1: str, text2: str) -> float:
     return intersection / union if union > 0 else 0.0
 
 # ---------- 判断回复 ----------
-async def should_reply_in_group(history: List[Dict], current_message: str, mentions: List[Dict]) -> bool:
+async def should_reply_in_group(history: List[Dict], current_message: str, mentions: List[Dict], app_id: str) -> bool:
     if not history:
         return False
     history_lines = []
@@ -768,8 +944,13 @@ async def should_reply_in_group(history: List[Dict], current_message: str, menti
     history_text = "\n".join(history_lines) if history_lines else "（无上文）"
     current_text = current_message or "（非文本内容）"
 
+    global_sys = get_global_system_prompt()
+    bot_sys = get_bot_system_prompt(app_id)
+    combined_sys = f"{global_sys}\n{bot_sys}" if bot_sys else global_sys
+
     judge_prompt = (
-        "你是一个群聊助手，需要判断机器人是否应该介入回复当前这条消息。\n"
+        f"你是一个群聊助手，需要判断机器人是否应该介入回复当前这条消息。\n"
+        f"机器人的人设和系统提示如下：\n{combined_sys}\n\n"
         "请先阅读以下【上文】（之前的对话历史），然后重点关注【当前消息】。\n"
         f"机器人的名字是 {BOT_NAME}。如果当前消息或上文中明确提到这个机器人名字，或者请求机器人帮助，则应当回复。\n"
         "判断标准：\n"
@@ -873,73 +1054,172 @@ async def generate_and_insert_summary(thread_key: str, retries: int = 3):
             await asyncio.sleep(2)
     print(f"[摘要生成] 线程 {thread_key} 最终失败，已放弃")
 
-# ---------- 生成回复（包含群记忆） ----------
-async def generate_reply(thread_key: str, user_message: str, username: str, msg_type: str, raw_message_json: str) -> str:
+# ---------- 生成回复（含群禁言状态注入 + 工具提示，基于白名单） ----------
+async def generate_reply(thread_key: str, user_message: str, username: str, msg_type: str, raw_message_json: str, bot_client) -> str:
     global BOT_NAME
-    # 全局记忆
-    global_mem = get_global_memory()
-    if global_mem:
-        scored = []
-        for mem in global_mem:
-            score = compute_similarity(user_message, mem)
-            scored.append((score, mem))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        global_memory_lines = []
-        for i, (score, mem) in enumerate(scored):
-            if i == 0:
-                global_memory_lines.append(f"- {mem} （最相关！！！）")
-            elif i == 1:
-                global_memory_lines.append(f"- {mem} （最相关！！！）")
-            else:
-                global_memory_lines.append(f"- {mem}")
-        global_memory_text = "\n".join(global_memory_lines)
-    else:
-        global_memory_text = "（无）"
+    app_id = bot_client.app_id
 
-    # 群记忆（仅群聊）
-    qun_memory_text = ""
+    global_memory_text = "（无）"
+    if get_global_memory_enabled(app_id):
+        global_mem = get_global_memory(app_id)
+        if global_mem:
+            scored = []
+            for mem in global_mem:
+                score = compute_similarity(user_message, mem)
+                scored.append((score, mem))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            lines = []
+            for i, (score, mem) in enumerate(scored):
+                if i == 0:
+                    lines.append(f"- {mem} （最相关！！！）")
+                elif i == 1:
+                    lines.append(f"- {mem} （最相关！！！）")
+                else:
+                    lines.append(f"- {mem}")
+            global_memory_text = "\n".join(lines)
+
+    qun_memory_text = "（无）"
+    c2c_memory_text = "（无）"
+
     if msg_type == "group":
         group_id = thread_key.replace("group_", "")
-        qun_data = get_qun_memory(group_id)
-        if qun_data.get("enabled", 1):
-            qun_mem = qun_data.get("memory", [])
+        if get_qun_memory_enabled(group_id):
+            qun_mem = get_qun_memory_list(group_id)
             if qun_mem:
-                scored_qun = []
+                scored = []
                 for mem in qun_mem:
                     score = compute_similarity(user_message, mem)
-                    scored_qun.append((score, mem))
-                scored_qun.sort(key=lambda x: x[0], reverse=True)
-                qun_lines = []
-                for i, (score, mem) in enumerate(scored_qun):
+                    scored.append((score, mem))
+                scored.sort(key=lambda x: x[0], reverse=True)
+                lines = []
+                for i, (score, mem) in enumerate(scored):
                     if i == 0:
-                        qun_lines.append(f"- {mem} （最相关！！！）")
+                        lines.append(f"- {mem} （最相关！！！）")
                     elif i == 1:
-                        qun_lines.append(f"- {mem} （最相关！！！）")
+                        lines.append(f"- {mem} （最相关！！！）")
                     else:
-                        qun_lines.append(f"- {mem}")
-                qun_memory_text = "\n".join(qun_lines)
-            else:
-                qun_memory_text = "（无）"
-        else:
-            qun_memory_text = "（未启用）"
+                        lines.append(f"- {mem}")
+                qun_memory_text = "\n".join(lines)
+    elif msg_type == "c2c":
+        user_id = thread_key.replace("c2c_", "")
+        if get_c2c_memory_enabled(user_id):
+            c2c_mem = get_c2c_memory_list(user_id)
+            if c2c_mem:
+                scored = []
+                for mem in c2c_mem:
+                    score = compute_similarity(user_message, mem)
+                    scored.append((score, mem))
+                scored.sort(key=lambda x: x[0], reverse=True)
+                lines = []
+                for i, (score, mem) in enumerate(scored):
+                    if i == 0:
+                        lines.append(f"- {mem} （最相关！！！）")
+                    elif i == 1:
+                        lines.append(f"- {mem} （最相关！！！）")
+                    else:
+                        lines.append(f"- {mem}")
+                c2c_memory_text = "\n".join(lines)
 
-    # 构建 system prompt
+    bot_memory_text = "（无）"
+    if get_bot_memory_enabled(app_id):
+        bot_mem = get_bot_memory_list(app_id)
+        if bot_mem:
+            scored = []
+            for mem in bot_mem:
+                score = compute_similarity(user_message, mem)
+                scored.append((score, mem))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            lines = []
+            for i, (score, mem) in enumerate(scored):
+                if i == 0:
+                    lines.append(f"- {mem} （最相关！！！）")
+                elif i == 1:
+                    lines.append(f"- {mem} （最相关！！！）")
+                else:
+                    lines.append(f"- {mem}")
+            bot_memory_text = "\n".join(lines)
+
+    global_sys = get_global_system_prompt()
+    bot_sys = get_bot_system_prompt(app_id)
+    combined_sys = f"{global_sys}\n{bot_sys}" if bot_sys else global_sys
+
+    memory_text = f"【全局长期记忆】\n{global_memory_text}\n"
     if msg_type == "group":
-        memory_text = f"【全局长期记忆】\n{global_memory_text}\n\n【本群长期记忆】\n{qun_memory_text}"
-    else:
-        memory_text = f"【全局长期记忆】\n{global_memory_text}"
+        memory_text += f"【本群长期记忆】\n{qun_memory_text}\n"
+    elif msg_type == "c2c":
+        memory_text += f"【私聊长期记忆】\n{c2c_memory_text}\n"
+    memory_text += f"【机器人专属记忆】\n{bot_memory_text}"
 
-    # 从配置文件实时获取 SYSTEM_PROMPT
-    sys_prompt = get_system_prompt()
+    # 群禁言状态注入（仅当该群在白名单内）
+    group_mute_status_text = ""
+    if msg_type == "group":
+        group_id = thread_key.replace("group_", "")
+        if is_group_manage_enabled(app_id, group_id):
+            try:
+                mute_status = await bot_client.get_group_mute_status(group_id)
+                if mute_status:
+                    global_rule = mute_status.get("global_rule", {})
+                    mode = global_rule.get("mode", "none")
+                    schedule_rules = global_rule.get("schedule_rules", [])
+                    recurring_rules = global_rule.get("recurring_rules", [])
+                    members = mute_status.get("members", [])
+                    lines = []
+                    lines.append(f"【当前群禁言状态】")
+                    lines.append(f"全员禁言模式: {mode}")
+                    if schedule_rules:
+                        lines.append("定时禁言规则:")
+                        for r in schedule_rules:
+                            enabled = "启用" if r.get("enabled") else "禁用"
+                            lines.append(f"  - 任务 {r.get('task_id')}: {r.get('start_at')} ~ {r.get('end_at')} ({enabled})")
+                    if recurring_rules:
+                        lines.append("周期禁言规则:")
+                        for r in recurring_rules:
+                            enabled = "启用" if r.get("enabled") else "禁用"
+                            weekdays = r.get("weekdays", [])
+                            days_str = ",".join(str(d) for d in weekdays)
+                            lines.append(f"  - 任务 {r.get('task_id')}: 每周{ days_str } {r.get('start_time')} ~ {r.get('end_time')} ({enabled})")
+                    if members:
+                        lines.append("当前被禁言成员:")
+                        for m in members:
+                            username_m = m.get("username", "未知")
+                            expire = m.get("mute_expire_at", "永久")
+                            lines.append(f"  - {username_m} (openid: {m.get('member_openid')}) 禁言至 {expire}")
+                    else:
+                        lines.append("当前无被禁言成员。")
+                    group_mute_status_text = "\n".join(lines)
+                else:
+                    group_mute_status_text = "【当前群禁言状态】获取失败"
+            except Exception as e:
+                print(f"[群禁言] 获取状态失败: {e}")
+                group_mute_status_text = "【当前群禁言状态】获取异常"
+
     system_prompt = (
-        f"{sys_prompt}\n"
+        f"{combined_sys}\n"
         f"你的名字是 {BOT_NAME}，用户可能会用这个名字称呼你。\n"
         f"{memory_text}\n"
+        f"{group_mute_status_text}\n"
         "在群聊中，如果需要提及某位用户，请直接使用“@用户名”的形式，例如“@张三”。\n"
         "重要：在回复内容中提及用户时，请仅使用“@用户名”的格式，严禁显示用户的ID（即不要在用户名后面添加括号和ID序列）。\n"
         "用户可能会发送语音消息、文本文件、图片、视频或包含网页链接的消息。语音消息已被自动转写成文字，并显示为 [语音：转文字内容]。文本文件内容会被自动读取并嵌入消息中，格式为 [文件：文件名] 后跟文件内容块。网页内容会被自动获取并嵌入消息中，格式为 [网页内容已自动获取] 或 [网页内容摘要]。图片和视频会被自动识别并生成摘要，格式为 [收到图片：文件名] 或 [收到视频：文件名] 后跟摘要。你可以根据这些内容进行回复。\n"
         "请尽量在回复中适当提及相关用户。"
     )
+
+    # ========== 群管理工具提示（仅当该群在白名单内） ==========
+    if msg_type == "group":
+        group_id = thread_key.replace("group_", "")
+        if is_group_manage_enabled(app_id, group_id):
+            beijing_tz = timezone(timedelta(hours=8))
+            now_beijing = datetime.now(beijing_tz).replace(microsecond=0)
+            now_rfc3339 = now_beijing.isoformat(timespec='seconds')
+            tool_prompt = (
+                f"\n【群管理工具】当前时间（北京时间，RFC3339格式）：{now_rfc3339}\n"
+                "你可以使用禁言工具和解除禁言工具来管理群成员，格式如下：\n"
+                "- 禁言某成员：在回复末尾添加 [禁言：用户id：禁言到期时间（RFC3339格式）] 例如 [禁言：123456：2026-08-17T16:00:00+08:00]\n"
+                "- 解除某成员禁言：在回复末尾添加 [解除：用户id] 例如 [解除：123456]\n"
+                "注意：只能禁言普通成员，不能禁言群主、管理员或机器人。如果禁言操作失败，程序会自动处理错误。\n"
+                "请谨慎使用此工具，只有在用户严重违反群规时才使用。\n"
+            )
+            system_prompt += tool_prompt
 
     print(f"[System Prompt] {system_prompt}")
 
@@ -957,25 +1237,25 @@ async def generate_reply(thread_key: str, user_message: str, username: str, msg_
         print(f"[AI Reply Error] {e}")
         return "抱歉，我暂时无法回复，请稍后再试。"
 
-# ---------- 记忆整理（全局） ----------
-_is_organizing_global = False
+# ---------- 记忆整理 ----------
+_is_organizing_global = {}
 
-async def check_and_organize_global_memory():
-    global _is_organizing_global
-    if _is_organizing_global:
+async def check_and_organize_global_memory(app_id: Optional[str] = None):
+    key = app_id if app_id else "shared"
+    if _is_organizing_global.get(key, False):
         return
-    mem = get_global_memory()
+    mem = get_global_memory(app_id)
     if len(mem) > 15:
-        _is_organizing_global = True
+        _is_organizing_global[key] = True
         try:
-            await organize_global_memory()
+            await organize_global_memory(app_id)
         finally:
-            _is_organizing_global = False
+            _is_organizing_global[key] = False
 
-async def organize_global_memory(retries: int = 3):
+async def organize_global_memory(app_id: Optional[str] = None, retries: int = 3):
     for attempt in range(retries):
         try:
-            old_list = get_global_memory()
+            old_list = get_global_memory(app_id)
             if len(old_list) <= 15:
                 return
             if len(old_list) > 50:
@@ -1008,32 +1288,31 @@ async def organize_global_memory(retries: int = 3):
                     new_list.append(line)
             if not new_list:
                 raise ValueError("整理后无有效记忆")
-            current_list = get_global_memory()
+            current_list = get_global_memory(app_id)
             if len(current_list) > len(old_list):
                 print("[记忆整理] 整理期间有新记忆添加，放弃本次整理")
                 return
             timestamp = time.strftime("%Y%m%d_%H%M")
-            old_file = BASE_DIR / f"old_memory_{timestamp}.json"
+            suffix = f"_{app_id}" if app_id else ""
+            old_file = BASE_DIR / f"old_memory{suffix}_{timestamp}.json"
             with open(old_file, "w", encoding="utf-8") as f:
                 json.dump(old_list, f, ensure_ascii=False, indent=2)
-            set_global_memory(new_list)
-            print(f"[记忆整理] 整理完成，原{len(old_list)}条精简为{len(new_list)}条，旧记忆保存至 {old_file}")
+            set_global_memory(new_list, app_id)
+            print(f"[记忆整理] 完成，原{len(old_list)}条精简为{len(new_list)}条，旧记忆保存至 {old_file}")
             return
         except Exception as e:
             print(f"[记忆整理] 尝试 {attempt+1}/{retries} 失败: {e}")
             await asyncio.sleep(2)
     print("[记忆整理] 最终失败，保留原记忆")
 
-# ---------- 记忆整理（群） ----------
 _is_organizing_qun = {}
 
 async def check_and_organize_qun_memory(group_id: str):
     if _is_organizing_qun.get(group_id, False):
         return
-    qun_data = get_qun_memory(group_id)
-    if not qun_data.get("enabled", 1):
+    if not get_qun_memory_enabled(group_id):
         return
-    mem = qun_data.get("memory", [])
+    mem = get_qun_memory_list(group_id)
     if len(mem) > 15:
         _is_organizing_qun[group_id] = True
         try:
@@ -1098,21 +1377,89 @@ async def organize_qun_memory(group_id: str, retries: int = 3):
     print(f"[群记忆整理] 群 {group_id} 最终失败，保留原记忆")
 
 # ---------- 自动记忆管理 ----------
-async def auto_manage_memory(thread_key: str, user_message: str, reply: str, context_hist: List[Dict], raw_json: str):
+async def auto_manage_memory(thread_key: str, user_message: str, reply: str, context_hist: List[Dict], raw_json: str, bot_client):
+    app_id = bot_client.app_id
     is_group = thread_key.startswith("group_")
+    is_c2c = thread_key.startswith("c2c_")
+
     if is_group:
         group_id = thread_key.replace("group_", "")
-        qun_data = get_qun_memory(group_id)
-        if not qun_data.get("enabled", 1):
-            print("[记忆管理] 群记忆未启用，跳过")
-            return
-        current_mem = get_qun_memory_list(group_id)
-        mem_type = "群"
-        mem_label = "群长期记忆"
+        await update_memory_by_ai(
+            app_id=app_id,
+            identifier=group_id,
+            user_message=user_message, reply=reply, context_hist=context_hist, raw_json=raw_json,
+            mem_type="群", mem_label="群长期记忆",
+            add_func=add_qun_memory, remove_func=remove_qun_memory,
+            replace_func=replace_qun_memory, clear_func=clear_qun_memory,
+            get_mem_func=get_qun_memory_list, set_mem_func=set_qun_memory_list,
+            enable_func=lambda: set_qun_memory_enabled(group_id, True),
+            disable_func=lambda: set_qun_memory_enabled(group_id, False),
+            get_enabled_func=lambda: get_qun_memory_enabled(group_id)
+        )
+    elif is_c2c:
+        user_id = thread_key.replace("c2c_", "")
+        await update_memory_by_ai(
+            app_id=app_id,
+            identifier=user_id,
+            user_message=user_message, reply=reply, context_hist=context_hist, raw_json=raw_json,
+            mem_type="私聊", mem_label="私聊长期记忆",
+            add_func=add_c2c_memory, remove_func=remove_c2c_memory,
+            replace_func=replace_c2c_memory, clear_func=clear_c2c_memory,
+            get_mem_func=get_c2c_memory_list, set_mem_func=set_c2c_memory_list,
+            enable_func=lambda: set_c2c_memory_enabled(user_id, True),
+            disable_func=lambda: set_c2c_memory_enabled(user_id, False),
+            get_enabled_func=lambda: get_c2c_memory_enabled(user_id)
+        )
+
+    await update_memory_by_ai(
+        app_id=app_id,
+        identifier=app_id,
+        user_message=user_message, reply=reply, context_hist=context_hist, raw_json=raw_json,
+        mem_type="机器人", mem_label=f"机器人({app_id})专属记忆",
+        add_func=add_bot_memory, remove_func=remove_bot_memory,
+        replace_func=replace_bot_memory, clear_func=clear_bot_memory,
+        get_mem_func=get_bot_memory_list, set_mem_func=set_bot_memory_list,
+        enable_func=lambda: set_bot_memory_enabled(app_id, True),
+        disable_func=lambda: set_bot_memory_enabled(app_id, False),
+        get_enabled_func=lambda: get_bot_memory_enabled(app_id),
+        is_bot=True
+    )
+
+    await update_memory_by_ai(
+        app_id=app_id,
+        identifier=app_id,
+        user_message=user_message, reply=reply, context_hist=context_hist, raw_json=raw_json,
+        mem_type="全局", mem_label="全局长期记忆",
+        add_func=add_global_memory, remove_func=remove_global_memory,
+        replace_func=replace_global_memory, clear_func=clear_global_memory,
+        get_mem_func=get_global_memory, set_mem_func=set_global_memory,
+        enable_func=lambda: set_global_memory_enabled(True, app_id),
+        disable_func=lambda: set_global_memory_enabled(False, app_id),
+        get_enabled_func=lambda: get_global_memory_enabled(app_id),
+        is_global=True,
+        extra_args=(app_id,)
+    )
+
+    if is_group:
+        await check_and_organize_qun_memory(group_id)
     else:
-        current_mem = get_global_memory()
-        mem_type = "全局"
-        mem_label = "全局长期记忆"
+        await check_and_organize_global_memory(app_id)
+
+async def update_memory_by_ai(app_id: str, identifier, user_message, reply, context_hist, raw_json,
+                              mem_type, mem_label,
+                              add_func, remove_func, replace_func, clear_func,
+                              get_mem_func, set_mem_func,
+                              enable_func, disable_func, get_enabled_func,
+                              is_global=False, is_bot=False, extra_args=()):
+    if is_global:
+        app_id_for_mem = extra_args[0] if extra_args else None
+        current_mem = get_mem_func(app_id_for_mem)
+    elif is_bot:
+        current_mem = get_mem_func(identifier)
+    else:
+        current_mem = get_mem_func(identifier)
+
+    enabled_status = "启用" if get_enabled_func() else "禁用"
 
     mem_text = "\n".join([f"- {item}" for item in current_mem]) if current_mem else "（无）"
     above_text = ""
@@ -1130,9 +1477,15 @@ async def auto_manage_memory(thread_key: str, user_message: str, reply: str, con
         else:
             above_text += f"{role}: {content}\n"
 
+    global_sys = get_global_system_prompt()
+    bot_sys = get_bot_system_prompt(app_id)
+    combined_sys = f"{global_sys}\n{bot_sys}" if bot_sys else global_sys
+
     prompt = (
         f"你是一个记忆管理助手，负责根据对话内容更新机器人的{mem_label}。\n"
+        f"机器人的人设和系统提示如下：\n{combined_sys}\n\n"
         f"机器人的名字是 {BOT_NAME}。\n"
+        f"当前{mem_label}的启用状态是：{enabled_status}。\n"
         f"当前{mem_label}列表如下：\n"
         f"{mem_text}\n\n"
         "最新的用户消息是：\n"
@@ -1143,12 +1496,15 @@ async def auto_manage_memory(thread_key: str, user_message: str, reply: str, con
         f"{above_text}\n\n"
         "重要规则：如果记忆内容涉及某位用户，必须在该用户的用户名后附上其QQ号（从消息的author.id或member_openid中获取），格式如“用户名(QQ号) 是...”。\n"
         "例如：\"张三(1234567) 是管理员\" 而不是 \"张三是管理员\"。\n"
-        "请分析上述内容，判断是否需要更新记忆。如果需要，输出一个JSON指令，格式如下：\n"
+        "请分析上述内容，判断是否需要更新记忆或调整启用状态。如果需要，输出一个JSON指令，格式如下：\n"
         "- 添加记忆：{ \"action\": \"add\", \"content\": \"要添加的记忆内容（必须包含用户QQ号）\" }\n"
         "- 删除记忆（按索引）：{ \"action\": \"delete\", \"index\": 0 }  （索引从0开始）\n"
         "- 替换记忆：{ \"action\": \"replace\", \"index\": 0, \"content\": \"新内容（必须包含用户QQ号）\" }\n"
         "- 清空所有记忆：{ \"action\": \"clear\" }\n"
+        "- 启用记忆：{ \"action\": \"enable\" }\n"
+        "- 禁用记忆：{ \"action\": \"disable\" }\n"
         "- 不操作：{ \"action\": \"none\" }\n"
+        "注意：禁用记忆会使其在后续回复中不被使用，但记忆内容仍会保留。启用记忆会恢复使用。只有在确实必要时才禁用，避免影响正常对话。\n"
         "只输出JSON，不要有其他内容。"
     )
 
@@ -1165,39 +1521,58 @@ async def auto_manage_memory(thread_key: str, user_message: str, reply: str, con
         json_str = re.sub(r',\s*\]', ']', json_str)
         data = json.loads(json_str)
         action = data.get("action")
+
         if action == "add":
             content = data.get("content")
             if content:
-                if is_group:
-                    add_qun_memory(group_id, content)
+                if is_global:
+                    app_id_for_mem = extra_args[0] if extra_args else None
+                    add_func(content, app_id_for_mem)
+                elif is_bot:
+                    add_func(identifier, content)
                 else:
-                    add_global_memory(content)
+                    add_func(identifier, content)
                 print(f"[记忆] {mem_type} 添加: {content}")
         elif action == "delete":
             idx = data.get("index")
             if idx is not None:
-                if is_group:
-                    if remove_qun_memory(group_id, idx):
-                        print(f"[记忆] {mem_type} 删除索引 {idx}")
+                if is_global:
+                    app_id_for_mem = extra_args[0] if extra_args else None
+                    removed = remove_func(idx, app_id_for_mem)
+                elif is_bot:
+                    removed = remove_func(identifier, idx)
                 else:
-                    if remove_global_memory(idx):
-                        print(f"[记忆] {mem_type} 删除索引 {idx}")
+                    removed = remove_func(identifier, idx)
+                if removed:
+                    print(f"[记忆] {mem_type} 删除索引 {idx}")
         elif action == "replace":
             idx = data.get("index")
             content = data.get("content")
             if idx is not None and content:
-                if is_group:
-                    if replace_qun_memory(group_id, idx, content):
-                        print(f"[记忆] {mem_type} 替换索引 {idx} 为: {content}")
+                if is_global:
+                    app_id_for_mem = extra_args[0] if extra_args else None
+                    replaced = replace_func(idx, content, app_id_for_mem)
+                elif is_bot:
+                    replaced = replace_func(identifier, idx, content)
                 else:
-                    if replace_global_memory(idx, content):
-                        print(f"[记忆] {mem_type} 替换索引 {idx} 为: {content}")
+                    replaced = replace_func(identifier, idx, content)
+                if replaced:
+                    print(f"[记忆] {mem_type} 替换索引 {idx} 为: {content}")
         elif action == "clear":
-            if is_group:
-                clear_qun_memory(group_id)
+            if is_global:
+                app_id_for_mem = extra_args[0] if extra_args else None
+                clear_func(app_id_for_mem)
+            elif is_bot:
+                clear_func(identifier)
             else:
-                clear_global_memory()
+                clear_func(identifier)
             print(f"[记忆] {mem_type} 清空所有记忆")
+        elif action == "enable":
+            enable_func()
+            print(f"[记忆] {mem_type} 已启用")
+        elif action == "disable":
+            disable_func()
+            print(f"[记忆] {mem_type} 已禁用")
         else:
             print(f"[记忆] {mem_type} 无操作")
     except json.JSONDecodeError as e:
@@ -1205,13 +1580,40 @@ async def auto_manage_memory(thread_key: str, user_message: str, reply: str, con
     except Exception as e:
         print(f"[记忆管理错误] {e}")
 
-    # 触发整理
-    if is_group:
-        await check_and_organize_qun_memory(group_id)
-    else:
-        await check_and_organize_global_memory()
+# ==================== 辅助函数：生成 RFC3339 时间 ====================
+def ensure_rfc3339_time(expire_str: str, default_seconds: int = 3600) -> str:
+    """
+    确保时间字符串符合 RFC3339 格式，并带有时区（+08:00）。
+    如果 expire_str 无效或缺失，则生成当前时间 + default_seconds 秒的时间。
+    """
+    beijing_tz = timezone(timedelta(hours=8))
+    if expire_str:
+        try:
+            clean_str = expire_str.replace('Z', '+00:00').replace(' ', 'T')
+            if '+' in clean_str or '-' in clean_str:
+                dt = datetime.fromisoformat(clean_str)
+            else:
+                dt = datetime.fromisoformat(clean_str)
+                dt = dt.replace(tzinfo=beijing_tz)
+            dt = dt.replace(microsecond=0)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=beijing_tz)
+            else:
+                dt = dt.astimezone(beijing_tz)
+            return dt.isoformat(timespec='seconds')
+        except Exception as e:
+            print(f"[时间修正] 解析输入时间失败 '{expire_str}': {e}，将使用默认时间")
 
-# ---------- Token 管理（每个机器人独立） ----------
+    dt = datetime.now(beijing_tz) + timedelta(seconds=default_seconds)
+    dt = dt.replace(microsecond=0)
+    return dt.isoformat(timespec='seconds')
+
+# ==================== 群管理（旧自动决策已废弃，仅保留空函数） ====================
+async def handle_group_manage(thread_key: str, user_message: str, reply: str, context_hist: List[Dict], raw_json: str, bot_client):
+    # 此函数已不再使用，群管理完全由 AI 工具指令触发
+    pass
+
+# ==================== Token 管理 ====================
 class BotClient:
     def __init__(self, app_id, app_secret):
         self.app_id = app_id
@@ -1291,6 +1693,70 @@ class BotClient:
                     print("[Reply] 发送最终失败，放弃消息")
                     return False
         return False
+
+    # ========== 群禁言相关API ==========
+    async def get_group_mute_status(self, group_openid: str) -> Optional[Dict]:
+        token = self.get_access_token()
+        url = f"https://api.sgroup.qq.com/v2/groups/{group_openid}/restrict_chat_setting"
+        headers = {"Authorization": f"QQBot {token}"}
+        loop = asyncio.get_event_loop()
+        try:
+            resp = await loop.run_in_executor(
+                _executor,
+                lambda: requests.get(url, headers=headers, timeout=10)
+            )
+            if resp.status_code == 200:
+                return resp.json()
+            else:
+                print(f"[群禁言] 查询失败，状态码 {resp.status_code}, 响应: {resp.text[:200]}")
+                return None
+        except Exception as e:
+            print(f"[群禁言] 查询异常: {e}")
+            return None
+
+    async def set_group_mute(self, group_openid: str, op: str, member_openid: str, mute_expire_at: str = "") -> Tuple[bool, int]:
+        """
+        执行单成员禁言操作：add/update/del
+        返回 (是否成功, 错误码)，成功时错误码为 0，失败时提取响应中的 err_code
+        """
+        token = self.get_access_token()
+        url = f"https://api.sgroup.qq.com/v2/groups/{group_openid}/restrict_chat_setting"
+        headers = {
+            "Authorization": f"QQBot {token}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "members": [
+                {
+                    "op": op,
+                    "member_openid": member_openid,
+                    "mute_expire_at": mute_expire_at
+                }
+            ]
+        }
+        print(f"[群禁言] 发送请求: POST {url}")
+        print(f"[群禁言] payload: {json.dumps(payload, ensure_ascii=False)}")
+        loop = asyncio.get_event_loop()
+        try:
+            resp = await loop.run_in_executor(
+                _executor,
+                lambda: requests.post(url, json=payload, headers=headers, timeout=10)
+            )
+            if resp.status_code == 200:
+                return True, 0
+            else:
+                # 尝试解析错误码
+                error_code = 0
+                try:
+                    err_data = resp.json()
+                    error_code = err_data.get("err_code", err_data.get("code", 0))
+                except:
+                    pass
+                print(f"[群禁言] 设置失败，状态码 {resp.status_code}, 错误码 {error_code}, 响应: {resp.text[:500]}")
+                return False, error_code
+        except Exception as e:
+            print(f"[群禁言] 设置异常: {e}")
+            return False, -1
 
 # ---------- 消息解析 ----------
 def parse_message(data: Dict) -> Dict:
@@ -1424,7 +1890,7 @@ def parse_message(data: Dict) -> Dict:
 
     return result
 
-# ---------- 冷却队列与中断 ----------
+# ---------- 冷却队列 ----------
 pending_queues: Dict[str, List[Dict]] = {}
 pending_timers: Dict[str, asyncio.Task] = {}
 pending_process_tasks: Dict[str, asyncio.Task] = {}
@@ -1463,7 +1929,6 @@ async def process_queue(thread_key: str, bot_client: BotClient):
     except Exception as e:
         print(f"[处理异常] 线程 {thread_key} 处理消息时发生错误: {e}")
 
-# ---------- 处理合并消息 ----------
 async def handle_processed_message(parsed: Dict, thread_key: str, merged_content: str, queue: List[Dict], bot_client: BotClient):
     msg_type = parsed["msg_type"]
     recipient_id = parsed["recipient_id"]
@@ -1473,7 +1938,6 @@ async def handle_processed_message(parsed: Dict, thread_key: str, merged_content
     is_voice = parsed.get("is_voice", False)
     voice_text = parsed.get("voice_text", "")
 
-    # ========== 强制回复检查 ==========
     force_reply = False
     for q in queue:
         q_mentions = q["parsed"].get("mentions", [])
@@ -1495,7 +1959,7 @@ async def handle_processed_message(parsed: Dict, thread_key: str, merged_content
         should_reply = True
     elif msg_type == "group" and not parsed.get("is_at_me", False):
         recent_history = get_recent_history(thread_key, get_judge_context_limit())
-        should_reply = await should_reply_in_group(recent_history, merged_content, mentions)
+        should_reply = await should_reply_in_group(recent_history, merged_content, mentions, bot_client.app_id)
         print(f"[AI Judge] 判定结果: {should_reply}")
 
     if not should_reply:
@@ -1524,11 +1988,65 @@ async def handle_processed_message(parsed: Dict, thread_key: str, merged_content
     full_user_input = merged_content + extra_info
     raw_json_str = json.dumps(parsed, ensure_ascii=False, default=str)
 
-    reply = await generate_reply(thread_key, full_user_input, username, msg_type, raw_json_str)
+    reply = await generate_reply(thread_key, full_user_input, username, msg_type, raw_json_str, bot_client)
 
     if asyncio.current_task().cancelled():
         print("[处理取消] 生成回复完成但任务已取消，放弃发送")
         return
+
+    # ========== 解析回复中的工具指令（仅当该群在白名单内） ==========
+    if msg_type == "group" and is_group_manage_enabled(bot_client.app_id, recipient_id):
+        # 提取禁言指令 [禁言：用户id：时间]
+        mute_pattern = r'\[禁言：([^：]+?)：([^\]]+)\]'
+        # 提取解除指令 [解除：用户id]
+        unmute_pattern = r'\[解除：([^\]]+)\]'
+
+        cleaned_reply = reply
+
+        # 处理禁言
+        mute_matches = re.findall(mute_pattern, cleaned_reply)
+        for member_openid, expire_time in mute_matches:
+            member_openid = member_openid.strip()
+            expire_time = expire_time.strip()
+            # 规范化时间
+            valid_time = ensure_rfc3339_time(expire_time, default_seconds=3600)
+            if valid_time != expire_time:
+                print(f"[工具] 修正时间格式: {expire_time} -> {valid_time}")
+            # 执行禁言
+            success, error_code = await bot_client.set_group_mute(recipient_id, "add", member_openid, valid_time)
+            if not success and error_code == 10007:
+                # 自动修正为1小时
+                beijing_tz = timezone(timedelta(hours=8))
+                new_time = (datetime.now(beijing_tz) + timedelta(hours=1)).replace(microsecond=0).isoformat(timespec='seconds')
+                success2, error_code2 = await bot_client.set_group_mute(recipient_id, "add", member_openid, new_time)
+                if success2:
+                    print(f"[工具] 自动重试成功，禁言至 {new_time}")
+                else:
+                    print(f"[工具] 自动重试失败，错误码 {error_code2}")
+            elif success:
+                print(f"[工具] 禁言成功: {member_openid} 至 {valid_time}")
+            else:
+                print(f"[工具] 禁言失败: {member_openid}，错误码 {error_code}")
+            # 从回复中移除该指令（每次移除一个）
+            cleaned_reply = re.sub(mute_pattern, '', cleaned_reply, count=1)
+
+        # 处理解除禁言
+        unmute_matches = re.findall(unmute_pattern, cleaned_reply)
+        for member_openid in unmute_matches:
+            member_openid = member_openid.strip()
+            success, error_code = await bot_client.set_group_mute(recipient_id, "del", member_openid, "")
+            if success:
+                print(f"[工具] 解除禁言成功: {member_openid}")
+            else:
+                print(f"[工具] 解除禁言失败: {member_openid}，错误码 {error_code}")
+            cleaned_reply = re.sub(unmute_pattern, '', cleaned_reply, count=1)
+
+        # 清理多余空白
+        cleaned_reply = re.sub(r'\n\s*\n', '\n', cleaned_reply).strip()
+        # 如果清理后为空，使用原回复（但工具指令已被移除，可能为空，则给一个默认回复）
+        if not cleaned_reply:
+            cleaned_reply = "操作已完成。"
+        reply = cleaned_reply
 
     if len(reply) > 2000:
         reply = reply[:1997] + "..."
@@ -1542,12 +2060,17 @@ async def handle_processed_message(parsed: Dict, thread_key: str, merged_content
         else:
             above_hist = full_hist
         user_msg_for_memory = merged_content
-        asyncio.create_task(auto_manage_memory(thread_key, user_msg_for_memory, reply, above_hist, raw_json_str))
+        asyncio.create_task(auto_manage_memory(thread_key, user_msg_for_memory, reply, above_hist, raw_json_str, bot_client))
+        # 旧的 handle_group_manage 已不再调用
     else:
         print("[发送失败] 消息未送达，不保存到历史")
 
 # ---------- 消息处理入口 ----------
 async def handle_message(data: Dict, bot_client: BotClient):
+    if not get_bot_enabled(bot_client.app_id):
+        print(f"[禁用] 机器人 {bot_client.app_id} 已禁用，忽略消息")
+        return
+
     parsed = parse_message(data)
     if not parsed["msg_type"]:
         return
@@ -1555,7 +2078,6 @@ async def handle_message(data: Dict, bot_client: BotClient):
     raw_content = parsed.get("content", "")
     decoded_content = decode_face_tags(raw_content)
 
-    # 强制从原始 JSON 提取引用内容
     raw_data = data.get("d", {})
     msg_elements = raw_data.get("msg_elements", [])
     ref_contents = []
@@ -1572,7 +2094,6 @@ async def handle_message(data: Dict, bot_client: BotClient):
         else:
             decoded_content = ref_text
 
-    # ==================== 解析聊天记录转发中的媒体附件 ====================
     if '[群聊的聊天记录]' in decoded_content or '=== 消息' in decoded_content:
         print("[转发解析] 检测到聊天记录转发格式，开始解析...")
         parsed_text, media_list = parse_forwarded_chatlog(decoded_content)
@@ -1640,7 +2161,6 @@ async def handle_message(data: Dict, bot_client: BotClient):
             else:
                 decoded_content = decoded_content.replace(placeholder, f"[转发附件: {filename}] 无法识别类型")
 
-    # ==================== 处理附件（包括 file 类型的图片/视频） ====================
     attachments = parsed.get("attachments", [])
     extra_content_parts = []
     loop = asyncio.get_event_loop()
@@ -1746,7 +2266,6 @@ async def handle_message(data: Dict, bot_client: BotClient):
         else:
             decoded_content = "\n".join(extra_content_parts)
 
-    # ========== 处理消息中的 URL（网页内容获取） ==========
     url_parts = []
     url_pattern = r'https?://[^\s<>"\'，。；！？）]+'
     urls = re.findall(url_pattern, decoded_content)
@@ -1790,7 +2309,6 @@ async def handle_message(data: Dict, bot_client: BotClient):
         else:
             decoded_content = "\n".join(url_parts)
 
-    # 语音
     is_voice = parsed.get("is_voice", False)
     voice_text = parsed.get("voice_text", "")
     if is_voice and voice_text:
@@ -1842,96 +2360,6 @@ async def handle_message(data: Dict, bot_client: BotClient):
 
     append_message(thread_key, "user", store_content)
 
-    # ==================== 命令处理（包括转移记忆） ====================
-    clean_cmd = decoded_content.strip()
-    if clean_cmd.startswith("添加记忆："):
-        mem_text = clean_cmd[5:].strip()
-        if mem_text:
-            if msg_type == "group":
-                group_id = thread_key.replace("group_", "")
-                add_qun_memory(group_id, mem_text)
-                await bot_client.send_message(msg_type, recipient_id, f"已添加群记忆：{mem_text}", msg_id)
-            else:
-                add_global_memory(mem_text)
-                await bot_client.send_message(msg_type, recipient_id, f"已添加全局记忆：{mem_text}", msg_id)
-            return
-        else:
-            await bot_client.send_message(msg_type, recipient_id, "请提供要添加的记忆内容，例如：添加记忆：张三(1234567)是管理员", msg_id)
-            return
-    elif clean_cmd.startswith("删除记忆："):
-        try:
-            idx_str = clean_cmd[5:].strip()
-            idx = int(idx_str) - 1
-            if msg_type == "group":
-                group_id = thread_key.replace("group_", "")
-                if remove_qun_memory(group_id, idx):
-                    await bot_client.send_message(msg_type, recipient_id, f"已删除第 {idx+1} 条群记忆", msg_id)
-                else:
-                    await bot_client.send_message(msg_type, recipient_id, "无效的序号，请检查记忆列表", msg_id)
-            else:
-                if remove_global_memory(idx):
-                    await bot_client.send_message(msg_type, recipient_id, f"已删除第 {idx+1} 条全局记忆", msg_id)
-                else:
-                    await bot_client.send_message(msg_type, recipient_id, "无效的序号，请检查记忆列表", msg_id)
-            return
-        except:
-            await bot_client.send_message(msg_type, recipient_id, "请提供要删除的记忆序号，例如：删除记忆：1", msg_id)
-            return
-    elif clean_cmd == "查看记忆":
-        if msg_type == "group":
-            group_id = thread_key.replace("group_", "")
-            mem_list = get_qun_memory_list(group_id)
-            if mem_list:
-                reply = "当前群记忆列表：\n" + "\n".join([f"{i+1}. {item}" for i, item in enumerate(mem_list)])
-            else:
-                reply = "暂无群记忆"
-            await bot_client.send_message(msg_type, recipient_id, reply, msg_id)
-        else:
-            mem_list = get_global_memory()
-            if mem_list:
-                reply = "当前全局记忆列表：\n" + "\n".join([f"{i+1}. {item}" for i, item in enumerate(mem_list)])
-            else:
-                reply = "暂无全局记忆"
-            await bot_client.send_message(msg_type, recipient_id, reply, msg_id)
-        return
-    elif clean_cmd.startswith("启用群记忆") and msg_type == "group":
-        group_id = thread_key.replace("group_", "")
-        enable_qun_memory(group_id)
-        await bot_client.send_message(msg_type, recipient_id, "已启用本群长期记忆", msg_id)
-        return
-    elif clean_cmd.startswith("禁用群记忆") and msg_type == "group":
-        group_id = thread_key.replace("group_", "")
-        disable_qun_memory(group_id)
-        await bot_client.send_message(msg_type, recipient_id, "已禁用本群长期记忆", msg_id)
-        return
-    elif clean_cmd.startswith("转移群记忆到全局：") and msg_type == "group":
-        try:
-            idx_str = clean_cmd[7:].strip()
-            idx = int(idx_str) - 1
-            group_id = thread_key.replace("group_", "")
-            if transfer_memory_to_global(group_id, idx):
-                await bot_client.send_message(msg_type, recipient_id, f"已将第 {idx+1} 条群记忆转移到全局记忆", msg_id)
-            else:
-                await bot_client.send_message(msg_type, recipient_id, "无效的序号，请检查群记忆列表", msg_id)
-            return
-        except:
-            await bot_client.send_message(msg_type, recipient_id, "请提供要转移的群记忆序号，例如：转移群记忆到全局：1", msg_id)
-            return
-    elif clean_cmd.startswith("转移全局记忆到群：") and msg_type == "group":
-        try:
-            idx_str = clean_cmd[7:].strip()
-            idx = int(idx_str) - 1
-            group_id = thread_key.replace("group_", "")
-            if transfer_memory_to_qun(group_id, idx):
-                await bot_client.send_message(msg_type, recipient_id, f"已将第 {idx+1} 条全局记忆转移到本群记忆", msg_id)
-            else:
-                await bot_client.send_message(msg_type, recipient_id, "无效的序号，请检查全局记忆列表", msg_id)
-            return
-        except:
-            await bot_client.send_message(msg_type, recipient_id, "请提供要转移的全局记忆序号，例如：转移全局记忆到群：1", msg_id)
-            return
-
-    # ---------- 正常消息队列处理 ----------
     if thread_key in pending_process_tasks:
         old_task = pending_process_tasks[thread_key]
         if not old_task.done():
@@ -1982,7 +2410,97 @@ async def handle_message(data: Dict, bot_client: BotClient):
     task = asyncio.create_task(timer_task())
     pending_timers[thread_key] = task
 
-# ---------- WebSocket 连接管理（单个机器人） ----------
+# ==================== 事件处理（申请加群、成员加入/退出） ====================
+async def handle_event(data: Dict, bot_client: BotClient):
+    event_type = data.get("t")
+    payload = data.get("d", {})
+
+    if event_type == "GROUP_JOIN_REQUEST":
+        member_openid = payload.get("member_openid")
+        username = payload.get("username")
+        if member_openid and username:
+            update_user_mapping(member_openid, username)
+            print(f"[事件] 保存申请人信息: {member_openid} -> {username}")
+        return
+
+    if event_type == "GROUP_MEMBER_ADD":
+        group_openid = payload.get("group_openid")
+        member_openid = payload.get("member_openid")
+        if not group_openid or not member_openid:
+            return
+
+        username = get_user_name(member_openid) or member_openid
+        thread_key = get_thread_key("group", None, group_openid)
+        join_msg = f"{username} 加入了群聊"
+
+        append_message(thread_key, "user", join_msg)
+
+        if get_bot_enabled(bot_client.app_id) and get_bot_auto_welcome(bot_client.app_id):
+            parsed = {
+                "author_id": member_openid,
+                "username": username,
+                "msg_type": "group",
+                "recipient_id": group_openid,
+                "content": join_msg
+            }
+            raw_json = json.dumps(parsed, ensure_ascii=False)
+            reply = await generate_reply(thread_key, join_msg, username, "group", raw_json, bot_client)
+            if reply:
+                success = await bot_client.send_message("group", group_openid, reply, msg_id=None)
+                if success:
+                    append_message(thread_key, "assistant", reply)
+                    print(f"[事件] 自动欢迎回复发送成功: {reply}")
+                else:
+                    print("[事件] 自动欢迎回复发送失败")
+            else:
+                print("[事件] 生成回复为空，不发送")
+        else:
+            print(f"[事件] 自动欢迎关闭或机器人禁用，仅记录加入消息")
+        return
+
+    if event_type == "GROUP_MEMBER_REMOVE":
+        group_openid = payload.get("group_openid")
+        member_openid = payload.get("member_openid")
+        if not group_openid or not member_openid:
+            return
+
+        username = get_user_name(member_openid) or member_openid
+        thread_key = get_thread_key("group", None, group_openid)
+        leave_msg = f"{username} 退出了群聊"
+
+        append_message(thread_key, "user", leave_msg)
+
+        if get_bot_enabled(bot_client.app_id):
+            recent_history = get_recent_history(thread_key, get_judge_context_limit())
+            should = await should_reply_in_group(recent_history, leave_msg, [], bot_client.app_id)
+            if should:
+                parsed = {
+                    "author_id": member_openid,
+                    "username": "系统",
+                    "msg_type": "group",
+                    "recipient_id": group_openid,
+                    "content": leave_msg
+                }
+                raw_json = json.dumps(parsed, ensure_ascii=False)
+                reply = await generate_reply(thread_key, leave_msg, "系统", "group", raw_json, bot_client)
+                if reply:
+                    success = await bot_client.send_message("group", group_openid, reply, msg_id=None)
+                    if success:
+                        append_message(thread_key, "assistant", reply)
+                        print(f"[事件] 退出回复发送成功: {reply}")
+                    else:
+                        print("[事件] 退出回复发送失败")
+                else:
+                    print("[事件] 生成回复为空，不发送")
+            else:
+                print("[事件] Judge 判定无需回复退出消息")
+        else:
+            print(f"[事件] 机器人禁用，仅记录退出消息")
+        return
+
+    print(f"[未处理事件] {event_type}: {payload}")
+
+# ---------- WebSocket ----------
 async def main_connection(bot_client: BotClient):
     global BOT_NAME
     print(f"[启动] 机器人 {bot_client.app_id} 开始连接...")
@@ -2000,7 +2518,7 @@ async def main_connection(bot_client: BotClient):
             "op": 2,
             "d": {
                 "token": f"QQBot {token}",
-                "intents": (1 << 25) | (1 << 30),
+                "intents": (1 << 25) | (1 << 30) | (1 << 24),
                 "shard": [0, 1],
                 "properties": {"os": "Linux", "browser": "MyBot", "device": "MyBot"}
             }
@@ -2016,7 +2534,7 @@ async def main_connection(bot_client: BotClient):
                 user_info = ready_data.get("user", {})
                 bot_username = user_info.get("username", "灵泽集AI")
                 bot_client.bot_name = bot_username
-                BOT_NAME = bot_username  # 使用 WebSocket 返回的名称，不读取配置文件
+                BOT_NAME = bot_username
                 print(f"[收到 Ready] 机器人名字: {bot_username}")
                 break
             else:
@@ -2047,14 +2565,20 @@ async def main_connection(bot_client: BotClient):
                 if op not in (1, 11):
                     print(f"[收到] {raw[:200]}...")
                 if op == 0:
-                    await handle_message(data, bot_client)
+                    t = data.get("t")
+                    if t in ("C2C_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"):
+                        await handle_message(data, bot_client)
+                    elif t in ("GROUP_JOIN_REQUEST", "GROUP_MEMBER_ADD", "GROUP_MEMBER_REMOVE"):
+                        await handle_event(data, bot_client)
+                    else:
+                        pass
             except websockets.ConnectionClosed:
                 print("[连接] 服务器关闭连接")
                 raise
             except Exception as e:
                 print(f"[处理消息错误] {e}")
 
-# ---------- 多机器人运行入口 ----------
+# ---------- 多机器人 ----------
 async def run_bot_for_client(bot_client: BotClient):
     while True:
         try:
