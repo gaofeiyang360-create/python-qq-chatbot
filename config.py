@@ -7,6 +7,8 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Dict, List
 
+from log import info, warn, error, setup_logger
+
 # ==================== 路径与常量 ====================
 if getattr(sys, 'frozen', False):
     BASE_DIR = Path(sys.executable).parent
@@ -17,6 +19,13 @@ CONFIG_FILE = BASE_DIR / "config.json"
 MIRROR_FILE = BASE_DIR / "mirror.json"
 
 DEFAULT_CONFIG = {
+    # ==================== 日志配置 ====================
+    "enable_log": 0,                 # 0=禁用文件日志（仅控制台输出），1=启用文件日志
+    "log_file": "log.txt",           # 日志文件路径
+    "max_log_length": 800,           # 日志文件最大行数，达到后自动轮转
+    "disable_print_in_console": 0,   # 0=控制台输出，1=关闭控制台显示（文件日志仍可启用）
+    "log_level": "DEBUG",            # 文件日志记录等级：DEBUG/INFO/WARNING/ERROR/CRITICAL
+
     "bots": [
         {
             "APP_ID": "YOUR_APP_ID",                    # 替换为实际的机器人 App ID
@@ -78,28 +87,68 @@ def safe_load_json(file_path: Path, default_data):
                 backup_name = file_path.with_name(f"[broken]{timestamp}_{file_path.name}")
             try:
                 file_path.rename(backup_name)
-                print(f"[警告] 文件 {file_path} 损坏，已备份为 {backup_name}")
+                warn(f"文件 {file_path} 损坏，已备份为 {backup_name}")
             except Exception as be:
-                print(f"[错误] 备份文件失败: {be}")
+                error(f"备份文件失败: {be}")
         try:
+            file_path.parent.mkdir(parents=True, exist_ok=True)
             with open(file_path, 'w', encoding='utf-8') as f:
                 json.dump(default_data, f, ensure_ascii=False, indent=2)
-            print(f"[修复] 已创建新的 {file_path} 使用默认数据")
+            info(f"已创建新的 {file_path} 使用默认数据")
         except Exception as we:
-            print(f"[错误] 创建新文件失败: {we}")
+            error(f"创建新文件失败: {we}")
         return default_data
 
 
-# ==================== 配置文件加载（实时读取） ====================
+# ==================== 自动补全缺省配置项 ====================
+def deep_patch_defaults(loaded: dict, defaults: dict, path: str = "") -> bool:
+    """
+    递归对比 loaded 与 defaults，将 loaded 中缺失的 key 用 defaults 的值补充。
+    返回 True 表示有改动（已补全），False 表示无改动。
+    规则：
+      - 对于 dict 类型的值，递归合并缺失的子 key
+      - 对于 list 类型的值（如 bots），不合并到现有 item 内部，但如果列表为空且默认不空，
+        将默认模板中缺失的 key 补到每个现有 item
+      - 其他类型（str/int/bool），缺失则直接补
+      - 永远不覆盖 loaded 中已有的值
+    """
+    changed = False
+    for key, default_val in defaults.items():
+        full_key = f"{path}.{key}" if path else key
+        if key not in loaded:
+            loaded[key] = __import__('copy').deepcopy(default_val)
+            info(f"配置补全: 缺少 '{full_key}'，已添加默认值")
+            changed = True
+        elif isinstance(default_val, dict) and isinstance(loaded[key], dict):
+            # 递归合并嵌套 dict
+            sub_changed = deep_patch_defaults(loaded[key], default_val, full_key)
+            if sub_changed:
+                changed = True
+        elif isinstance(default_val, list) and isinstance(loaded[key], list):
+            # list 类型：确保每个现有 item （dict）也补上默认模板中缺失的 key
+            if default_val and isinstance(default_val[0], dict):
+                template = default_val[0]
+                for idx, item in enumerate(loaded[key]):
+                    if isinstance(item, dict):
+                        item_path = f"{full_key}[{idx}]"
+                        for tk, tv in template.items():
+                            if tk not in item:
+                                item[tk] = __import__('copy').deepcopy(tv)
+                                info(f"配置补全: 缺少 '{item_path}.{tk}'，已添加默认值")
+                                changed = True
+    return changed
+
+
+# ==================== 配置文件加载（实时读取 + 自动补全） ====================
 def get_config():
     if not CONFIG_FILE.exists():
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=2)
-        print("配置文件 config.json 已生成，请编辑后重新运行。")
+        info("配置文件 config.json 已生成，请编辑后重新运行。")
         sys.exit(0)
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            config = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
         backup_name = CONFIG_FILE.with_name(f"[broken]{CONFIG_FILE.name}")
         if backup_name.exists():
@@ -107,13 +156,24 @@ def get_config():
             backup_name = CONFIG_FILE.with_name(f"[broken]{timestamp}_{CONFIG_FILE.name}")
         try:
             CONFIG_FILE.rename(backup_name)
-            print(f"[警告] 配置文件损坏，已备份为 {backup_name}")
+            warn(f"配置文件损坏，已备份为 {backup_name}")
         except Exception as be:
-            print(f"[错误] 备份配置文件失败: {be}")
+            error(f"备份配置文件失败: {be}")
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=2)
-        print("配置文件 config.json 已重置为默认配置，请编辑后重新运行。")
+        info("配置文件 config.json 已重置为默认配置，请编辑后重新运行。")
         sys.exit(0)
+
+    # 自动补全缺失的配置项
+    if deep_patch_defaults(config, DEFAULT_CONFIG):
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+            info("已自动补全 config.json 中的缺省配置项并写回文件")
+        except OSError as we:
+            error(f"写回补全后的配置文件失败: {we}")
+
+    return config
 
 
 def get_bots() -> List[Dict]:
@@ -203,6 +263,32 @@ def get_global_system_prompt() -> str:
     return get_config().get("SYSTEM_PROMPT", "you are a helpful ai")
 
 
+# ==================== 日志配置获取 ====================
+def get_enable_log() -> int:
+    """获取是否启用文件日志：0=禁用（仅控制台），1=启用"""
+    return int(get_config().get("enable_log", 0))
+
+
+def get_log_file() -> str:
+    """获取日志文件路径"""
+    return str(get_config().get("log_file", "log.txt"))
+
+
+def get_max_log_length() -> int:
+    """获取日志文件最大行数"""
+    return int(get_config().get("max_log_length", 800))
+
+
+def get_disable_print_in_console() -> int:
+    """获取是否关闭控制台输出：0=输出，1=关闭"""
+    return int(get_config().get("disable_print_in_console", 0))
+
+
+def get_log_level() -> str:
+    """获取文件日志记录等级"""
+    return str(get_config().get("log_level", "DEBUG")).upper()
+
+
 def get_model_config(model_key: str) -> Dict[str, str]:
     config = get_config()
     models = config.get("models", {})
@@ -224,7 +310,7 @@ def set_bot_name(name: str):
 # ==================== 初始化：机器人列表 & 线程池 ====================
 BOTS = get_bots()
 if not BOTS:
-    print("错误：配置文件中没有机器人信息，请添加 'bots' 数组。")
+    error("配置文件中没有机器人信息，请添加 'bots' 数组。")
     sys.exit(1)
 
 MAX_WORKERS = get_max_workers()
@@ -237,6 +323,7 @@ def get_executor() -> ThreadPoolExecutor:
 
 # ==================== 数据目录 ====================
 MEMORY_FILE = BASE_DIR / "memory.json"
+USER_MAP_FILE = BASE_DIR / "user_map.json"
 HISTORY_DIR = BASE_DIR / "history"
 MEDIA_CACHE_DIR = BASE_DIR / "media_cache"
 QUN_MEMORY_DIR = BASE_DIR / "qun_memory"
@@ -259,18 +346,18 @@ def migrate_old_data():
             with open(old_file, "r", encoding="utf-8") as f:
                 old = json.load(f)
         except Exception as e:
-            print(f"[迁移] 旧文件 {old_file} 损坏，无法迁移，跳过。")
+            warn(f"旧文件 {old_file} 损坏，无法迁移，跳过。")
             backup_name = old_file.with_name(f"[broken]{old_file.name}")
             if backup_name.exists():
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 backup_name = old_file.with_name(f"[broken]{timestamp}_{old_file.name}")
             try:
                 old_file.rename(backup_name)
-                print(f"[迁移] 已备份损坏文件为 {backup_name}")
+                warn(f"已备份损坏文件为 {backup_name}")
             except Exception as be:
-                print(f"[迁移] 备份失败: {be}")
+                error(f"备份失败: {be}")
         if old is not None:
-            print("[迁移] 检测到旧的 threads.json，正在迁移...")
+            info("检测到旧的 threads.json，正在迁移...")
             memory_data = {"global_memory": old.get("global_memory", []), "enabled": 1}
             with open(MEMORY_FILE, "w", encoding="utf-8") as f:
                 json.dump(memory_data, f, ensure_ascii=False, indent=2)
@@ -286,22 +373,24 @@ def migrate_old_data():
                         json.dump(val["history"], f, ensure_ascii=False, indent=2)
             backup = old_file.with_suffix(".json.bak")
             old_file.rename(backup)
-            print(f"[迁移] 完成，旧文件备份为 {backup}")
+            info(f"迁移完成，旧文件备份为 {backup}")
     else:
         if MEMORY_FILE.exists():
             try:
                 with open(MEMORY_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
             except Exception as e:
-                print(f"[迁移] 记忆文件 {MEMORY_FILE} 损坏，跳过迁移处理。")
+                warn(f"记忆文件 {MEMORY_FILE} 损坏，跳过迁移处理。")
                 data = None
-            if data is not None and "user_mapping" in data and data["user_mapping"]:
-                with open(MIRROR_FILE, "w", encoding="utf-8") as f:
-                    json.dump(data["user_mapping"], f, ensure_ascii=False, indent=2)
+            # 旧版 memory.json 中的 user_mapping 已废弃，由 memory.mirror_migrate_old() 处理
+            if data is not None and "user_mapping" in data:
                 del data["user_mapping"]
                 with open(MEMORY_FILE, "w", encoding="utf-8") as f:
                     json.dump(data, f, ensure_ascii=False, indent=2)
-                print("[迁移] 已将 user_mapping 迁移到 mirror.json")
+                info("已清理 memory.json 中的旧 user_mapping 字段")
 
 
 migrate_old_data()
+
+# ==================== 初始化日志系统 ====================
+setup_logger()

@@ -10,7 +10,8 @@ from typing import Optional, Dict, Any, Tuple
 from urllib.parse import urlparse
 from pathlib import Path
 
-from config import get_executor, get_bot_name, set_bot_name
+from config import get_executor, get_bot_name, set_bot_name, get_bots, get_bot_enabled
+from log import info, warn, error, debug
 
 
 # ==================== BotClient：Token 管理 & QQ API 调用 ====================
@@ -33,7 +34,7 @@ class BotClient:
             data = resp.json()
             self.token_info["access_token"] = data["access_token"]
             self.token_info["expires_at"] = time.time() + int(data["expires_in"])
-            print(f"[Token] {self.app_id} 获取成功，有效期 {data['expires_in']} 秒")
+            info(f"[Token] {self.app_id} 获取成功，有效期 {data['expires_in']} 秒")
         return self.token_info["access_token"]
 
     def get_websocket_url(self) -> str:
@@ -52,9 +53,9 @@ class BotClient:
         使用官方 /files 接口直接传入 URL 上传。
         返回 file_info，失败返回 None。
         """
-        print(f"[上传URL] 收到 file_name: {file_name}, file_type: {file_type}")
+        info(f"[上传URL] 收到 file_name: {file_name}, file_type: {file_type}")
         if not (source.startswith('http://') or source.startswith('https://')):
-            print(f"[上传URL] 错误：仅支持 HTTP/HTTPS URL，收到: {source[:80]}")
+            info(f"[上传URL] 错误：仅支持 HTTP/HTTPS URL，收到: {source[:80]}")
             return None
 
         # 确定 file_type（若未指定则自动推断）
@@ -89,8 +90,8 @@ class BotClient:
         if file_name:
             payload["file_name"] = file_name
 
-        print(f"[上传URL] 类型 {file_type}，目标 {source[:80]}...")
-        print(f"[上传URL] 完整 payload: {json.dumps(payload, ensure_ascii=False)}")
+        info(f"[上传URL] 类型 {file_type}，目标 {source[:80]}...")
+        info(f"[上传URL] 完整 payload: {json.dumps(payload, ensure_ascii=False)}")
         loop = asyncio.get_event_loop()
         try:
             resp = await loop.run_in_executor(
@@ -98,19 +99,19 @@ class BotClient:
                 lambda: requests.post(url, json=payload, headers=headers, timeout=30)
             )
         except Exception as e:
-            print(f"[上传URL] 请求异常: {e}")
+            error(f"[上传URL] 请求异常: {e}")
             return None
 
         if resp.status_code != 200:
-            print(f"[上传URL] 失败，状态码 {resp.status_code}，响应: {resp.text[:200]}")
+            error(f"[上传URL] 失败，状态码 {resp.status_code}，响应: {resp.text[:200]}")
             return None
 
         resp_json = resp.json()
         file_info = resp_json.get('file_info')
         if not file_info:
-            print(f"[上传URL] 响应无 file_info: {resp_json}")
+            info(f"[上传URL] 响应无 file_info: {resp_json}")
             return None
-        print(f"[上传URL] 成功，file_info: {file_info[:20]}...")
+        info(f"[上传URL] 成功，file_info: {file_info[:20]}...")
         return file_info
 
     # ========== 发送消息（支持 msg_seq 自动去重） ==========
@@ -134,14 +135,14 @@ class BotClient:
         file_info = None
         if media_source:
             if not (media_source.startswith('http://') or media_source.startswith('https://')):
-                print(f"[发送] 错误：media_source 必须为 HTTP/HTTPS URL，收到: {media_source[:80]}")
+                info(f"[发送] 错误：media_source 必须为 HTTP/HTTPS URL，收到: {media_source[:80]}")
                 return False
 
-            print(f"[发送] 调用上传，file_name={file_name}, file_type={file_type}")
+            info(f"[发送] 调用上传，file_name={file_name}, file_type={file_type}")
             file_info = await self.upload_media_by_url(msg_type, recipient_id,
                                                        media_source, file_type, file_name)
             if not file_info:
-                print("[发送] URL 上传失败，放弃发送")
+                error("[发送] URL 上传失败，放弃发送")
                 return False
 
         if not media_source and media:
@@ -185,7 +186,7 @@ class BotClient:
             else:
                 payload["msg_type"] = 0
 
-            print(f"[发送] 最终 payload: {json.dumps(payload, ensure_ascii=False)[:500]}")
+            info(f"[发送] 最终 payload: {json.dumps(payload, ensure_ascii=False)[:500]}")
             loop = asyncio.get_event_loop()
             try:
                 resp = await loop.run_in_executor(
@@ -194,20 +195,20 @@ class BotClient:
                 )
                 if resp.status_code == 200:
                     if is_media_msg:
-                        print(f"[Reply] {msg_type} 富媒体消息发送成功: {content[:50] if content else '媒体'}")
+                        info(f"[Reply] {msg_type} 富媒体消息发送成功: {content[:50] if content else '媒体'}")
                     else:
-                        print(f"[Reply] {msg_type} 发送成功: {content[:50] if content else '空'}")
+                        info(f"[Reply] {msg_type} 发送成功: {content[:50] if content else '空'}")
                     return True
                 else:
-                    print(f"[Reply Error] 尝试 {attempt+1}/{max_retries} 失败，状态码 {resp.status_code}, 响应: {resp.text[:200]}")
+                    error(f"[Reply Error] 尝试 {attempt+1}/{max_retries} 失败，状态码 {resp.status_code}, 响应: {resp.text[:200]}")
                     if resp.status_code in (401, 500):
-                        print("[Reply] 强制刷新 Token")
+                        info("[Reply] 强制刷新 Token")
                         self.get_access_token(force_refresh=True)
                         continue
                     if attempt < max_retries - 1:
                         await asyncio.sleep(2 ** attempt)
                     else:
-                        print("[Reply] 发送最终失败，放弃消息")
+                        error("[Reply] 发送最终失败，放弃消息")
                         # ----- 被动回复超限 → 自动切主动重试 -----
                         if msg_id:
                             try:
@@ -216,7 +217,7 @@ class BotClient:
                             except Exception:
                                 err_code = None
                             if err_code == 40034128:
-                                print("[Reply] 检测到被动回复超限（40034128），尝试主动发送...")
+                                info("[Reply] 检测到被动回复超限（40034128），尝试主动发送...")
                                 # 去掉 msg_id 以主动发送
                                 payload.pop("msg_id", None)
                                 payload.pop("msg_seq", None)
@@ -225,17 +226,17 @@ class BotClient:
                                     lambda: requests.post(url, json=payload, headers=headers, timeout=10)
                                 )
                                 if active_resp.status_code == 200:
-                                    print(f"[Reply] 主动发送成功: {content[:50] if content else '空'}")
+                                    info(f"[Reply] 主动发送成功: {content[:50] if content else '空'}")
                                     return True
                                 else:
-                                    print(f"[Reply] 主动发送也失败，状态码 {active_resp.status_code}")
+                                    error(f"[Reply] 主动发送也失败，状态码 {active_resp.status_code}")
                         return False
             except Exception as e:
-                print(f"[Reply Error] 尝试 {attempt+1}/{max_retries} 异常: {e}")
+                error(f"[Reply Error] 尝试 {attempt+1}/{max_retries} 异常: {e}")
                 if attempt < max_retries - 1:
                     await asyncio.sleep(2 ** attempt)
                 else:
-                    print("[Reply] 发送最终失败，放弃消息")
+                    error("[Reply] 发送最终失败，放弃消息")
                     return False
         return False
 
@@ -253,10 +254,10 @@ class BotClient:
             if resp.status_code == 200:
                 return resp.json()
             else:
-                print(f"[群禁言] 查询失败，状态码 {resp.status_code}, 响应: {resp.text[:200]}")
+                error(f"[群禁言] 查询失败，状态码 {resp.status_code}, 响应: {resp.text[:200]}")
                 return None
         except Exception as e:
-            print(f"[群禁言] 查询异常: {e}")
+            error(f"[群禁言] 查询异常: {e}")
             return None
 
     async def set_group_mute(self, group_openid: str, op: str, member_openid: str,
@@ -276,8 +277,8 @@ class BotClient:
                 }
             ]
         }
-        print(f"[群禁言] 发送请求: POST {url}")
-        print(f"[群禁言] payload: {json.dumps(payload, ensure_ascii=False)}")
+        info(f"[群禁言] 发送请求: POST {url}")
+        info(f"[群禁言] payload: {json.dumps(payload, ensure_ascii=False)}")
         loop = asyncio.get_event_loop()
         try:
             resp = await loop.run_in_executor(
@@ -293,10 +294,10 @@ class BotClient:
                     error_code = err_data.get("err_code", err_data.get("code", 0))
                 except Exception:
                     pass
-                print(f"[群禁言] 设置失败，状态码 {resp.status_code}, 错误码 {error_code}, 响应: {resp.text[:500]}")
+                error(f"[群禁言] 设置失败，状态码 {resp.status_code}, 错误码 {error_code}, 响应: {resp.text[:500]}")
                 return False, error_code
         except Exception as e:
-            print(f"[群禁言] 设置异常: {e}")
+            error(f"[群禁言] 设置异常: {e}")
             return False, -1
 
 
@@ -304,14 +305,14 @@ class BotClient:
 async def main_connection(bot_client: BotClient):
     from msg import handle_message, handle_event
 
-    print(f"[启动] 机器人 {bot_client.app_id} 开始连接...")
+    info(f"[启动] 机器人 {bot_client.app_id} 开始连接...")
     ws_url = bot_client.get_websocket_url()
-    print(f"[启动] 地址: {ws_url}")
+    info(f"[启动] 地址: {ws_url}")
 
     async with websockets.connect(ws_url) as ws:
         hello = await ws.recv()
         hello_data = json.loads(hello)
-        print(f"[收到 Hello] {hello}")
+        info(f"[收到 Hello] {hello}")
         heartbeat_interval = hello_data.get("d", {}).get("heartbeat_interval", 30000) / 1000.0
 
         token = bot_client.get_access_token()
@@ -325,7 +326,7 @@ async def main_connection(bot_client: BotClient):
             }
         }
         await ws.send(json.dumps(identify))
-        print("[鉴权] 已发送 Identify")
+        info("[鉴权] 已发送 Identify")
 
         while True:
             msg = await ws.recv()
@@ -336,35 +337,46 @@ async def main_connection(bot_client: BotClient):
                 bot_username = user_info.get("username", "灵泽集AI")
                 bot_client.bot_name = bot_username
                 set_bot_name(bot_username)
-                print(f"[收到 Ready] 机器人名字: {bot_username}")
+                info(f"[收到 Ready] 机器人名字: {bot_username}")
                 break
             else:
-                print(f"[收到] {msg}")
+                info(f"[收到] {msg}")
 
-        print(f"[准备就绪] 机器人 {bot_client.bot_name} 已上线")
+        info(f"[准备就绪] 机器人 {bot_client.bot_name} 已上线")
 
         async def heartbeat():
             while True:
                 await asyncio.sleep(heartbeat_interval)
                 try:
                     await ws.send(json.dumps({"op": 1, "d": int(time.time() * 1000)}))
-                    print("[心跳] 发送")
+                    info("[心跳] 发送")
                 except websockets.ConnectionClosed:
-                    print("[心跳] 连接已关闭")
+                    info("[心跳] 连接已关闭")
                     break
                 except Exception as e:
-                    print(f"[心跳错误] {e}")
+                    info(f"[心跳错误] {e}")
+                    break
+
+                # ★ 使用时主动检测：bot 是否仍存在于配置且启用
+                still_valid = False
+                for b in get_bots():
+                    if b.get("APP_ID") == bot_client.app_id and get_bot_enabled(bot_client.app_id):
+                        still_valid = True
+                        break
+                if not still_valid:
+                    info(f"[心跳] 机器人 {bot_client.app_id} 已被移除或禁用，关闭连接")
+                    await ws.close()
                     break
 
         asyncio.create_task(heartbeat())
-        print("[监听] 开始接收消息...")
+        info("[监听] 开始接收消息...")
 
         async for raw in ws:
             try:
                 data = json.loads(raw)
                 op = data.get("op")
                 if op not in (1, 11):
-                    print(f"[收到] {raw[:200]}...")
+                    info(f"[收到] {raw[:200]}...")
                 if op == 0:
                     t = data.get("t")
                     if t in ("C2C_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"):
@@ -374,7 +386,7 @@ async def main_connection(bot_client: BotClient):
                     else:
                         pass
             except websockets.ConnectionClosed:
-                print("[连接] 服务器关闭连接")
+                info("[连接] 服务器关闭连接")
                 raise
             except Exception as e:
-                print(f"[处理消息错误] {e}")
+                info(f"[处理消息错误] {e}")

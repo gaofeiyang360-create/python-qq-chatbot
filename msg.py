@@ -18,15 +18,16 @@ from memory import (
     append_message, get_recent_history,
     get_media_cache_key, get_media_cache_path,
     auto_manage_memory,
+    record_user_id, record_group_id,
 )
 from ai import (
     generate_reply, should_reply_in_group, recognize_media, recognize_media_by_url,
-    fetch_webpage_content, is_valid_url, summarize_content_if_needed,
     INTERRUPT_CONTEXT,
 )
 
 # 仅用于类型提示，避免运行时循环导入
 from typing import TYPE_CHECKING
+from log import info, warn, error, debug
 if TYPE_CHECKING:
     from client import BotClient
 
@@ -68,12 +69,13 @@ def get_thread_key(msg_type: str, user_id: str = None, group_id: str = None) -> 
         return f"group_{group_id}"
 
 
-def get_display_name(author_id: str, username: str = "") -> str:
+def get_display_name(author_id: str, username: str = "", bot_appid: str = "") -> str:
     if username and username.strip():
         return username.strip()
-    mapped = get_user_name(author_id)
-    if mapped:
-        return mapped
+    if bot_appid:
+        mapped = get_user_name(author_id, bot_appid)
+        if mapped:
+            return mapped
     return "用户"
 
 
@@ -191,7 +193,7 @@ def ensure_rfc3339_time(expire_str: str, default_seconds: int = 3600) -> str:
                 dt = dt.astimezone(beijing_tz)
             return dt.isoformat(timespec='seconds')
         except Exception as e:
-            print(f"[时间修正] 解析输入时间失败 '{expire_str}': {e}，将使用默认时间")
+            error(f"[时间修正] 解析输入时间失败 '{expire_str}': {e}，将使用默认时间")
     dt = datetime.now(beijing_tz) + timedelta(seconds=default_seconds)
     dt = dt.replace(microsecond=0)
     return dt.isoformat(timespec='seconds')
@@ -205,7 +207,7 @@ async def handle_group_manage(thread_key: str, user_message: str, reply: str,
 
 
 # ==================== 消息解析 ====================
-def parse_message(data: Dict) -> Dict:
+def parse_message(data: Dict, bot_appid: str = "") -> Dict:
     event_type = data.get("t")
     payload = data.get("d", {})
     result = {
@@ -321,8 +323,11 @@ def parse_message(data: Dict) -> Dict:
         result["author_id"] = author_id
         result["username"] = username
         result["recipient_id"] = author_id
-        if username:
-            update_user_mapping(author_id, username)
+        if username and bot_appid:
+            update_user_mapping(author_id, username, bot_appid)
+        # 记录私聊用户ID
+        if bot_appid and author_id:
+            record_user_id(bot_appid, author_id)
     elif event_type in ("GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"):
         result["msg_type"] = "group"
         author = payload.get("author", {})
@@ -331,8 +336,11 @@ def parse_message(data: Dict) -> Dict:
         result["author_id"] = author_id
         result["username"] = username
         result["recipient_id"] = payload.get("group_openid")
-        if username:
-            update_user_mapping(author_id, username)
+        # 记录群ID
+        if bot_appid and result["recipient_id"]:
+            record_group_id(bot_appid, result["recipient_id"])
+        if username and bot_appid:
+            update_user_mapping(author_id, username, bot_appid)
         for mention in result["mentions"]:
             if mention.get("bot") and mention.get("is_you"):
                 result["is_at_me"] = True
@@ -410,7 +418,7 @@ async def process_queue(thread_key: str, bot_client: 'BotClient'):
             del task_force_reply[thread_key]
 
     except asyncio.CancelledError:
-        print(f"[处理取消] 线程 {thread_key} 的处理被中断")
+        info(f"[处理取消] 线程 {thread_key} 的处理被中断")
         # 获取该线程的 force_reply（从任务存储中取）
         force_reply = task_force_reply.get(thread_key, False)
         if thread_key in INTERRUPT_CONTEXT:
@@ -419,15 +427,15 @@ async def process_queue(thread_key: str, bot_client: 'BotClient'):
                 "force_reply": force_reply
             }
             del INTERRUPT_CONTEXT[thread_key]
-            print(f"[处理取消] 已保存线程 {thread_key} 的上下文（长度 {len(pending_contexts[thread_key]['messages'])}）和 force_reply={force_reply}")
+            info(f"[处理取消] 已保存线程 {thread_key} 的上下文（长度 {len(pending_contexts[thread_key]['messages'])}）和 force_reply={force_reply}")
         else:
-            print(f"[处理取消] 线程 {thread_key} 无上下文可保存")
+            info(f"[处理取消] 线程 {thread_key} 无上下文可保存")
         # 清理任务存储
         if thread_key in task_force_reply:
             del task_force_reply[thread_key]
         # 不重新抛出，任务结束
     except Exception as e:
-        print(f"[处理异常] 线程 {thread_key} 处理消息时发生错误: {e}")
+        error(f"[处理异常] 线程 {thread_key} 处理消息时发生错误: {e}")
         if thread_key in task_force_reply:
             del task_force_reply[thread_key]
 
@@ -448,20 +456,20 @@ async def handle_processed_message(parsed: Dict, thread_key: str, merged_content
     should_reply = False
     if force_reply:
         should_reply = True
-        print("[强制回复] 根据 force_reply 标志强制回复")
+        info("[强制回复] 根据 force_reply 标志强制回复")
     elif msg_type == "group" and parsed.get("is_at_me", False):
         should_reply = True
     elif msg_type == "group" and not parsed.get("is_at_me", False):
         recent_history = get_recent_history(thread_key, get_judge_context_limit())
         should_reply = await should_reply_in_group(recent_history, merged_content, mentions, bot_client.app_id)
-        print(f"[AI Judge] 判定结果: {should_reply}")
+        info(f"[AI Judge] 判定结果: {should_reply}")
 
     if not should_reply:
-        print("[忽略] 不回复")
+        info("[忽略] 不回复")
         return
 
     if asyncio.current_task().cancelled():
-        print("[处理取消] 判断完成但任务已取消，放弃回复")
+        info("[处理取消] 判断完成但任务已取消，放弃回复")
         return
 
     # 组装额外信息（引用、附件、语音）
@@ -497,7 +505,7 @@ async def handle_processed_message(parsed: Dict, thread_key: str, merged_content
     )
 
     if asyncio.current_task().cancelled():
-        print("[处理取消] 生成回复完成但任务已取消，放弃后续")
+        info("[处理取消] 生成回复完成但任务已取消，放弃后续")
         return
 
     # --- 后续操作：记忆管理（压缩、长期记忆）等 ---
@@ -520,18 +528,18 @@ async def handle_processed_message(parsed: Dict, thread_key: str, merged_content
     )
     # 可选：打印发送状态
     if sent_success:
-        print(f"[处理完成] 消息已发送并保存历史")
+        info(f"[处理完成] 消息已发送并保存历史")
     else:
-        print(f"[处理完成] 历史已保存，但消息未发送（可能因 skip_reply 或发送失败）")
+        error(f"[处理完成] 历史已保存，但消息未发送（可能因 skip_reply 或发送失败）")
 
 
 # ==================== 消息处理入口 ====================
 async def handle_message(data: Dict, bot_client: 'BotClient'):
     if not get_bot_enabled(bot_client.app_id):
-        print(f"[禁用] 机器人 {bot_client.app_id} 已禁用，忽略消息")
+        info(f"[禁用] 机器人 {bot_client.app_id} 已禁用，忽略消息")
         return
 
-    parsed = parse_message(data)
+    parsed = parse_message(data, bot_client.app_id)
     if not parsed["msg_type"]:
         return
 
@@ -557,7 +565,7 @@ async def handle_message(data: Dict, bot_client: 'BotClient'):
 
     # 聊天记录转发解析
     if '[群聊的聊天记录]' in decoded_content or '=== 消息' in decoded_content:
-        print("[转发解析] 检测到聊天记录转发格式，开始解析...")
+        info("[转发解析] 检测到聊天记录转发格式，开始解析...")
         parsed_text, media_list = parse_forwarded_chatlog(decoded_content)
         decoded_content = parsed_text
 
@@ -575,25 +583,19 @@ async def handle_message(data: Dict, bot_client: 'BotClient'):
 
         if len(media_to_process) > 5:
             media_to_process = media_to_process[:5]
-            print("[转发解析] 仅处理前5个无缓存媒体，其余忽略")
+            info("[转发解析] 仅处理前5个无缓存媒体，其余忽略")
 
-        for idx, media in enumerate(media_list):
-            process_this = media.get('_cached', False) or media in media_to_process
-            if not process_this:
-                placeholder = f"[MEDIA_PLACEHOLDER_{idx}]"
-                decoded_content = decoded_content.replace(placeholder, f"[媒体附件: {media['filename']}] (超过处理限制，已忽略)")
-                continue
-
+        # 并发处理转发聊天记录中的媒体
+        async def process_forwarded_media(idx, media):
             url = media.get('url')
             filename = media.get('filename', '未知文件')
             media_type = media.get('type', 'unknown')
             height = media.get('height', 0)
             width = media.get('width', 0)
-            placeholder = f"[MEDIA_PLACEHOLDER_{idx}]"
 
             if media_type in ('image', 'video'):
                 summary = await recognize_media(media_type, url, filename, height, width)
-                decoded_content = decoded_content.replace(placeholder, f"[转发媒体识别结果: {filename}]\n{summary}")
+                return (idx, f"[转发媒体识别结果: {filename}]\nURL: {url}\n{summary}")
             elif media_type == 'text_file':
                 try:
                     loop = asyncio.get_event_loop()
@@ -607,28 +609,47 @@ async def handle_message(data: Dict, bot_client: 'BotClient'):
                         max_len = 100 * 1024
                         if len(content) > max_len:
                             content = content[:max_len] + "\n... (文件内容过长，已截断)"
-                        block = f"[转发文件: {filename}]\n=== 文件内容 ===\n{content}\n=== 文件内容结束 ==="
-                        decoded_content = decoded_content.replace(placeholder, block)
+                        block = f"[转发文件: {filename}]\nURL: {url}\n=== 文件内容 ===\n{content}\n=== 文件内容结束 ==="
+                        return (idx, block)
                     else:
-                        decoded_content = decoded_content.replace(placeholder, f"[转发文件: {filename}] 下载失败 (HTTP {response.status_code})")
+                        return (idx, f"[转发文件: {filename}] 下载失败 (HTTP {response.status_code})\nURL: {url}")
                 except Exception as e:
-                    decoded_content = decoded_content.replace(placeholder, f"[转发文件: {filename}] 下载异常: {e}")
+                    return (idx, f"[转发文件: {filename}] 下载异常: {e}\nURL: {url}")
             elif media_type == 'binary_file':
-                decoded_content = decoded_content.replace(placeholder, f"[转发文件: {filename}] 不支持的文件类型")
+                return (idx, f"[转发文件: {filename}] 不支持的文件类型\nURL: {url}")
             else:
-                decoded_content = decoded_content.replace(placeholder, f"[转发附件: {filename}] 无法识别类型")
+                return (idx, f"[转发附件: {filename}] 无法识别类型\nURL: {url}")
 
-    # 处理当前消息的附件
+        media_tasks = []
+        for idx, media in enumerate(media_list):
+            process_this = media.get('_cached', False) or media in media_to_process
+            if not process_this:
+                placeholder = f"[MEDIA_PLACEHOLDER_{idx}]"
+                decoded_content = decoded_content.replace(placeholder, f"[媒体附件: {media['filename']}] (超过处理限制，已忽略) URL: {media.get('url', '无')}")
+                continue
+            media_tasks.append(process_forwarded_media(idx, media))
+
+        if media_tasks:
+            results = await asyncio.gather(*media_tasks, return_exceptions=True)
+            for res in results:
+                if isinstance(res, Exception):
+                    error(f"[转发解析] 媒体处理异常: {res}")
+                    continue
+                idx, result_text = res
+                placeholder = f"[MEDIA_PLACEHOLDER_{idx}]"
+                decoded_content = decoded_content.replace(placeholder, result_text)
+
+    # 处理当前消息的附件（并发处理）
     attachments = parsed.get("attachments", [])
     extra_content_parts = []
     loop = asyncio.get_event_loop()
 
-    for att in attachments:
+    async def process_attachment(att):
         content_type = att.get("content_type", "")
         filename = att.get("filename", "未知文件")
         url = att.get("url")
         if not url:
-            continue
+            return None
         media_type = None
         if content_type.startswith("image/"):
             media_type = "image"
@@ -646,10 +667,9 @@ async def handle_message(data: Dict, bot_client: 'BotClient'):
             elif len(summary) > 600:
                 summary = summary[:600] + "...（摘要过长，已截断）"
             if media_type == "image":
-                block = f"[收到图片：{filename}]===图片{filename}摘要开始===\n{summary}\n===图片{filename}摘要结束==="
+                return f"[收到图片：{filename}]\nURL: {url}\n===图片{filename}摘要开始===\n{summary}\n===图片{filename}摘要结束==="
             else:
-                block = f"[收到视频：{filename}]===视频{filename}摘要开始===\n{summary}\n===视频{filename}摘要结束==="
-            extra_content_parts.append(block)
+                return f"[收到视频：{filename}]\nURL: {url}\n===视频{filename}摘要开始===\n{summary}\n===视频{filename}摘要结束==="
         elif content_type == "file" and is_text_file(filename):
             try:
                 response = await loop.run_in_executor(
@@ -662,21 +682,31 @@ async def handle_message(data: Dict, bot_client: 'BotClient'):
                     max_len = 100 * 1024
                     if len(content) > max_len:
                         content = content[:max_len] + "\n... (文件内容过长，已截断)"
-                    block = f"[文件：{filename}] =====文件内容：{filename}开始=====\n{content}\n=====文件内容：{filename}结束====="
-                    extra_content_parts.append(block)
+                    return f"[文件：{filename}]\nURL: {url}\n=====文件内容：{filename}开始=====\n{content}\n=====文件内容：{filename}结束====="
                 else:
-                    extra_content_parts.append(f"[文件：{filename}] 下载失败")
+                    return f"[文件：{filename}] 下载失败\nURL: {url}"
             except Exception as e:
-                extra_content_parts.append(f"[文件：{filename}] 下载异常: {e}")
+                return f"[文件：{filename}] 下载异常: {e}\nURL: {url}"
+        return f"[附件: {filename}]\nURL: {url}\n（无法自动解析此附件类型）"
 
-    # 处理引用消息中的媒体
+    att_tasks = [process_attachment(att) for att in attachments if att.get("url")]
+    if att_tasks:
+        att_results = await asyncio.gather(*att_tasks, return_exceptions=True)
+        for res in att_results:
+            if isinstance(res, Exception):
+                error(f"[附件处理] 异常: {res}")
+            elif res:
+                extra_content_parts.append(res)
+
+    # 处理引用消息中的媒体（并发处理）
     ref_media = parsed.get("ref_media", [])
-    for ref in ref_media:
+
+    async def process_ref_media(ref):
         content_type = ref.get("content_type", "")
         filename = ref.get("filename", "未知文件")
         url = ref.get("url")
         if not url:
-            continue
+            return None
         media_type = None
         if content_type.startswith("image/"):
             media_type = "image"
@@ -694,10 +724,9 @@ async def handle_message(data: Dict, bot_client: 'BotClient'):
             elif len(summary) > 600:
                 summary = summary[:600] + "...（摘要过长，已截断）"
             if media_type == "image":
-                block = f"[引用图片：{filename}]===图片{filename}摘要开始===\n{summary}\n===图片{filename}摘要结束==="
+                return f"[引用图片：{filename}]\nURL: {url}\n===图片{filename}摘要开始===\n{summary}\n===图片{filename}摘要结束==="
             else:
-                block = f"[引用视频：{filename}]===视频{filename}摘要开始===\n{summary}\n===视频{filename}摘要结束==="
-            extra_content_parts.append(block)
+                return f"[引用视频：{filename}]\nURL: {url}\n===视频{filename}摘要开始===\n{summary}\n===视频{filename}摘要结束==="
         elif content_type == "file" and is_text_file(filename):
             try:
                 response = await loop.run_in_executor(
@@ -710,59 +739,27 @@ async def handle_message(data: Dict, bot_client: 'BotClient'):
                     max_len = 100 * 1024
                     if len(content) > max_len:
                         content = content[:max_len] + "\n... (文件内容过长，已截断)"
-                    block = f"[引用文件：{filename}] =====文件内容：{filename}开始=====\n{content}\n=====文件内容：{filename}结束====="
-                    extra_content_parts.append(block)
+                    return f"[引用文件：{filename}]\nURL: {url}\n=====文件内容：{filename}开始=====\n{content}\n=====文件内容：{filename}结束====="
                 else:
-                    extra_content_parts.append(f"[引用文件：{filename}] 下载失败")
+                    return f"[引用文件：{filename}] 下载失败\nURL: {url}"
             except Exception as e:
-                extra_content_parts.append(f"[引用文件：{filename}] 下载异常: {e}")
+                return f"[引用文件：{filename}] 下载异常: {e}\nURL: {url}"
+        return f"[引用附件: {filename}]\nURL: {url}\n（无法自动解析此附件类型）"
+
+    ref_tasks = [process_ref_media(ref) for ref in ref_media if ref.get("url")]
+    if ref_tasks:
+        ref_results = await asyncio.gather(*ref_tasks, return_exceptions=True)
+        for res in ref_results:
+            if isinstance(res, Exception):
+                error(f"[引用媒体处理] 异常: {res}")
+            elif res:
+                extra_content_parts.append(res)
 
     if extra_content_parts:
         if decoded_content:
             decoded_content = decoded_content + "\n" + "\n".join(extra_content_parts)
         else:
             decoded_content = "\n".join(extra_content_parts)
-
-    # 处理网页链接
-    url_parts = []
-    url_pattern = r'https?://[^\s<>"\'，。；！？）]+'
-    urls = re.findall(url_pattern, decoded_content)
-    for url in urls:
-        if not is_valid_url(url):
-            continue
-        print(f"[网页] 开始获取 {url} ...")
-        content = await fetch_webpage_content(url)
-        if content is None:
-            url_parts.append(f"{url}[网页内容获取失败]")
-            continue
-        if content.startswith("__MEDIA_URL__:"):
-            parts = content.split(":", 2)
-            if len(parts) >= 3:
-                media_type = parts[1]
-                media_url = parts[2]
-            else:
-                media_url = content.replace("__MEDIA_URL__:", "")
-                media_type = None
-            print(f"[网页] 检测到媒体 URL，类型: {media_type}，开始识别...")
-            filename = url.split('/')[-1].split('?')[0] or "媒体文件"
-            summary = await recognize_media_by_url(media_url, filename, media_type=media_type)
-            display_block = f"{url}[网页内容为媒体文件]\n=== {url} 的媒体摘要 ===\n{summary}\n=== {url} 的媒体摘要结尾 ==="
-            url_parts.append(display_block)
-            print(f"[网页] 媒体识别完成，摘要长度 {len(summary)} 字符")
-        else:
-            summary = await summarize_content_if_needed(content, max_len=5000, summary_len=400)
-            if len(summary) < len(content) * 0.7:
-                display_block = f"{url}[网页内容摘要]\n=== {url} 的内容摘要 ===\n{summary}\n=== {url} 的内容摘要结尾 ==="
-            else:
-                display_block = f"{url}[网页内容已自动获取]\n=== {url} 的内容 ===\n{summary}\n=== {url} 的内容结尾 ==="
-            url_parts.append(display_block)
-            print(f"[网页] 获取 {url} 成功，原始长度 {len(content)} 字符，摘要后 {len(summary)} 字符")
-
-    if url_parts:
-        if decoded_content:
-            decoded_content = decoded_content + "\n" + "\n".join(url_parts)
-        else:
-            decoded_content = "\n".join(url_parts)
 
     # 语音消息标注
     is_voice = parsed.get("is_voice", False)
@@ -783,10 +780,10 @@ async def handle_message(data: Dict, bot_client: 'BotClient'):
 
     author_id = parsed["author_id"]
     msg_username = parsed.get("username", "")
-    display_username = get_display_name(author_id, msg_username)
+    display_username = get_display_name(author_id, msg_username, bot_client.app_id)
     user_identifier = f"{display_username}({author_id})"
     if msg_username:
-        update_user_mapping(author_id, msg_username)
+        update_user_mapping(author_id, msg_username, bot_client.app_id)
 
     parsed["decoded_content"] = decoded_content
     parsed["clean_content"] = re.sub(r'<@[^>]+>\s*', '', decoded_content).strip()
@@ -797,11 +794,11 @@ async def handle_message(data: Dict, bot_client: 'BotClient'):
     msg_id = parsed["msg_id"]
     is_at_me = parsed["is_at_me"]
 
-    print(f"[收到] {msg_type} | {user_identifier}: {display_content}")
+    info(f"[收到] {msg_type} | {user_identifier}: {display_content}")
     if parsed.get("mentions"):
-        print(f"[提及详情] {json.dumps(parsed['mentions'], ensure_ascii=False)}")
+        info(f"[提及详情] {json.dumps(parsed['mentions'], ensure_ascii=False)}")
     if is_voice:
-        print(f"[语音] URL: {parsed.get('voice_url', '')}")
+        info(f"[语音] URL: {parsed.get('voice_url', '')}")
 
     if msg_type == "c2c":
         thread_key = get_thread_key("c2c", parsed["author_id"])
@@ -820,7 +817,7 @@ async def handle_message(data: Dict, bot_client: 'BotClient'):
         old_task = pending_process_tasks[thread_key]
         if not old_task.done():
             old_task.cancel()
-            print(f"[中断] 取消线程 {thread_key} 的旧处理任务")
+            info(f"[中断] 取消线程 {thread_key} 的旧处理任务")
         del pending_process_tasks[thread_key]
 
     # @机器人：立即处理
@@ -878,8 +875,8 @@ async def handle_event(data: Dict, bot_client: 'BotClient'):
         member_openid = payload.get("member_openid")
         username = payload.get("username")
         if member_openid and username:
-            update_user_mapping(member_openid, username)
-            print(f"[事件] 保存申请人信息: {member_openid} -> {username}")
+            update_user_mapping(member_openid, username, bot_client.app_id)
+            info(f"[事件] 保存申请人信息: {member_openid} -> {username}")
         return
 
     if event_type == "GROUP_MEMBER_ADD":
@@ -887,7 +884,7 @@ async def handle_event(data: Dict, bot_client: 'BotClient'):
         member_openid = payload.get("member_openid")
         if not group_openid or not member_openid:
             return
-        username = get_user_name(member_openid) or member_openid
+        username = get_user_name(member_openid, bot_client.app_id) or member_openid
         thread_key = get_thread_key("group", None, group_openid)
         join_msg = f"{username} 加入了群聊"
         append_message(thread_key, "user", join_msg)
@@ -906,13 +903,13 @@ async def handle_event(data: Dict, bot_client: 'BotClient'):
                 success = await bot_client.send_message("group", group_openid, reply, msg_id=None)
                 if success:
                     append_message(thread_key, "assistant", reply)
-                    print(f"[事件] 自动欢迎回复发送成功: {reply}")
+                    info(f"[事件] 自动欢迎回复发送成功: {reply}")
                 else:
-                    print("[事件] 自动欢迎回复发送失败")
+                    error("[事件] 自动欢迎回复发送失败")
             else:
-                print("[事件] 生成回复为空，不发送")
+                info("[事件] 生成回复为空，不发送")
         else:
-            print(f"[事件] 自动欢迎关闭或机器人禁用，仅记录加入消息")
+            info(f"[事件] 自动欢迎关闭或机器人禁用，仅记录加入消息")
         return
 
     if event_type == "GROUP_MEMBER_REMOVE":
@@ -920,7 +917,7 @@ async def handle_event(data: Dict, bot_client: 'BotClient'):
         member_openid = payload.get("member_openid")
         if not group_openid or not member_openid:
             return
-        username = get_user_name(member_openid) or member_openid
+        username = get_user_name(member_openid, bot_client.app_id) or member_openid
         thread_key = get_thread_key("group", None, group_openid)
         leave_msg = f"{username} 退出了群聊"
         append_message(thread_key, "user", leave_msg)
@@ -942,15 +939,15 @@ async def handle_event(data: Dict, bot_client: 'BotClient'):
                     success = await bot_client.send_message("group", group_openid, reply, msg_id=None)
                     if success:
                         append_message(thread_key, "assistant", reply)
-                        print(f"[事件] 退出回复发送成功: {reply}")
+                        info(f"[事件] 退出回复发送成功: {reply}")
                     else:
-                        print("[事件] 退出回复发送失败")
+                        error("[事件] 退出回复发送失败")
                 else:
-                    print("[事件] 生成回复为空，不发送")
+                    info("[事件] 生成回复为空，不发送")
             else:
-                print("[事件] Judge 判定无需回复退出消息")
+                info("[事件] Judge 判定无需回复退出消息")
         else:
-            print(f"[事件] 机器人禁用，仅记录退出消息")
+            info(f"[事件] 机器人禁用，仅记录退出消息")
         return
 
-    print(f"[未处理事件] {event_type}: {payload}")
+    info(f"[未处理事件] {event_type}: {payload}")

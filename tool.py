@@ -10,6 +10,7 @@ from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse
 from datetime import datetime, timedelta, timezone
 
+from log import info, warn, error, debug
 from config import get_executor, is_group_manage_enabled
 from memory import (
     get_cached_media_summary, set_cached_media, get_media_cache_key, get_url_cache_key,
@@ -346,7 +347,7 @@ async def execute_http_request(method: str, url: str, headers: Dict = None,
 
     try:
         timeout_display = timeout if timeout != 0 else "不限"
-        print(f"[HTTP工具] {method} {url[:80]}（超时={timeout_display}s, SSL验证={verify_ssl}, 跟随重定向={allow_redirects}）")
+        info(f"[HTTP工具] {method} {url[:80]}（超时={timeout_display}s, SSL验证={verify_ssl}, 跟随重定向={allow_redirects}）")
         resp = await loop.run_in_executor(get_executor(), _do_request)
         status = resp.status_code
         resp_headers = dict(resp.headers)
@@ -368,7 +369,7 @@ async def execute_http_request(method: str, url: str, headers: Dict = None,
         if truncated:
             result += f"\n...（响应过长，已截断至{max_body_length}字符）"
 
-        print(f"[HTTP工具] 完成，状态码 {status}，响应长度 {len(content)}")
+        info(f"[HTTP工具] 完成，状态码 {status}，响应长度 {len(content)}")
         return result
     except requests.exceptions.Timeout:
         timeout_msg = f"HTTP请求超时（{timeout}秒）" if timeout != 0 else "HTTP请求超时（无限制超时仍有系统级超时）"
@@ -398,9 +399,9 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
         arguments = _json.loads(arguments_str) if arguments_str else {}
     except _json.JSONDecodeError:
         arguments = {}
-        print(f"[工具执行] 参数解析失败: {arguments_str[:200]}")
+        error(f"[工具执行] 参数解析失败: {arguments_str[:200]}")
 
-    print(f"[工具执行] 调用 {function_name}，参数: {_json.dumps(arguments, ensure_ascii=False)[:200]}")
+    info(f"[工具执行] 调用 {function_name}，参数: {_json.dumps(arguments, ensure_ascii=False)[:200]}")
 
     result_content = ""
 
@@ -546,7 +547,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                             data = _json.loads(raw_text)
                         except _json.JSONDecodeError as e:
                             # 如果仍然解析失败，打印部分内容以供调试
-                            print(f"[搜索音乐] JSON解析失败，原始内容前200字符: {raw_text[:200]}")
+                            error(f"[搜索音乐] JSON解析失败，原始内容前200字符: {raw_text[:200]}")
                             raise e
                         songs = data.get("result", {}).get("songs", [])
                         if songs:
@@ -611,7 +612,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                                 ("真实URL-文件", real_url, 4),
                             ]
                         for label, url, ftype in attempts:
-                            print(f"[播放音乐] 尝试 {label}")
+                            info(f"[播放音乐] 尝试 {label}")
                             ok = await bot_client.send_message(
                                 msg_type=msg_type,
                                 recipient_id=recipient_id,
@@ -628,7 +629,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                                     result_content += f"（{caption}）"
                                 break
                             else:
-                                print(f"[播放音乐] {label} 失败")
+                                error(f"[播放音乐] {label} 失败")
                         if not success:
                             result_content = "音乐发送失败（所有尝试均失败）。"
             except Exception as e:
@@ -678,7 +679,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
     else:
         result_content = f"错误：未知工具 {function_name}"
 
-    print(f"[工具执行] {function_name} 结果: {result_content[:200]}")
+    info(f"[工具执行] {function_name} 结果: {result_content[:200]}")
 
     return {
         "role": "tool",

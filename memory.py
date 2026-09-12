@@ -7,9 +7,11 @@ import asyncio
 import hashlib
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
+from datetime import datetime, timedelta, timezone
 
+from log import info, warn, error, debug
 from config import (
-    safe_load_json, BASE_DIR, MEMORY_FILE, MIRROR_FILE,
+    safe_load_json, BASE_DIR, MEMORY_FILE, MIRROR_FILE, USER_MAP_FILE,
     HISTORY_DIR, MEDIA_CACHE_DIR, QUN_MEMORY_DIR, C2C_MEMORY_DIR, BOT_MEMORY_DIR,
     get_bot_isolate_flag, get_compress_threshold, get_context_limit,
     get_global_system_prompt, get_bot_system_prompt, get_bot_name,
@@ -85,8 +87,104 @@ def set_global_memory_enabled(enabled: bool, app_id: Optional[str] = None):
 
 
 # ==================== 用户映射表（mirror.json） ====================
+# 新格式: {"users": {"bot_appid": {"user_id": "username", ...}}}
+# 旧格式（自动备份为 old_version_mirror.json）:
+#   v1: {user_id: username}
+#   v2: {bot_appid: [{user_id: username}, ...]}
+
+
+# ==================== 用户/群映射表（user_map.json） ====================
+# 格式: {"app_id": {"user": ["user_openid1", ...], "group": ["group_openid1", ...]}}
+# 记录所有私聊过的用户ID和机器人加入过的群ID
+
+def load_user_map() -> dict:
+    """加载 user_map.json，返回 {app_id: {"user": [...], "group": [...]}}"""
+    return safe_load_json(USER_MAP_FILE, {})
+
+
+def save_user_map(data: dict):
+    """保存 user_map.json"""
+    with open(USER_MAP_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _ensure_user_map_app_entry(app_id: str) -> dict:
+    """确保 user_map 中有 app_id 条目，返回完整数据"""
+    data = load_user_map()
+    if app_id not in data:
+        data[app_id] = {"user": [], "group": []}
+    else:
+        if "user" not in data[app_id]:
+            data[app_id]["user"] = []
+        if "group" not in data[app_id]:
+            data[app_id]["group"] = []
+    return data
+
+
+def record_user_id(app_id: str, user_openid: str):
+    """记录私聊用户ID（C2C）"""
+    if not app_id or not user_openid:
+        return
+    data = _ensure_user_map_app_entry(app_id)
+    if user_openid not in data[app_id]["user"]:
+        data[app_id]["user"].append(user_openid)
+        save_user_map(data)
+        info(f"[UserMap] 记录私聊用户 {user_openid} (app={app_id})")
+
+
+def record_group_id(app_id: str, group_openid: str):
+    """记录群ID（Group）"""
+    if not app_id or not group_openid:
+        return
+    data = _ensure_user_map_app_entry(app_id)
+    if group_openid not in data[app_id]["group"]:
+        data[app_id]["group"].append(group_openid)
+        save_user_map(data)
+        info(f"[UserMap] 记录群 {group_openid} (app={app_id})")
+
+def _mirror_is_new_format(data: dict) -> bool:
+    """检测是否为最新格式：顶层含 'users' 键"""
+    return isinstance(data, dict) and "users" in data
+
+
+def mirror_migrate_old():
+    """
+    检测旧版 mirror.json，若有则备份为 old_version_mirror.json，
+    并创建一个空的新格式文件。
+    """
+    if not MIRROR_FILE.exists():
+        return
+    try:
+        with open(MIRROR_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return
+
+    # 空文件或已是最新格式 → 跳过
+    if not data or _mirror_is_new_format(data):
+        return
+
+    # 备份旧文件
+    backup_name = BASE_DIR / "old_version_mirror.json"
+    if backup_name.exists():
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_name = BASE_DIR / f"old_version_mirror_{timestamp}.json"
+    try:
+        MIRROR_FILE.rename(backup_name)
+        info(f"旧版 mirror.json 已备份为 {backup_name.name}")
+    except Exception as e:
+        warn(f"备份旧版 mirror.json 失败: {e}")
+        return
+
+    # 创建新格式的空文件
+    new_empty = {"users": {}}
+    with open(MIRROR_FILE, "w", encoding="utf-8") as f:
+        json.dump(new_empty, f, ensure_ascii=False, indent=2)
+    info("已创建新版 mirror.json（格式: {\"users\": {\"bot_appid\": {...}}}）")
+
+
 def load_mirror() -> Dict:
-    return safe_load_json(MIRROR_FILE, {})
+    return safe_load_json(MIRROR_FILE, {"users": {}})
 
 
 def save_mirror(data: Dict):
@@ -94,25 +192,45 @@ def save_mirror(data: Dict):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def get_user_mapping() -> Dict:
-    return load_mirror()
+def _ensure_bot_entry(bot_appid: str) -> Dict:
+    """确保 mirror data 中有 users→bot_appid 条目，返回完整的 mirror data"""
+    data = load_mirror()
+    if "users" not in data:
+        data["users"] = {}
+    if bot_appid not in data["users"]:
+        data["users"][bot_appid] = {}
+    return data
 
 
-def set_user_mapping(mapping: Dict):
-    save_mirror(mapping)
+def get_user_mapping(bot_appid: str) -> dict:
+    """获取指定机器人的用户映射 dict: {user_id: username, ...}"""
+    data = load_mirror()
+    return data.get("users", {}).get(bot_appid, {})
 
 
-def get_user_name(qq_id: str) -> Optional[str]:
-    return get_user_mapping().get(qq_id)
+def set_user_mapping(bot_appid: str, mapping_dict: dict):
+    """设置指定机器人的用户映射 dict"""
+    data = load_mirror()
+    if "users" not in data:
+        data["users"] = {}
+    data["users"][bot_appid] = mapping_dict
+    save_mirror(data)
 
 
-def update_user_mapping(qq_id: str, username: str):
+def get_user_name(qq_id: str, bot_appid: str) -> Optional[str]:
+    """在指定机器人的映射中查找用户名称"""
+    mapping = get_user_mapping(bot_appid)
+    return mapping.get(qq_id)
+
+
+def update_user_mapping(qq_id: str, username: str, bot_appid: str):
+    """更新指定机器人的用户映射，不存在则添加"""
     if not qq_id or not username:
         return
-    mapping = get_user_mapping()
-    if mapping.get(qq_id) != username:
-        mapping[qq_id] = username
-        set_user_mapping(mapping)
+    data = _ensure_bot_entry(bot_appid)
+    if data["users"][bot_appid].get(qq_id) != username:
+        data["users"][bot_appid][qq_id] = username
+        save_mirror(data)
 
 
 # ==================== 群记忆 ====================
@@ -329,7 +447,10 @@ def save_history(thread_key: str, hist: List[Dict]):
 
 def append_message(thread_key: str, role: str, content: str, is_summary: bool = False):
     hist = load_history(thread_key)
-    msg = {"role": role, "content": content}
+    # 自动添加北京时间时间戳 [YYYY-MM-DD HH:MM]
+    bj_tz = timezone(timedelta(hours=8))
+    ts = datetime.now(bj_tz).strftime("%Y-%m-%d %H:%M")
+    msg = {"role": role, "content": f"[{ts}]{content}"}
     if is_summary:
         msg["is_summary"] = True
     hist.append(msg)
@@ -500,7 +621,7 @@ async def organize_global_memory(app_id: Optional[str] = None, retries: int = 3)
                 raise ValueError("整理后无有效记忆")
             current_list = get_global_memory(app_id)
             if len(current_list) > len(old_list):
-                print("[记忆整理] 整理期间有新记忆添加，放弃本次整理")
+                warn("[记忆整理] 整理期间有新记忆添加，放弃本次整理")
                 return
             timestamp = time.strftime("%Y%m%d_%H%M")
             suffix = f"_{app_id}" if app_id else ""
@@ -508,12 +629,12 @@ async def organize_global_memory(app_id: Optional[str] = None, retries: int = 3)
             with open(old_file, "w", encoding="utf-8") as f:
                 json.dump(old_list, f, ensure_ascii=False, indent=2)
             set_global_memory(new_list, app_id)
-            print(f"[记忆整理] 完成，原{len(old_list)}条精简为{len(new_list)}条，旧记忆保存至 {old_file}")
+            info(f"[记忆整理] 完成，原{len(old_list)}条精简为{len(new_list)}条，旧记忆保存至 {old_file}")
             return
         except Exception as e:
-            print(f"[记忆整理] 尝试 {attempt+1}/{retries} 失败: {e}")
+            error(f"[记忆整理] 尝试 {attempt+1}/{retries} 失败: {e}")
             await asyncio.sleep(2)
-    print("[记忆整理] 最终失败，保留原记忆")
+    error("[记忆整理] 最终失败，保留原记忆")
 
 
 # ==================== 记忆整理（群） ====================
@@ -575,7 +696,7 @@ async def organize_qun_memory(group_id: str, retries: int = 3):
             current_data = get_qun_memory(group_id)
             current_list = current_data.get("memory", [])
             if len(current_list) > len(old_list):
-                print(f"[群记忆整理] 整理期间有新记忆添加，放弃本次整理")
+                warn(f"[群记忆整理] 整理期间有新记忆添加，放弃本次整理")
                 return
             timestamp = time.strftime("%Y%m%d_%H%M")
             backup_dir = BASE_DIR / "qun_memory_backup"
@@ -584,12 +705,12 @@ async def organize_qun_memory(group_id: str, retries: int = 3):
             with open(old_file, "w", encoding="utf-8") as f:
                 json.dump(current_data, f, ensure_ascii=False, indent=2)
             set_qun_memory_list(group_id, new_list)
-            print(f"[群记忆整理] 群 {group_id} 整理完成，原{len(old_list)}条精简为{len(new_list)}条，旧记忆保存至 {old_file}")
+            info(f"[群记忆整理] 群 {group_id} 整理完成，原{len(old_list)}条精简为{len(new_list)}条，旧记忆保存至 {old_file}")
             return
         except Exception as e:
-            print(f"[群记忆整理] 尝试 {attempt+1}/{retries} 失败: {e}")
+            error(f"[群记忆整理] 尝试 {attempt+1}/{retries} 失败: {e}")
             await asyncio.sleep(2)
-    print(f"[群记忆整理] 群 {group_id} 最终失败，保留原记忆")
+    error(f"[群记忆整理] 群 {group_id} 最终失败，保留原记忆")
 
 
 # ==================== 自动记忆管理 ====================
@@ -748,7 +869,7 @@ async def update_memory_by_ai(app_id: str, identifier, user_message, reply, cont
                     add_func(identifier, content)
                 else:
                     add_func(identifier, content)
-                print(f"[记忆] {mem_type} 添加: {content}")
+                info(f"[记忆] {mem_type} 添加: {content}")
         elif action == "delete":
             idx = data.get("index")
             if idx is not None:
@@ -760,7 +881,7 @@ async def update_memory_by_ai(app_id: str, identifier, user_message, reply, cont
                 else:
                     removed = remove_func(identifier, idx)
                 if removed:
-                    print(f"[记忆] {mem_type} 删除索引 {idx}")
+                    info(f"[记忆] {mem_type} 删除索引 {idx}")
         elif action == "replace":
             idx = data.get("index")
             content = data.get("content")
@@ -773,7 +894,7 @@ async def update_memory_by_ai(app_id: str, identifier, user_message, reply, cont
                 else:
                     replaced = replace_func(identifier, idx, content)
                 if replaced:
-                    print(f"[记忆] {mem_type} 替换索引 {idx} 为: {content}")
+                    info(f"[记忆] {mem_type} 替换索引 {idx} 为: {content}")
         elif action == "clear":
             if is_global:
                 app_id_for_mem = extra_args[0] if extra_args else None
@@ -782,16 +903,20 @@ async def update_memory_by_ai(app_id: str, identifier, user_message, reply, cont
                 clear_func(identifier)
             else:
                 clear_func(identifier)
-            print(f"[记忆] {mem_type} 清空所有记忆")
+            info(f"[记忆] {mem_type} 清空所有记忆")
         elif action == "enable":
             enable_func()
-            print(f"[记忆] {mem_type} 已启用")
+            info(f"[记忆] {mem_type} 已启用")
         elif action == "disable":
             disable_func()
-            print(f"[记忆] {mem_type} 已禁用")
+            info(f"[记忆] {mem_type} 已禁用")
         else:
-            print(f"[记忆] {mem_type} 无操作")
+            info(f"[记忆] {mem_type} 无操作")
     except json.JSONDecodeError as e:
-        print(f"[记忆管理 JSON解析错误] {e}, 原始内容: {result[:200]}")
+        error(f"[记忆管理 JSON解析错误] {e}, 原始内容: {result[:200]}")
     except Exception as e:
-        print(f"[记忆管理错误] {e}")
+        info(f"[记忆管理错误] {e}")
+
+
+# ==================== 初始化：旧版 mirror 迁移 ====================
+mirror_migrate_old()
