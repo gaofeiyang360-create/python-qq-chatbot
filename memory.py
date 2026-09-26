@@ -9,12 +9,11 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timedelta, timezone
 
-from log import info, warn, error, debug
+from log import info, warn, error, debug, LogCtx
 from config import (
     safe_load_json, BASE_DIR, MEMORY_FILE, MIRROR_FILE, USER_MAP_FILE,
     HISTORY_DIR, MEDIA_CACHE_DIR, QUN_MEMORY_DIR, C2C_MEMORY_DIR, BOT_MEMORY_DIR,
     get_bot_isolate_flag, get_compress_threshold, get_context_limit,
-    get_global_system_prompt, get_bot_system_prompt, get_bot_name,
 )
 
 
@@ -94,8 +93,10 @@ def set_global_memory_enabled(enabled: bool, app_id: Optional[str] = None):
 
 
 # ==================== 用户/群映射表（user_map.json） ====================
-# 格式: {"app_id": {"user": ["user_openid1", ...], "group": ["group_openid1", ...]}}
-# 记录所有私聊过的用户ID和机器人加入过的群ID
+# 新格式: {"app_id": {"user": ["user_openid1", ...], "group": {"group_openid1": ["member_id1", ...], ...}}}
+# 旧格式（自动备份为 old_version_user_map.json）:
+#   旧格式: {"app_id": {"user": [...], "group": ["group_openid1", ...]}}
+# 记录所有私聊过的用户ID、机器人加入过的群ID及群内成员
 
 def load_user_map() -> dict:
     """加载 user_map.json，返回 {app_id: {"user": [...], "group": [...]}}"""
@@ -112,12 +113,12 @@ def _ensure_user_map_app_entry(app_id: str) -> dict:
     """确保 user_map 中有 app_id 条目，返回完整数据"""
     data = load_user_map()
     if app_id not in data:
-        data[app_id] = {"user": [], "group": []}
+        data[app_id] = {"user": [], "group": {}}
     else:
         if "user" not in data[app_id]:
             data[app_id]["user"] = []
         if "group" not in data[app_id]:
-            data[app_id]["group"] = []
+            data[app_id]["group"] = {}
     return data
 
 
@@ -129,18 +130,39 @@ def record_user_id(app_id: str, user_openid: str):
     if user_openid not in data[app_id]["user"]:
         data[app_id]["user"].append(user_openid)
         save_user_map(data)
-        info(f"[UserMap] 记录私聊用户 {user_openid} (app={app_id})")
+        info(f"[UserMap] 记录私聊用户 {user_openid} (app={app_id})", ctx=app_id)
 
 
-def record_group_id(app_id: str, group_openid: str):
-    """记录群ID（Group）"""
+def record_group_id(app_id: str, group_openid: str, member_id: str = None):
+    """记录群ID（Group），可选同时记录该群的一个成员"""
     if not app_id or not group_openid:
         return
     data = _ensure_user_map_app_entry(app_id)
     if group_openid not in data[app_id]["group"]:
-        data[app_id]["group"].append(group_openid)
+        data[app_id]["group"][group_openid] = []
+        if member_id:
+            data[app_id]["group"][group_openid].append(member_id)
         save_user_map(data)
-        info(f"[UserMap] 记录群 {group_openid} (app={app_id})")
+        info(f"[UserMap] 记录群 {group_openid} (app={app_id})", ctx=app_id)
+    elif member_id and member_id not in data[app_id]["group"][group_openid]:
+        data[app_id]["group"][group_openid].append(member_id)
+        save_user_map(data)
+        info(f"[UserMap] 记录群成员 {member_id} -> 群 {group_openid} (app={app_id})", ctx=app_id)
+
+
+def record_group_member(app_id: str, group_openid: str, member_id: str):
+    """记录群内的一个成员，群不存在时会自动创建"""
+    if not app_id or not group_openid or not member_id:
+        return
+    data = _ensure_user_map_app_entry(app_id)
+    if group_openid not in data[app_id]["group"]:
+        data[app_id]["group"][group_openid] = [member_id]
+        save_user_map(data)
+        info(f"[UserMap] 记录群 {group_openid} 及其成员 {member_id} (app={app_id})", ctx=app_id)
+    elif member_id not in data[app_id]["group"][group_openid]:
+        data[app_id]["group"][group_openid].append(member_id)
+        save_user_map(data)
+        info(f"[UserMap] 记录群成员 {member_id} -> 群 {group_openid} (app={app_id})", ctx=app_id)
 
 def _mirror_is_new_format(data: dict) -> bool:
     """检测是否为最新格式：顶层含 'users' 键"""
@@ -171,20 +193,72 @@ def mirror_migrate_old():
         backup_name = BASE_DIR / f"old_version_mirror_{timestamp}.json"
     try:
         MIRROR_FILE.rename(backup_name)
-        info(f"旧版 mirror.json 已备份为 {backup_name.name}")
+        info(f"旧版 mirror.json 已备份为 {backup_name.name}", ctx=None)
     except Exception as e:
-        warn(f"备份旧版 mirror.json 失败: {e}")
+        warn(f"备份旧版 mirror.json 失败: {e}", ctx=None)
         return
 
     # 创建新格式的空文件
-    new_empty = {"users": {}}
+    new_empty = {"users": {}, "groups": {}}
     with open(MIRROR_FILE, "w", encoding="utf-8") as f:
         json.dump(new_empty, f, ensure_ascii=False, indent=2)
-    info("已创建新版 mirror.json（格式: {\"users\": {\"bot_appid\": {...}}}）")
+    info("已创建新版 mirror.json（格式: {\"users\": {...}, \"groups\": {...}}）", ctx=None)
+
+
+def user_map_migrate_old():
+    """
+    检测旧版 user_map.json 的 group 格式（列表），转换为新版格式（字典）。
+    旧: {"app_id": {"group": ["gid1", "gid2"]}}
+    新: {"app_id": {"group": {"gid1": [], "gid2": []}}}
+    """
+    if not USER_MAP_FILE.exists():
+        return
+    try:
+        data = safe_load_json(USER_MAP_FILE, {})
+        if not data:
+            return
+    except Exception:
+        return
+
+    changed = False
+    for app_id, entry in data.items():
+        if not isinstance(entry, dict):
+            continue
+        group_val = entry.get("group")
+        if isinstance(group_val, list):
+            # 旧格式: [gid1, gid2] -> 新格式: {gid1: [], gid2: []}
+            entry["group"] = {gid: [] for gid in group_val}
+            changed = True
+
+    if not changed:
+        # 已经是新格式（dict），但确保所有 group 值都是列表
+        for entry in data.values():
+            if isinstance(entry, dict) and isinstance(entry.get("group"), dict):
+                for gid, members in entry["group"].items():
+                    if not isinstance(members, list):
+                        entry["group"][gid] = []
+                        changed = True
+        if not changed:
+            return
+
+    # 备份旧文件
+    backup_name = BASE_DIR / "old_version_user_map.json"
+    if backup_name.exists():
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_name = BASE_DIR / f"old_version_user_map_{timestamp}.json"
+    try:
+        USER_MAP_FILE.rename(backup_name)
+        info(f"旧版 user_map.json 已备份为 {backup_name.name}", ctx=None)
+    except Exception as e:
+        warn(f"备份旧版 user_map.json 失败: {e}", ctx=None)
+        return
+
+    save_user_map(data)
+    info("user_map.json 已迁移为新格式（group 列表 -> 字典，含成员列表）", ctx=None)
 
 
 def load_mirror() -> Dict:
-    return safe_load_json(MIRROR_FILE, {"users": {}})
+    return safe_load_json(MIRROR_FILE, {"users": {}, "groups": {}})
 
 
 def save_mirror(data: Dict):
@@ -231,6 +305,34 @@ def update_user_mapping(qq_id: str, username: str, bot_appid: str):
     if data["users"][bot_appid].get(qq_id) != username:
         data["users"][bot_appid][qq_id] = username
         save_mirror(data)
+
+
+# ==================== mirror.json 群记录 ====================
+def _ensure_mirror_groups_entry(app_id: str) -> Dict:
+    """确保 mirror data 中有 groups→app_id 条目，返回完整 mirror data"""
+    data = load_mirror()
+    if "groups" not in data:
+        data["groups"] = {}
+    if app_id not in data["groups"]:
+        data["groups"][app_id] = {}
+    return data
+
+
+def save_group_to_mirror(app_id: str, group_openid: str, group_name: str):
+    """记录群ID和群名称到 mirror.json groups 字段"""
+    if not app_id or not group_openid or not group_name:
+        return
+    data = _ensure_mirror_groups_entry(app_id)
+    if data["groups"][app_id].get(group_openid) != group_name:
+        data["groups"][app_id][group_openid] = group_name
+        save_mirror(data)
+        info(f"[Mirror] 记录群信息: {group_name} ({group_openid}) (app={app_id})", ctx=app_id)
+
+
+def get_group_name_from_mirror(app_id: str, group_openid: str) -> Optional[str]:
+    """从 mirror.json 查询群名称，返回 None 表示不存在"""
+    data = load_mirror()
+    return data.get("groups", {}).get(app_id, {}).get(group_openid)
 
 
 # ==================== 群记忆 ====================
@@ -445,14 +547,29 @@ def save_history(thread_key: str, hist: List[Dict]):
         json.dump(hist, f, ensure_ascii=False, indent=2)
 
 
-def append_message(thread_key: str, role: str, content: str, is_summary: bool = False):
+def append_message(thread_key: str, role: str, content: str, is_summary: bool = False,
+                   msg_id: Optional[str] = None, msg_idx: Optional[str] = None,
+                   ref_msg_idx: Optional[str] = None, is_markdown: bool = False,
+                   is_wakeup: bool = False, media_url: Optional[str] = None):
     hist = load_history(thread_key)
     # 自动添加北京时间时间戳 [YYYY-MM-DD HH:MM]
     bj_tz = timezone(timedelta(hours=8))
     ts = datetime.now(bj_tz).strftime("%Y-%m-%d %H:%M")
     msg = {"role": role, "content": f"[{ts}]{content}"}
+    if msg_id:
+        msg["msg_id"] = msg_id
+    if msg_idx:
+        msg["msg_idx"] = msg_idx
+    if ref_msg_idx:
+        msg["ref_msg_idx"] = ref_msg_idx
     if is_summary:
         msg["is_summary"] = True
+    if is_markdown:
+        msg["is_markdown"] = 1      # Markdown 消息标记（API 返回用；发给 AI 前会剥离）
+    if is_wakeup:
+        msg["is_wakeup"] = 1        # 唤醒消息标记（API 返回用；发给 AI 前会剥离）
+    if media_url:
+        msg["media_url"] = media_url  # 媒体原始 URL（API 返回用；发给 AI 前会剥离）
     hist.append(msg)
     save_history(thread_key, hist)
 
@@ -471,6 +588,45 @@ def append_message(thread_key: str, role: str, content: str, is_summary: bool = 
                 asyncio.create_task(generate_and_insert_summary(thread_key))
         except Exception:
             pass
+
+
+def strip_message_meta(msg: Dict) -> Dict:
+    """返回移除了内部元数据字段的消息副本，用于发送给 AI。
+
+    剥离的字段：msg_id / msg_idx / ref_msg_idx / revoked / is_markdown / is_wakeup / media_url
+    （这些只服务于 API 查询与撤回逻辑，不该出现在喂给模型的上下文里）
+    """
+    cleaned = {k: v for k, v in msg.items()
+               if k not in ("msg_id", "msg_idx", "ref_msg_idx", "revoked",
+                            "is_markdown", "is_wakeup", "media_url")}
+    return cleaned
+
+
+def mark_message_revoked(thread_key: str, msg_id_to_revoke: str) -> bool:
+    """
+    在聊天记录中标记指定 msg_id 的消息为已撤回。
+    在 content 中添加 "已撤回" 前缀，并设置 revoked=true。
+    返回 True 表示找到并标记成功，False 表示未找到。
+    """
+    if not thread_key or not msg_id_to_revoke:
+        return False
+    try:
+        hist = load_history(thread_key)
+        found = False
+        for msg in hist:
+            if msg.get("msg_id") == msg_id_to_revoke and not msg.get("revoked"):
+                raw = msg.get("content", "")
+                if not raw.startswith("[已撤回]"):
+                    # 格式: [2026-09-15 22:09]内容 → [已撤回][2026-09-15 22:09]内容
+                    msg["content"] = "[已撤回]" + raw
+                msg["revoked"] = True
+                found = True
+                # 不 break，继续标记所有匹配的（可能多条相同 msg_id 的情况）
+        if found:
+            save_history(thread_key, hist)
+        return found
+    except Exception:
+        return False
 
 
 def get_history(thread_key: str, limit: int = None) -> List[Dict]:
@@ -583,7 +739,25 @@ async def check_and_organize_global_memory(app_id: Optional[str] = None):
 
 
 async def organize_global_memory(app_id: Optional[str] = None, retries: int = 3):
-    from ai import call_ai  # 延迟导入避免循环依赖
+    from ai import call_ai_with_tools  # 延迟导入避免循环依赖
+    organize_tool = {
+        "type": "function",
+        "function": {
+            "name": "organize_memory",
+            "description": "提交整理精简后的记忆列表",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "memories": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "整理精简后的记忆列表，每一条记忆是一个字符串。如果涉及用户，必须包含用户名(QQ号)的格式"
+                    }
+                },
+                "required": ["memories"]
+            }
+        }
+    }
     for attempt in range(retries):
         try:
             old_list = get_global_memory(app_id)
@@ -595,53 +769,47 @@ async def organize_global_memory(app_id: Optional[str] = None, retries: int = 3)
             user_msg = (
                 "当前记忆列表如下（每条记忆是一个字符串）：\n"
                 f"{json.dumps(old_list, ensure_ascii=False, indent=2)}\n\n"
-                "请将上述记忆列表精简、合并，输出多行文本，每行一条精简后的记忆。\n"
-                "要求：如果记忆涉及用户，必须包含用户名(QQ号)的格式。\n"
-                "格式：第一行以【开头，最后一行以】结尾，中间每一行是一条记忆。\n"
-                "只输出这种格式的文本，不要有其他内容。"
+                "请调用 organize_memory 工具提交整理精简后的记忆列表。\n"
+                "要求：保留重要信息，合并相似内容，删除过期/无关信息。\n"
+                "如果记忆涉及用户，必须包含用户名(QQ号)的格式。"
             )
-            result = await call_ai(
+            ai_msg = await call_ai_with_tools(
                 [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
-                "main",
+                "judge",
+                [organize_tool],
                 temperature=0.3
-            )
-            lines = result.strip().split('\n')
-            if not lines:
-                raise ValueError("返回为空")
-            first = lines[0].strip()
-            last = lines[-1].strip()
-            if not first.startswith('【') or not last.endswith('】'):
-                raise ValueError("首行不以【开头或末行不以】结尾")
-            new_list = []
-            for line in lines[1:-1]:
-                line = line.strip()
-                if line:
-                    new_list.append(line)
-            if not new_list:
+            , ctx=app_id)
+            tool_calls = ai_msg.get("tool_calls", [])
+            if not tool_calls:
+                raise ValueError("AI 未调用 organize_memory 工具")
+            args = json.loads(tool_calls[0]["function"]["arguments"])
+            new_list = args.get("memories", [])
+            if not new_list or not isinstance(new_list, list):
                 raise ValueError("整理后无有效记忆")
-            current_list = get_global_memory(app_id)
-            if len(current_list) > len(old_list):
-                warn("[记忆整理] 整理期间有新记忆添加，放弃本次整理")
-                return
             timestamp = time.strftime("%Y%m%d_%H%M")
             suffix = f"_{app_id}" if app_id else ""
             old_file = BASE_DIR / f"old_memory{suffix}_{timestamp}.json"
             with open(old_file, "w", encoding="utf-8") as f:
                 json.dump(old_list, f, ensure_ascii=False, indent=2)
             set_global_memory(new_list, app_id)
-            info(f"[记忆整理] 完成，原{len(old_list)}条精简为{len(new_list)}条，旧记忆保存至 {old_file}")
+            info(f"[记忆整理] 完成（工具调用），原{len(old_list)}条精简为{len(new_list)}条，旧记忆保存至 {old_file}", ctx=app_id)
             return
         except Exception as e:
-            error(f"[记忆整理] 尝试 {attempt+1}/{retries} 失败: {e}")
+            error(f"[记忆整理] 尝试 {attempt+1}/{retries} 失败: {e}", ctx=app_id)
             await asyncio.sleep(2)
-    error("[记忆整理] 最终失败，保留原记忆")
+    error("[记忆整理] 最终失败，保留原记忆", ctx=app_id)
 
 
 # ==================== 记忆整理（群） ====================
 _is_organizing_qun: Dict[str, bool] = {}
 
 
-async def check_and_organize_qun_memory(group_id: str):
+async def check_and_organize_qun_memory(group_id: str, app_id: Optional[str] = None):
+    """检查群记忆是否超阈值，超了就触发整理。
+
+    app_id: 所属机器人 APP_ID，由调用方（auto_manage_memory）显式传入，
+            用于日志标识；缺失时日志显示 appid=? 而非猜测。
+    """
     if _is_organizing_qun.get(group_id, False):
         return
     if not get_qun_memory_enabled(group_id):
@@ -650,13 +818,38 @@ async def check_and_organize_qun_memory(group_id: str):
     if len(mem) > 15:
         _is_organizing_qun[group_id] = True
         try:
-            await organize_qun_memory(group_id)
+            await organize_qun_memory(group_id, app_id=app_id)
         finally:
             _is_organizing_qun[group_id] = False
 
 
-async def organize_qun_memory(group_id: str, retries: int = 3):
-    from ai import call_ai  # 延迟导入避免循环依赖
+async def organize_qun_memory(group_id: str, retries: int = 3,
+                             app_id: Optional[str] = None):
+    """整理（压缩）群记忆。
+
+    app_id: 所属机器人 APP_ID，由调用链显式传入，用于日志标识。
+    """
+    # 本函数所有日志统一使用的标识（thread_key = 群会话）
+    ctx = LogCtx(app_id=app_id or "", thread_key=f"group_{group_id}")
+    from ai import call_ai_with_tools  # 延迟导入避免循环依赖
+    organize_tool = {
+        "type": "function",
+        "function": {
+            "name": "organize_memory",
+            "description": "提交整理精简后的记忆列表",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "memories": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "整理精简后的记忆列表，每一条记忆是一个字符串。如果涉及用户，必须包含用户名(QQ号)的格式"
+                    }
+                },
+                "required": ["memories"]
+            }
+        }
+    }
     for attempt in range(retries):
         try:
             qun_data = get_qun_memory(group_id)
@@ -669,35 +862,23 @@ async def organize_qun_memory(group_id: str, retries: int = 3):
             user_msg = (
                 "当前群记忆列表如下（每条记忆是一个字符串）：\n"
                 f"{json.dumps(old_list, ensure_ascii=False, indent=2)}\n\n"
-                "请将上述记忆列表精简、合并，输出多行文本，每行一条精简后的记忆。\n"
-                "要求：如果记忆涉及用户，必须包含用户名(QQ号)的格式。\n"
-                "格式：第一行以【开头，最后一行以】结尾，中间每一行是一条记忆。\n"
-                "只输出这种格式的文本，不要有其他内容。"
+                "请调用 organize_memory 工具提交整理精简后的记忆列表。\n"
+                "要求：保留重要信息，合并相似内容，删除过期/无关信息。\n"
+                "如果记忆涉及用户，必须包含用户名(QQ号)的格式。"
             )
-            result = await call_ai(
+            ai_msg = await call_ai_with_tools(
                 [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
-                "main",
+                "judge",
+                [organize_tool],
                 temperature=0.3
-            )
-            lines = result.strip().split('\n')
-            if not lines:
-                raise ValueError("返回为空")
-            first = lines[0].strip()
-            last = lines[-1].strip()
-            if not first.startswith('【') or not last.endswith('】'):
-                raise ValueError("首行不以【开头或末行不以】结尾")
-            new_list = []
-            for line in lines[1:-1]:
-                line = line.strip()
-                if line:
-                    new_list.append(line)
-            if not new_list:
+            , ctx=ctx)
+            tool_calls = ai_msg.get("tool_calls", [])
+            if not tool_calls:
+                raise ValueError("AI 未调用 organize_memory 工具")
+            args = json.loads(tool_calls[0]["function"]["arguments"])
+            new_list = args.get("memories", [])
+            if not new_list or not isinstance(new_list, list):
                 raise ValueError("整理后无有效记忆")
-            current_data = get_qun_memory(group_id)
-            current_list = current_data.get("memory", [])
-            if len(current_list) > len(old_list):
-                warn(f"[群记忆整理] 整理期间有新记忆添加，放弃本次整理")
-                return
             timestamp = time.strftime("%Y%m%d_%H%M")
             backup_dir = BASE_DIR / "qun_memory_backup"
             backup_dir.mkdir(exist_ok=True)
@@ -705,218 +886,276 @@ async def organize_qun_memory(group_id: str, retries: int = 3):
             with open(old_file, "w", encoding="utf-8") as f:
                 json.dump(current_data, f, ensure_ascii=False, indent=2)
             set_qun_memory_list(group_id, new_list)
-            info(f"[群记忆整理] 群 {group_id} 整理完成，原{len(old_list)}条精简为{len(new_list)}条，旧记忆保存至 {old_file}")
+            info(f"[群记忆整理] 群 {group_id} 整理完成（工具调用），原{len(old_list)}条精简为{len(new_list)}条，旧记忆保存至 {old_file}", ctx=ctx)
             return
         except Exception as e:
-            error(f"[群记忆整理] 尝试 {attempt+1}/{retries} 失败: {e}")
+            error(f"[群记忆整理] 尝试 {attempt+1}/{retries} 失败: {e}", ctx=ctx)
             await asyncio.sleep(2)
-    error(f"[群记忆整理] 群 {group_id} 最终失败，保留原记忆")
+    error(f"[群记忆整理] 群 {group_id} 最终失败，保留原记忆", ctx=ctx)
+
+
+# ==================== 记忆整理（机器人） ====================
+_is_organizing_bot: Dict[str, bool] = {}
+
+
+async def check_and_organize_bot_memory(app_id: str):
+    if _is_organizing_bot.get(app_id, False):
+        return
+    if not get_bot_memory_enabled(app_id):
+        return
+    mem = get_bot_memory_list(app_id)
+    if len(mem) > 15:
+        _is_organizing_bot[app_id] = True
+        try:
+            await organize_bot_memory(app_id)
+        finally:
+            _is_organizing_bot[app_id] = False
+
+
+async def organize_bot_memory(app_id: str, retries: int = 3):
+    from ai import call_ai_with_tools
+    organize_tool = {
+        "type": "function",
+        "function": {
+            "name": "organize_memory",
+            "description": "提交整理精简后的记忆列表",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "memories": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "整理精简后的记忆列表，每一条记忆是一个字符串。如果涉及用户，必须包含用户名(QQ号)的格式"
+                    }
+                },
+                "required": ["memories"]
+            }
+        }
+    }
+    for attempt in range(retries):
+        try:
+            old_list = get_bot_memory_list(app_id)
+            if len(old_list) <= 15:
+                return
+            if len(old_list) > 50:
+                old_list = old_list[:50] + [f"... 还有 {len(old_list)-50} 条记忆未显示"]
+            system_msg = "你是一个记忆整理助手，负责精简和合并机器人专属记忆列表。"
+            user_msg = (
+                "当前机器人记忆列表如下（每条记忆是一个字符串）：\n"
+                f"{json.dumps(old_list, ensure_ascii=False, indent=2)}\n\n"
+                "请调用 organize_memory 工具提交整理精简后的记忆列表。\n"
+                "要求：保留重要信息，合并相似内容，删除过期/无关信息。\n"
+                "如果记忆涉及用户，必须包含用户名(QQ号)的格式。"
+            )
+            ai_msg = await call_ai_with_tools(
+                [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
+                "judge",
+                [organize_tool],
+                temperature=0.3
+            , ctx=app_id)
+            tool_calls = ai_msg.get("tool_calls", [])
+            if not tool_calls:
+                raise ValueError("AI 未调用 organize_memory 工具")
+            args = json.loads(tool_calls[0]["function"]["arguments"])
+            new_list = args.get("memories", [])
+            if not new_list or not isinstance(new_list, list):
+                raise ValueError("整理后无有效记忆")
+            timestamp = time.strftime("%Y%m%d_%H%M")
+            old_file = BASE_DIR / f"bot_memory_backup_{app_id}_{timestamp}.json"
+            with open(old_file, "w", encoding="utf-8") as f:
+                json.dump(old_list, f, ensure_ascii=False, indent=2)
+            set_bot_memory_list(app_id, new_list)
+            info(f"[机器人记忆整理] 完成（工具调用），原{len(old_list)}条精简为{len(new_list)}条，旧记忆保存至 {old_file}", ctx=app_id)
+            return
+        except Exception as e:
+            error(f"[机器人记忆整理] 尝试 {attempt+1}/{retries} 失败: {e}", ctx=app_id)
+            await asyncio.sleep(2)
+    error(f"[机器人记忆整理] 最终失败，保留原记忆", ctx=app_id)
+
+
+# ==================== 记忆整理（私聊） ====================
+_is_organizing_c2c: Dict[str, bool] = {}
+
+
+async def check_and_organize_c2c_memory(user_id: str, app_id: Optional[str] = None):
+    """检查私聊记忆是否超阈值，超了就触发整理。
+
+    app_id: 所属机器人 APP_ID，由调用方（auto_manage_memory）显式传入，
+            用于日志标识；缺失时日志显示 appid=? 而非猜测。
+    """
+    if _is_organizing_c2c.get(user_id, False):
+        return
+    if not get_c2c_memory_enabled(user_id):
+        return
+    mem = get_c2c_memory_list(user_id)
+    if len(mem) > 15:
+        _is_organizing_c2c[user_id] = True
+        try:
+            await organize_c2c_memory(user_id, app_id=app_id)
+        finally:
+            _is_organizing_c2c[user_id] = False
+
+
+async def organize_c2c_memory(user_id: str, retries: int = 3,
+                             app_id: Optional[str] = None):
+    """整理（压缩）私聊记忆。
+
+    app_id: 所属机器人 APP_ID，由调用链显式传入，用于日志标识。
+    """
+    # 本函数所有日志统一使用的标识（thread_key = 私聊会话）
+    ctx = LogCtx(app_id=app_id or "", thread_key=f"c2c_{user_id}")
+    from ai import call_ai_with_tools
+    organize_tool = {
+        "type": "function",
+        "function": {
+            "name": "organize_memory",
+            "description": "提交整理精简后的记忆列表",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "memories": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "整理精简后的记忆列表，每一条记忆是一个字符串。如果涉及用户，必须包含用户名(QQ号)的格式"
+                    }
+                },
+                "required": ["memories"]
+            }
+        }
+    }
+    for attempt in range(retries):
+        try:
+            old_list = get_c2c_memory_list(user_id)
+            if len(old_list) <= 15:
+                return
+            if len(old_list) > 50:
+                old_list = old_list[:50] + [f"... 还有 {len(old_list)-50} 条记忆未显示"]
+            system_msg = "你是一个记忆整理助手，负责精简和合并私聊长期记忆列表。"
+            user_msg = (
+                "当前私聊记忆列表如下（每条记忆是一个字符串）：\n"
+                f"{json.dumps(old_list, ensure_ascii=False, indent=2)}\n\n"
+                "请调用 organize_memory 工具提交整理精简后的记忆列表。\n"
+                "要求：保留重要信息，合并相似内容，删除过期/无关信息。\n"
+                "如果记忆涉及用户，必须包含用户名(QQ号)的格式。"
+            )
+            ai_msg = await call_ai_with_tools(
+                [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
+                "judge",
+                [organize_tool],
+                temperature=0.3
+            , ctx=ctx)
+            tool_calls = ai_msg.get("tool_calls", [])
+            if not tool_calls:
+                raise ValueError("AI 未调用 organize_memory 工具")
+            args = json.loads(tool_calls[0]["function"]["arguments"])
+            new_list = args.get("memories", [])
+            if not new_list or not isinstance(new_list, list):
+                raise ValueError("整理后无有效记忆")
+            timestamp = time.strftime("%Y%m%d_%H%M")
+            old_file = BASE_DIR / f"c2c_memory_backup_{user_id}_{timestamp}.json"
+            with open(old_file, "w", encoding="utf-8") as f:
+                json.dump(old_list, f, ensure_ascii=False, indent=2)
+            set_c2c_memory_list(user_id, new_list)
+            info(f"[私聊记忆整理] 完成（工具调用），原{len(old_list)}条精简为{len(new_list)}条，旧记忆保存至 {old_file}", ctx=ctx)
+            return
+        except Exception as e:
+            error(f"[私聊记忆整理] 尝试 {attempt+1}/{retries} 失败: {e}", ctx=ctx)
+            await asyncio.sleep(2)
+    error(f"[私聊记忆整理] 最终失败，保留原记忆", ctx=ctx)
 
 
 # ==================== 自动记忆管理 ====================
-async def auto_manage_memory(thread_key: str, user_message: str, reply: str,
-                             context_hist: List[Dict], raw_json: str, bot_client):
+async def auto_manage_memory(thread_key: str, bot_client, **kwargs):
+    """
+    后台自动整理记忆（不涉及添加/修改/删除，这些由 AI 工具调用完成）。
+    检查全局、机器人、群/私聊所有四个层级的记忆，超过阈值时触发压缩整理。
+    """
     app_id = bot_client.app_id
     is_group = thread_key.startswith("group_")
-    is_c2c = thread_key.startswith("c2c_")
+
+    # —— 全局记忆 ——
+    await check_and_organize_global_memory(app_id)
+    # —— 机器人专属记忆 ——
+    await check_and_organize_bot_memory(app_id)
 
     if is_group:
         group_id = thread_key.replace("group_", "")
-        await update_memory_by_ai(
-            app_id=app_id, identifier=group_id,
-            user_message=user_message, reply=reply, context_hist=context_hist, raw_json=raw_json,
-            mem_type="群", mem_label="群长期记忆",
-            add_func=add_qun_memory, remove_func=remove_qun_memory,
-            replace_func=replace_qun_memory, clear_func=clear_qun_memory,
-            get_mem_func=get_qun_memory_list, set_mem_func=set_qun_memory_list,
-            enable_func=lambda: set_qun_memory_enabled(group_id, True),
-            disable_func=lambda: set_qun_memory_enabled(group_id, False),
-            get_enabled_func=lambda: get_qun_memory_enabled(group_id)
-        )
-    elif is_c2c:
-        user_id = thread_key.replace("c2c_", "")
-        await update_memory_by_ai(
-            app_id=app_id, identifier=user_id,
-            user_message=user_message, reply=reply, context_hist=context_hist, raw_json=raw_json,
-            mem_type="私聊", mem_label="私聊长期记忆",
-            add_func=add_c2c_memory, remove_func=remove_c2c_memory,
-            replace_func=replace_c2c_memory, clear_func=clear_c2c_memory,
-            get_mem_func=get_c2c_memory_list, set_mem_func=set_c2c_memory_list,
-            enable_func=lambda: set_c2c_memory_enabled(user_id, True),
-            disable_func=lambda: set_c2c_memory_enabled(user_id, False),
-            get_enabled_func=lambda: get_c2c_memory_enabled(user_id)
-        )
-
-    await update_memory_by_ai(
-        app_id=app_id, identifier=app_id,
-        user_message=user_message, reply=reply, context_hist=context_hist, raw_json=raw_json,
-        mem_type="机器人", mem_label=f"机器人({app_id})专属记忆",
-        add_func=add_bot_memory, remove_func=remove_bot_memory,
-        replace_func=replace_bot_memory, clear_func=clear_bot_memory,
-        get_mem_func=get_bot_memory_list, set_mem_func=set_bot_memory_list,
-        enable_func=lambda: set_bot_memory_enabled(app_id, True),
-        disable_func=lambda: set_bot_memory_enabled(app_id, False),
-        get_enabled_func=lambda: get_bot_memory_enabled(app_id),
-        is_bot=True
-    )
-
-    await update_memory_by_ai(
-        app_id=app_id, identifier=app_id,
-        user_message=user_message, reply=reply, context_hist=context_hist, raw_json=raw_json,
-        mem_type="全局", mem_label="全局长期记忆",
-        add_func=add_global_memory, remove_func=remove_global_memory,
-        replace_func=replace_global_memory, clear_func=clear_global_memory,
-        get_mem_func=get_global_memory, set_mem_func=set_global_memory,
-        enable_func=lambda: set_global_memory_enabled(True, app_id),
-        disable_func=lambda: set_global_memory_enabled(False, app_id),
-        get_enabled_func=lambda: get_global_memory_enabled(app_id),
-        is_global=True,
-        extra_args=(app_id,)
-    )
-
-    if is_group:
-        await check_and_organize_qun_memory(group_id)
+        await check_and_organize_qun_memory(group_id, app_id=app_id)
     else:
-        await check_and_organize_global_memory(app_id)
+        c2c_user_id = thread_key.replace("c2c_", "")
+        await check_and_organize_c2c_memory(c2c_user_id, app_id=app_id)
 
 
-async def update_memory_by_ai(app_id: str, identifier, user_message, reply, context_hist, raw_json,
-                              mem_type, mem_label,
-                              add_func, remove_func, replace_func, clear_func,
-                              get_mem_func, set_mem_func,
-                              enable_func, disable_func, get_enabled_func,
-                              is_global=False, is_bot=False, extra_args=()):
-    from ai import call_ai  # 延迟导入避免循环依赖
+# ==================== 记忆搜索 ====================
+def search_memory(keywords: List[str], layer: str = "all",
+                  app_id: Optional[str] = None,
+                  group_id: Optional[str] = None,
+                  c2c_user_id: Optional[str] = None) -> str:
+    """
+    跨层搜索记忆，返回格式化结果。
+    keywords: 搜索关键词列表（多个关键词取并集，只要匹配任意一个即返回）
+    layer:    "global"=全局记忆, "bot"=机器人记忆, "group"=群聊记忆,
+              "c2c"=私聊记忆, "all"=全部（默认）
+    app_id:   机器人 APP_ID（global/bot 层需要）
+    group_id: 群 openid（group 层需要）
+    c2c_user_id: 用户 openid（c2c 层需要）
+    """
+    results = []
 
-    if is_global:
-        app_id_for_mem = extra_args[0] if extra_args else None
-        current_mem = get_mem_func(app_id_for_mem)
-    elif is_bot:
-        current_mem = get_mem_func(identifier)
-    else:
-        current_mem = get_mem_func(identifier)
+    def _matches(text: str) -> bool:
+        text_lower = text.lower()
+        return any(kw.lower() in text_lower for kw in keywords)
 
-    enabled_status = "启用" if get_enabled_func() else "禁用"
-    mem_text = "\n".join([f"- {item}" for item in current_mem]) if current_mem else "（无）"
-
-    above_text = ""
-    for msg in context_hist[-5:]:
-        role = msg.get("role", "")
-        content = msg.get("content", "")
-        if role == "user":
-            above_text += f"用户: {content}\n"
-        elif role == "assistant":
-            above_text += f"机器人: {content}\n"
-        elif msg.get("is_summary"):
-            above_text += f"摘要: {content}\n"
-        elif role == "system":
-            above_text += f"系统: {content}\n"
+    # --- 全局记忆 ---
+    if layer in ("global", "all"):
+        if app_id is not None:
+            mem_list = get_global_memory(app_id)
         else:
-            above_text += f"{role}: {content}\n"
-
-    global_sys = get_global_system_prompt()
-    bot_sys = get_bot_system_prompt(app_id)
-    combined_sys = f"{global_sys}\n{bot_sys}" if bot_sys else global_sys
-
-    prompt = (
-        f"你是一个记忆管理助手，负责根据对话内容更新机器人的{mem_label}。\n"
-        f"机器人的人设和系统提示如下：\n{combined_sys}\n\n"
-        f"机器人的名字是 {get_bot_name()}。\n"
-        f"当前{mem_label}的启用状态是：{enabled_status}。\n"
-        f"当前{mem_label}列表如下：\n"
-        f"{mem_text}\n\n"
-        "最新的用户消息是：\n"
-        f"{user_message}\n\n"
-        "机器人的回复是：\n"
-        f"{reply}\n\n"
-        "对话上文（最近5条）：\n"
-        f"{above_text}\n\n"
-        "重要规则：如果记忆内容涉及某位用户，必须在该用户的用户名后附上其QQ号（从消息的author.id或member_openid中获取），格式如“用户名(QQ号) 是...”。\n"
-        "例如：\"张三(1234567) 是管理员\" 而不是 \"张三是管理员\"。\n"
-        "请分析上述内容，判断是否需要更新记忆或调整启用状态。如果需要，输出一个JSON指令，格式如下：\n"
-        "- 添加记忆：{ \"action\": \"add\", \"content\": \"要添加的记忆内容（必须包含用户QQ号）\" }\n"
-        "- 删除记忆（按索引）：{ \"action\": \"delete\", \"index\": 0 }  （索引从0开始）\n"
-        "- 替换记忆：{ \"action\": \"replace\", \"index\": 0, \"content\": \"新内容（必须包含用户QQ号）\" }\n"
-        "- 清空所有记忆：{ \"action\": \"clear\" }\n"
-        "- 启用记忆：{ \"action\": \"enable\" }\n"
-        "- 禁用记忆：{ \"action\": \"disable\" }\n"
-        "- 不操作：{ \"action\": \"none\" }\n"
-        "注意：禁用记忆会使其在后续回复中不被使用，但记忆内容仍会保留。启用记忆会恢复使用。只有在确实必要时才禁用，避免影响正常对话。\n"
-        "只输出JSON，不要有其他内容。"
-    )
-
-    try:
-        result = await call_ai([{"role": "user", "content": prompt}], "judge", temperature=0.2)
-        json_match = re.search(r'```json\s*(\{.*?\})\s*```', result, re.DOTALL)
-        if json_match:
-            json_str = json_match.group(1)
+            mem_list = get_global_memory(None)
+        matched = [(idx, m) for idx, m in enumerate(mem_list) if _matches(m)]
+        if matched:
+            results.append(f"【全局记忆】（共 {len(matched)} 条匹配）")
+            for idx, m in matched:
+                results.append(f"  [{idx}] {m}")
         else:
-            json_str = result.strip()
-        json_str = re.sub(r'{{', '{', json_str)
-        json_str = re.sub(r'}}', '}', json_str)
-        json_str = re.sub(r',\s*\}', '}', json_str)
-        json_str = re.sub(r',\s*\]', ']', json_str)
-        data = json.loads(json_str)
-        action = data.get("action")
+            results.append("【全局记忆】无匹配")
 
-        if action == "add":
-            content = data.get("content")
-            if content:
-                if is_global:
-                    app_id_for_mem = extra_args[0] if extra_args else None
-                    add_func(content, app_id_for_mem)
-                elif is_bot:
-                    add_func(identifier, content)
-                else:
-                    add_func(identifier, content)
-                info(f"[记忆] {mem_type} 添加: {content}")
-        elif action == "delete":
-            idx = data.get("index")
-            if idx is not None:
-                if is_global:
-                    app_id_for_mem = extra_args[0] if extra_args else None
-                    removed = remove_func(idx, app_id_for_mem)
-                elif is_bot:
-                    removed = remove_func(identifier, idx)
-                else:
-                    removed = remove_func(identifier, idx)
-                if removed:
-                    info(f"[记忆] {mem_type} 删除索引 {idx}")
-        elif action == "replace":
-            idx = data.get("index")
-            content = data.get("content")
-            if idx is not None and content:
-                if is_global:
-                    app_id_for_mem = extra_args[0] if extra_args else None
-                    replaced = replace_func(idx, content, app_id_for_mem)
-                elif is_bot:
-                    replaced = replace_func(identifier, idx, content)
-                else:
-                    replaced = replace_func(identifier, idx, content)
-                if replaced:
-                    info(f"[记忆] {mem_type} 替换索引 {idx} 为: {content}")
-        elif action == "clear":
-            if is_global:
-                app_id_for_mem = extra_args[0] if extra_args else None
-                clear_func(app_id_for_mem)
-            elif is_bot:
-                clear_func(identifier)
-            else:
-                clear_func(identifier)
-            info(f"[记忆] {mem_type} 清空所有记忆")
-        elif action == "enable":
-            enable_func()
-            info(f"[记忆] {mem_type} 已启用")
-        elif action == "disable":
-            disable_func()
-            info(f"[记忆] {mem_type} 已禁用")
+    # --- 机器人专属记忆 ---
+    if layer in ("bot", "all") and app_id is not None:
+        mem_list = get_bot_memory_list(app_id)
+        matched = [(idx, m) for idx, m in enumerate(mem_list) if _matches(m)]
+        if matched:
+            results.append(f"【机器人专属记忆】（共 {len(matched)} 条匹配）")
+            for idx, m in matched:
+                results.append(f"  [{idx}] {m}")
         else:
-            info(f"[记忆] {mem_type} 无操作")
-    except json.JSONDecodeError as e:
-        error(f"[记忆管理 JSON解析错误] {e}, 原始内容: {result[:200]}")
-    except Exception as e:
-        info(f"[记忆管理错误] {e}")
+            results.append("【机器人专属记忆】无匹配")
+
+    # --- 群聊记忆 ---
+    if layer in ("group", "all") and group_id is not None:
+        mem_list = get_qun_memory_list(group_id)
+        matched = [(idx, m) for idx, m in enumerate(mem_list) if _matches(m)]
+        if matched:
+            results.append(f"【群聊记忆】（共 {len(matched)} 条匹配）")
+            for idx, m in matched:
+                results.append(f"  [{idx}] {m}")
+        else:
+            results.append("【群聊记忆】无匹配")
+
+    # --- 私聊记忆 ---
+    if layer in ("c2c", "all") and c2c_user_id is not None:
+        mem_list = get_c2c_memory_list(c2c_user_id)
+        matched = [(idx, m) for idx, m in enumerate(mem_list) if _matches(m)]
+        if matched:
+            results.append(f"【私聊记忆】（共 {len(matched)} 条匹配）")
+            for idx, m in matched:
+                results.append(f"  [{idx}] {m}")
+        else:
+            results.append("【私聊记忆】无匹配")
+
+    return "\n".join(results) if results else "（未指定任何记忆层级或标识符，无搜索结果）"
 
 
-# ==================== 初始化：旧版 mirror 迁移 ====================
+# ==================== 初始化：旧版 mirror / user_map 迁移 ====================
 mirror_migrate_old()
+user_map_migrate_old()
