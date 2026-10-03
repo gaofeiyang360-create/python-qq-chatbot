@@ -536,9 +536,161 @@ def set_bot_memory_enabled(app_id: str, enabled: bool):
 
 
 # ==================== 聊天记录 ====================
+# 记录结构（结构化存储，展示用字段独立保存）：
+#   {
+#     "role":     "user" | "assistant" | "system" | "tool",
+#     "content":  正文（不含时间戳、不含 "昵称(id): " 前缀）,
+#     "ts":       "2026-09-15 22:09"（北京时间，独立字段）,
+#     "username": 发送者昵称（user 消息才有）,
+#     "user_id":  发送者 openid（user 消息才有）,
+#     "revoked":  true 表示已撤回（正文保持不变，状态独立记录）,
+#     "is_hide":  1 表示该条已隐藏、不参与「发给 AI」的上下文（默认不写，视为 0）,
+#     ... 以及 msg_id / msg_idx / ref_msg_idx / is_summary / is_markdown / is_wakeup / media_url
+#   }
+#
+# is_hide 与 revoked 完全独立，两者互不影响：
+#   revoked —— 「对方撤回了这条消息」这一客观事实，由撤回 API/工具写入；
+#              发给 AI 时保留该条并加 [已撤回] 前缀，让模型知道发生过什么。
+#   is_hide —— 「不要把这条喂给模型」这一人工筛选意图（界面上的「隐藏」）；
+#              发给 AI 时整条剔除，模型完全看不到它。
+#   一条消息可以已撤回但仍参与上下文，也可以没撤回却被隐藏，反之亦然。
+#   因此不要把它们合并成一个字段，也不要在任一处互相推导。
+#
+# 为什么默认不写 is_hide（缺省视为 0）：
+#   历史文件里已有大量记录，若在写入时统一补 0 需要迁移全部文件；
+#   读侧一律用 .get("is_hide") 判真，缺字段即等于 0，旧数据天然兼容。
+#   取消隐藏时同样把字段删掉而不是写 0，保持「没隐藏过」的记录与初始状态一致。
+#
+# 为什么不把时间戳和昵称拼进 content：
+#   旧实现把三者拼成一个字符串（"[ts]昵称(id): 正文"），导致任何一处想取
+#   单独的字段都只能靠正则反解 —— 前端要剥 [ts]、后端要按 ": " 切昵称、
+#   撤回时还要在时间戳前面插 "[已撤回]" 把格式搞得更乱。
+#   现在三者各占一个字段，只有「发给 AI」这一步才拼回可读行
+#   （见 render_history_for_ai），API 原样返回 json，前端直接取字段。
+_TS_FMT = "%Y-%m-%d %H:%M"
+# 旧格式的行首时间戳/用户前缀：(?s) 让 . 匹配换行，保证多行正文也能整体处理
+_LEGACY_TS_RE = re.compile(r'^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?::\d{2})?)\]')
+_LEGACY_USER_RE = re.compile(r'^([^:\n]{1,60}?)\(([^)\n]{4,})\):\s?')
+
+
+def _now_ts() -> str:
+    """当前北京时间字符串（YYYY-MM-DD HH:MM）。"""
+    return datetime.now(timezone(timedelta(hours=8))).strftime(_TS_FMT)
+
+
+def split_legacy_content(content: str) -> Dict[str, str]:
+    """把旧格式 content（"[ts]昵称(id): 正文"）拆成结构化字段。
+
+    仅用于兼容改造之前写入的历史文件 —— 新写入的记录一律结构化保存，
+    不需要也不应该走这里。拆不出的部分原样留在正文里，绝不丢内容。
+    """
+    text = str(content or "")
+    ts = ""
+    m = _LEGACY_TS_RE.match(text)
+    if m:
+        ts = m.group(1)[:16]          # 统一截到分钟，去掉可能的秒
+        text = text[m.end():]
+    username = ""
+    user_id = ""
+    um = _LEGACY_USER_RE.match(text)
+    if um:
+        username = um.group(1).strip()
+        user_id = um.group(2).strip()
+        text = text[um.end():]
+    return {"ts": ts, "username": username, "user_id": user_id, "content": text}
+
+
+def normalize_history_msg(msg: Dict) -> Dict:
+    """把一条历史记录归一为结构化格式（就地不改原对象，返回新 dict）。
+
+    已经是新格式（带 ts 字段）的原样返回；旧格式则拆出 ts/username/user_id。
+    读取入口统一调用它，这样新旧历史混存时上层代码只需处理一种结构。
+    """
+    if not isinstance(msg, dict):
+        return msg
+    if "ts" in msg or "username" in msg or "user_id" in msg:
+        return msg
+    raw = msg.get("content", "")
+    # 只有 user 消息才可能带 "昵称(id): " 前缀；assistant/system/tool 不拆
+    if msg.get("role") != "user":
+        m = _LEGACY_TS_RE.match(str(raw or ""))
+        if not m:
+            return msg
+        out = dict(msg)
+        out["ts"] = m.group(1)[:16]
+        out["content"] = str(raw)[m.end():]
+        return out
+    parts = split_legacy_content(raw)
+    out = dict(msg)
+    out["content"] = parts["content"]
+    if parts["ts"]:
+        out["ts"] = parts["ts"]
+    if parts["username"]:
+        out["username"] = parts["username"]
+    if parts["user_id"]:
+        out["user_id"] = parts["user_id"]
+    return out
+
+
+def is_message_hidden(msg: Dict) -> bool:
+    """该条是否已隐藏（is_hide=1，即不发给 AI）。缺字段视为 0（未隐藏）。"""
+    if not isinstance(msg, dict):
+        return False
+    return bool(msg.get("is_hide"))
+
+
+def render_history_for_ai(msg: Dict) -> Dict:
+    """把一条历史记录渲染成「发给 AI」的 messages 条目。
+
+    这里的拼接是**唯一**把 ts / username / user_id 重新合成文本的地方：
+    模型需要的是可读的一行 "[时间]昵称(id): 正文"，而存储层保持结构化。
+    同时剥离只服务于 API/撤回的元数据字段。
+
+    被标记 is_hide=1 的记录返回 None，表示「这条不应出现在上下文里」，
+    由调用方过滤掉（见 strip_message_meta / get_history）。
+    不在这里直接抛异常或返回空对象：那会让模型看到一条空消息，
+    而正确语义是「这条根本不存在」。
+    """
+    if not isinstance(msg, dict):
+        return msg
+    if is_message_hidden(msg):
+        return None
+    m = normalize_history_msg(msg)
+    role = m.get("role", "")
+    body = m.get("content", "")
+
+    header = ""
+    if m.get("ts"):
+        header = f"[{m['ts']}]"
+    if role == "user":
+        name = m.get("username") or ""
+        uid = m.get("user_id") or ""
+        if uid:
+            header += f"{name or '用户'}({uid}): "
+        elif name:
+            header += f"{name}: "
+
+    # 撤回标记放在整行最前面（头部之前），避免被读成正文的一部分
+    prefix = ""
+    if m.get("revoked") and not str(body).startswith("[已撤回]"):
+        prefix = "[已撤回]"
+
+    out = {"role": role, "content": f"{prefix}{header}{body}"}
+    # tool 消息的 tool_call_id 必须保留，否则回放上下文的工具调用链会断
+    if m.get("tool_call_id"):
+        out["tool_call_id"] = m["tool_call_id"]
+    if m.get("tool_calls"):
+        out["tool_calls"] = m["tool_calls"]
+    return out
+
+
 def load_history(thread_key: str) -> List[Dict]:
     hist_file = HISTORY_DIR / f"{thread_key}.json"
-    return safe_load_json(hist_file, [])
+    raw = safe_load_json(hist_file, [])
+    if not isinstance(raw, list):
+        return []
+    # 读取即归一：旧格式记录在此拆出 ts/username/user_id，上层只见一种结构
+    return [normalize_history_msg(m) for m in raw]
 
 
 def save_history(thread_key: str, hist: List[Dict]):
@@ -550,12 +702,21 @@ def save_history(thread_key: str, hist: List[Dict]):
 def append_message(thread_key: str, role: str, content: str, is_summary: bool = False,
                    msg_id: Optional[str] = None, msg_idx: Optional[str] = None,
                    ref_msg_idx: Optional[str] = None, is_markdown: bool = False,
-                   is_wakeup: bool = False, media_url: Optional[str] = None):
+                   is_wakeup: bool = False, media_url: Optional[str] = None,
+                   username: Optional[str] = None, user_id: Optional[str] = None,
+                   ts: Optional[str] = None):
+    """追加一条聊天记录。
+
+    时间戳/用户名/用户ID 各自作为独立字段保存，不再拼进 content；
+    发给 AI 时由 render_history_for_ai 统一拼回可读行。
+    ts 不传则取当前北京时间（历史回放/导入时可显式指定）。
+    """
     hist = load_history(thread_key)
-    # 自动添加北京时间时间戳 [YYYY-MM-DD HH:MM]
-    bj_tz = timezone(timedelta(hours=8))
-    ts = datetime.now(bj_tz).strftime("%Y-%m-%d %H:%M")
-    msg = {"role": role, "content": f"[{ts}]{content}"}
+    msg = {"role": role, "content": content, "ts": ts or _now_ts()}
+    if username:
+        msg["username"] = username
+    if user_id:
+        msg["user_id"] = user_id
     if msg_id:
         msg["msg_id"] = msg_id
     if msg_idx:
@@ -591,21 +752,65 @@ def append_message(thread_key: str, role: str, content: str, is_summary: bool = 
 
 
 def strip_message_meta(msg: Dict) -> Dict:
-    """返回移除了内部元数据字段的消息副本，用于发送给 AI。
+    """把一条历史记录渲染为「发给 AI」的 messages 条目。
 
-    剥离的字段：msg_id / msg_idx / ref_msg_idx / revoked / is_markdown / is_wakeup / media_url
-    （这些只服务于 API 查询与撤回逻辑，不该出现在喂给模型的上下文里）
+    保留此函数名以兼容既有调用点；实际工作已交给 render_history_for_ai
+    （它会剥离 msg_id / msg_idx / ref_msg_idx / is_markdown / is_wakeup /
+    media_url / username / user_id / ts 等仅服务于 API 与展示的字段，
+    并把 ts 与用户名拼回 content）。
+
+    对 is_hide=1 的记录返回 None（filter_hidden_for_ai 会据此剔除）。
     """
-    cleaned = {k: v for k, v in msg.items()
-               if k not in ("msg_id", "msg_idx", "ref_msg_idx", "revoked",
-                            "is_markdown", "is_wakeup", "media_url")}
-    return cleaned
+    return render_history_for_ai(msg)
+
+
+def filter_hidden_for_ai(msgs: List[Dict]) -> List[Dict]:
+    """渲染一批历史记录并剔除 is_hide=1（已隐藏）的条目。
+
+    这是「发给 AI」的统一出口：调用方不必自己判断 is_hide，
+    拿到的一定是可直接塞进 messages 的列表。
+    """
+    out: List[Dict] = []
+    for m in msgs or []:
+        item = render_history_for_ai(m)
+        # render 返回 None 有两种可能：本条已隐藏；或输入本身是 None
+        if item is not None:
+            out.append(item)
+    return out
+
+
+def parse_history_ts(msg: Dict) -> Optional[datetime]:
+    """从记录中解析发送时间（北京时间），解析不出返回 None。
+
+    优先用结构化的 ts 字段；旧记录（ts 缺失）由 normalize_history_msg 在
+    读取时补上，因此这里基本只需处理结构化路径 —— 不再从正文里正则抠时间戳。
+    """
+    m = normalize_history_msg(msg)
+    raw = m.get("ts")
+    if not raw:
+        return None
+    bj_tz = timezone(timedelta(hours=8))
+    s = str(raw).strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=bj_tz)
+        except ValueError:
+            continue
+    # 兜底：ISO 形式（含 T 分隔、带时区）
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=bj_tz)
+    except ValueError:
+        return None
 
 
 def mark_message_revoked(thread_key: str, msg_id_to_revoke: str) -> bool:
     """
     在聊天记录中标记指定 msg_id 的消息为已撤回。
-    在 content 中添加 "已撤回" 前缀，并设置 revoked=true。
+
+    撤回是独立的状态字段（revoked=true），不再修改 content ——
+    旧实现往正文前面插 "[已撤回]" 会把时间戳挤到中间，
+    导致前端/后端所有按 "[ts]" 行首解析的逻辑失配。
     返回 True 表示找到并标记成功，False 表示未找到。
     """
     if not thread_key or not msg_id_to_revoke:
@@ -615,10 +820,6 @@ def mark_message_revoked(thread_key: str, msg_id_to_revoke: str) -> bool:
         found = False
         for msg in hist:
             if msg.get("msg_id") == msg_id_to_revoke and not msg.get("revoked"):
-                raw = msg.get("content", "")
-                if not raw.startswith("[已撤回]"):
-                    # 格式: [2026-09-15 22:09]内容 → [已撤回][2026-09-15 22:09]内容
-                    msg["content"] = "[已撤回]" + raw
                 msg["revoked"] = True
                 found = True
                 # 不 break，继续标记所有匹配的（可能多条相同 msg_id 的情况）
@@ -629,14 +830,64 @@ def mark_message_revoked(thread_key: str, msg_id_to_revoke: str) -> bool:
         return False
 
 
+def set_message_hidden(thread_key: str, msg_id: str, is_hide: bool = True) -> int:
+    """把指定 msg_id 的消息隐藏 / 取消隐藏（is_hide=1 / 0）。
+
+    返回被改动的条数（0 表示没找到该 msg_id，或值本来就已经是目标值）。
+
+    与 mark_message_revoked 的关系：**完全独立**。本函数只动 is_hide，
+    不碰 revoked；撤回状态由撤回 API/工具单独维护，两者可任意组合。
+    这里也不像撤回那样跳过「已隐藏」的条目 —— 隐藏是可反复开关的。
+
+    写入约定：只写 1，取消隐藏时**移除字段**。这样「未隐藏」的记录与其
+    从没被点过的记录在文件里完全一致，不会因为一次误点就永久多出一个
+    is_hide:0。
+    """
+    if not thread_key or not msg_id:
+        return 0
+    try:
+        hist = load_history(thread_key)
+        changed = 0
+        for msg in hist:
+            if msg.get("msg_id") == msg_id:
+                # 与 mark_message_revoked 一样不 break：同一 msg_id 可能有多条
+                if is_hide:
+                    if not msg.get("is_hide"):
+                        changed += 1
+                    msg["is_hide"] = 1
+                else:
+                    # 取消隐藏时**删掉**字段而不是写 0：
+                    # 与 append_message 的「默认不写」保持一致，否则一次误点
+                    # 就会给这条记录永久留下 is_hide:0，白白膨胀历史文件
+                    # （含长 msg_idx 的记录尤其明显）。
+                    if "is_hide" in msg:
+                        if msg.get("is_hide"):
+                            changed += 1
+                        del msg["is_hide"]
+        if changed:
+            save_history(thread_key, hist)
+        return changed
+    except Exception:
+        return 0
+
+
 def get_history(thread_key: str, limit: int = None) -> List[Dict]:
     """
     获取聊天历史，只按条数限制截取，不进行字符数截断。
     limit 默认为 CONTEXT_LIMIT（来自 config）。
+
+    返回**已剔除 is_hide=1 条目**的列表：本函数的调用方都是「要发给 AI」的场景
+    （见 ai.py / msg.py），在源头就过滤掉，避免每个调用点各自记得处理。
+    需要含已隐藏条目的原始记录时用 load_history()。
     """
     if limit is None:
         limit = get_context_limit()
     hist = load_history(thread_key)
+    if not hist:
+        return []
+    # is_hide 的条目在截断前就剔除：否则 limit 条里可能有一半是被隐藏的，
+    # 真正进上下文的条数会少于预期（模型看到的上下文被无声缩短）。
+    hist = [m for m in hist if not is_message_hidden(m)]
     if not hist:
         return []
     # 定位最后一个摘要的位置，从摘要之后开始取
@@ -652,8 +903,10 @@ def get_history(thread_key: str, limit: int = None) -> List[Dict]:
 
 
 def get_recent_history(thread_key: str, limit: int) -> List[Dict]:
+    """取最近若干条非摘要历史，同样剔除 is_hide=1 的条目（用于群聊判定上下文）。"""
     hist = load_history(thread_key)
-    non_summary = [msg for msg in hist if not msg.get("is_summary")]
+    non_summary = [msg for msg in hist
+                   if not msg.get("is_summary") and not is_message_hidden(msg)]
     return non_summary[-limit:]
 
 
@@ -721,6 +974,68 @@ def compute_similarity(text1: str, text2: str) -> float:
     return intersection / union if union > 0 else 0.0
 
 
+# ==================== 记忆整理（公共：工具调用结果提取） ====================
+# 四处记忆整理（全局 / 群 / 机器人 / 私聊）原先各自写着同一段：
+#     tool_calls = ai_msg.get("tool_calls", [])
+#     if not tool_calls: raise ValueError("AI 未调用 organize_memory 工具")
+#     args = json.loads(tool_calls[0]["function"]["arguments"])
+#     new_list = args.get("memories", [])
+# 这段写法把三个假设焊死在调用点：
+#   1. 只取第 0 个工具调用 —— 模型一次返回多个调用（或把 organize_memory
+#      放在后面）时会被静默丢弃；
+#   2. 不校验工具名 —— 模型调了别的工具也照吞它的 arguments；
+#   3. arguments 一定是 JSON 字符串 —— 模型直接给对象、或带尾逗号时抛异常。
+# 统一收敛到这里：按名字查找、兼容字符串/对象两种 arguments、失败给出明确原因。
+def _extract_memories_from_ai_msg(ai_msg: Dict, tool_name: str = "organize_memory") -> List[str]:
+    """从 AI 返回中取出 organize_memory 工具提交的记忆列表。
+
+    成功返回 List[str]（可能为空列表）；未按约定调用工具、arguments 非法、
+    或 memories 字段缺失/类型不对时抛 ValueError，由调用方统一重试。
+    """
+    tool_calls = (ai_msg or {}).get("tool_calls") or []
+
+    # 按工具名挑选，而不是盲目取 [0]：模型可能一次返回多个调用，
+    # 也可能先调别的工具再调 organize_memory。
+    target = None
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") or {}
+        if fn.get("name") == tool_name:
+            target = fn
+            break
+    if target is None:
+        raise ValueError(f"AI 未调用 {tool_name} 工具")
+
+    raw_args = target.get("arguments")
+    # arguments 规范上是 JSON 字符串，但模型有时直接给对象/给空值。
+    if isinstance(raw_args, dict):
+        args = raw_args
+    else:
+        try:
+            args = json.loads(raw_args) if raw_args else {}
+        except (json.JSONDecodeError, TypeError) as e:
+            raise ValueError(f"{tool_name} 的 arguments 不是合法 JSON: {str(e)[:100]}")
+    if not isinstance(args, dict):
+        raise ValueError(f"{tool_name} 的 arguments 不是 JSON 对象（{type(args).__name__}）")
+
+    memories = args.get("memories")
+    if not isinstance(memories, list) or not memories:
+        raise ValueError("整理后无有效记忆")
+    # 逐条归一为字符串：模型偶尔会把数字/对象塞进数组，
+    # 落到记忆文件里会变成非字符串条目，后续拼接提示词时报错。
+    out = []
+    for m in memories:
+        if m is None:
+            continue
+        text = m if isinstance(m, str) else str(m)
+        if text.strip():
+            out.append(text)
+    if not out:
+        raise ValueError("整理后无有效记忆")
+    return out
+
+
 # ==================== 记忆整理（全局） ====================
 _is_organizing_global: Dict[str, bool] = {}
 
@@ -779,13 +1094,7 @@ async def organize_global_memory(app_id: Optional[str] = None, retries: int = 3)
                 [organize_tool],
                 temperature=0.3
             , ctx=app_id)
-            tool_calls = ai_msg.get("tool_calls", [])
-            if not tool_calls:
-                raise ValueError("AI 未调用 organize_memory 工具")
-            args = json.loads(tool_calls[0]["function"]["arguments"])
-            new_list = args.get("memories", [])
-            if not new_list or not isinstance(new_list, list):
-                raise ValueError("整理后无有效记忆")
+            new_list = _extract_memories_from_ai_msg(ai_msg)
             timestamp = time.strftime("%Y%m%d_%H%M")
             suffix = f"_{app_id}" if app_id else ""
             old_file = BASE_DIR / f"old_memory{suffix}_{timestamp}.json"
@@ -872,13 +1181,7 @@ async def organize_qun_memory(group_id: str, retries: int = 3,
                 [organize_tool],
                 temperature=0.3
             , ctx=ctx)
-            tool_calls = ai_msg.get("tool_calls", [])
-            if not tool_calls:
-                raise ValueError("AI 未调用 organize_memory 工具")
-            args = json.loads(tool_calls[0]["function"]["arguments"])
-            new_list = args.get("memories", [])
-            if not new_list or not isinstance(new_list, list):
-                raise ValueError("整理后无有效记忆")
+            new_list = _extract_memories_from_ai_msg(ai_msg)
             timestamp = time.strftime("%Y%m%d_%H%M")
             backup_dir = BASE_DIR / "qun_memory_backup"
             backup_dir.mkdir(exist_ok=True)
@@ -953,13 +1256,7 @@ async def organize_bot_memory(app_id: str, retries: int = 3):
                 [organize_tool],
                 temperature=0.3
             , ctx=app_id)
-            tool_calls = ai_msg.get("tool_calls", [])
-            if not tool_calls:
-                raise ValueError("AI 未调用 organize_memory 工具")
-            args = json.loads(tool_calls[0]["function"]["arguments"])
-            new_list = args.get("memories", [])
-            if not new_list or not isinstance(new_list, list):
-                raise ValueError("整理后无有效记忆")
+            new_list = _extract_memories_from_ai_msg(ai_msg)
             timestamp = time.strftime("%Y%m%d_%H%M")
             old_file = BASE_DIR / f"bot_memory_backup_{app_id}_{timestamp}.json"
             with open(old_file, "w", encoding="utf-8") as f:
@@ -1044,13 +1341,7 @@ async def organize_c2c_memory(user_id: str, retries: int = 3,
                 [organize_tool],
                 temperature=0.3
             , ctx=ctx)
-            tool_calls = ai_msg.get("tool_calls", [])
-            if not tool_calls:
-                raise ValueError("AI 未调用 organize_memory 工具")
-            args = json.loads(tool_calls[0]["function"]["arguments"])
-            new_list = args.get("memories", [])
-            if not new_list or not isinstance(new_list, list):
-                raise ValueError("整理后无有效记忆")
+            new_list = _extract_memories_from_ai_msg(ai_msg)
             timestamp = time.strftime("%Y%m%d_%H%M")
             old_file = BASE_DIR / f"c2c_memory_backup_{user_id}_{timestamp}.json"
             with open(old_file, "w", encoding="utf-8") as f:
@@ -1154,6 +1445,221 @@ def search_memory(keywords: List[str], layer: str = "all",
             results.append("【私聊记忆】无匹配")
 
     return "\n".join(results) if results else "（未指定任何记忆层级或标识符，无搜索结果）"
+
+
+# ==================== 记忆管理统一入口（API / AI 工具共用） ====================
+# 本段是「按级别操作记忆」的唯一业务实现，两端共用同一份函数对象：
+#  1. AI 工具 execute_tool_call 的 view_memory / add_memory / modify_memory /
+#     delete_memory / enable_memory / disable_memory（tool.py 导入）
+#  2. api_server.py 的 /api/memory/* 接口
+#
+# 它垫在上面那些原子读写函数之上：
+#      HTTP /api/memory/*  ──┐
+#                            ├──> 本段（级别派发 / 禁用检查 / 批量语义）──> 原子读写 ──> json
+#      AI 工具 *_memory    ──┘
+#
+# 为什么放在 memory.py 而不是 tool.py：这两端共用的是「记忆」这件事本身的语义
+#   （级别怎么派发、禁用算不算错误、批量失败要不要回滚），属于本文件的职责；
+#   放进 tool.py 会让 api_server 为了用记忆而反向依赖整个工具定义模块。
+#   此前这段逻辑以 6 份副本的形式摊在工具执行分支里，现收敛到此处。
+#
+# 设计约束：本段**只返回结构化数据 / 抛异常，不产出任何中文文案**。
+#   文案属于展示层，两端要求不同：
+#     工具侧要说给模型听（"错误：群聊记忆当前已禁用，请先使用 enable_memory 启用"）
+#     API 侧要放进 JSON（结构化 failed 数组 + 准确的 HTTP 状态码）
+#   把文案焊死在底层，两边就无法共用逻辑了。
+
+MEMORY_LEVELS = ("global", "bot", "group", "c2c")
+
+
+class MemoryError_(Exception):
+    """记忆操作的通用错误基类，便于调用方一并捕获。"""
+
+
+class MemoryDisabledError(MemoryError_):
+    """该级别记忆已被禁用 —— 添加操作应被拒绝。
+
+    修改/删除**不检查**禁用状态：禁用只表示「不再注入系统提示」，
+    记忆内容仍然保留，此时仍应允许整理（与改造前行为一致）。
+    """
+
+    def __init__(self, level: str, identifier: str):
+        self.level = level
+        self.identifier = identifier
+        super().__init__(f"{level}({identifier}) 记忆已禁用")
+
+
+class MemoryLevelError(MemoryError_):
+    """未知的记忆级别。"""
+
+    def __init__(self, level: str):
+        self.level = level
+        super().__init__(f"未知记忆级别 {level}")
+
+
+def _norm_memory_level(level: Any) -> str:
+    """归一记忆级别；未知级别抛 MemoryLevelError。"""
+    lv = str(level or "").strip().lower()
+    if lv not in MEMORY_LEVELS:
+        raise MemoryLevelError(lv)
+    return lv
+
+
+def _memory_get(level: str, identifier: str) -> Tuple[List[str], bool]:
+    """读取某级记忆，返回 (记忆列表, 是否启用)。
+
+    派发表：把「级别 -> 本文件里那组读写函数」的映射收在一处。
+    改造前这张表在 view_memory / add_memory / modify_memory / delete_memory /
+    enable_memory / disable_memory 里各抄了一遍，共 6 份 —— 新增一个级别要改 6 处，
+    漏改一处就是「A 工具能用、B 工具报未知级别」。
+    注意 global 的函数把 app_id 放在参数末尾，与其余三级的顺序相反，
+    由本函数统一抹平，调用方不必再记这个差异。
+    """
+    lv = _norm_memory_level(level)
+    if lv == "global":
+        return get_global_memory(identifier), get_global_memory_enabled(identifier)
+    if lv == "bot":
+        return get_bot_memory_list(identifier), get_bot_memory_enabled(identifier)
+    if lv == "group":
+        return get_qun_memory_list(identifier), get_qun_memory_enabled(identifier)
+    return get_c2c_memory_list(identifier), get_c2c_memory_enabled(identifier)
+
+
+def _memory_add(level: str, identifier: str, content: str) -> None:
+    """向某级记忆追加一条。该级已禁用时抛 MemoryDisabledError。"""
+    lv = _norm_memory_level(level)
+    if not str(content or "").strip():
+        raise MemoryError_("记忆内容不能为空")
+    _, enabled = _memory_get(lv, identifier)
+    if not enabled:
+        raise MemoryDisabledError(lv, identifier)
+    if lv == "global":
+        add_global_memory(content, identifier)
+    elif lv == "bot":
+        add_bot_memory(identifier, content)
+    elif lv == "group":
+        add_qun_memory(identifier, content)
+    else:
+        add_c2c_memory(identifier, content)
+
+
+def _memory_replace(level: str, identifier: str, index: Any, content: str) -> bool:
+    """替换某级记忆的第 index 条，返回 False 表示索引越界。"""
+    lv = _norm_memory_level(level)
+    idx = _coerce_memory_index(index)
+    if idx is None:
+        return False
+    if lv == "global":
+        return replace_global_memory(idx, content, identifier)
+    if lv == "bot":
+        return replace_bot_memory(identifier, idx, content)
+    if lv == "group":
+        return replace_qun_memory(identifier, idx, content)
+    return replace_c2c_memory(identifier, idx, content)
+
+
+def _memory_remove(level: str, identifier: str, index: Any) -> bool:
+    """删除某级记忆的第 index 条，返回 False 表示索引越界。"""
+    lv = _norm_memory_level(level)
+    idx = _coerce_memory_index(index)
+    if idx is None:
+        return False
+    if lv == "global":
+        return remove_global_memory(idx, identifier)
+    if lv == "bot":
+        return remove_bot_memory(identifier, idx)
+    if lv == "group":
+        return remove_qun_memory(identifier, idx)
+    return remove_c2c_memory(identifier, idx)
+
+
+def _memory_set_enabled(level: str, identifier: str, enabled: bool) -> None:
+    """启用/禁用某级记忆。"""
+    lv = _norm_memory_level(level)
+    if lv == "global":
+        set_global_memory_enabled(enabled, identifier)
+    elif lv == "bot":
+        set_bot_memory_enabled(identifier, enabled)
+    elif lv == "group":
+        set_qun_memory_enabled(identifier, enabled)
+    else:
+        set_c2c_memory_enabled(identifier, enabled)
+
+
+def _coerce_memory_index(index: Any) -> Optional[int]:
+    """把 index 归一为非负整数，非法返回 None（调用方据此判越界/参数错）。
+
+    模型与 HTTP 调用方都可能把索引给成字符串（"2"）或负数；
+    负索引在 list.pop 里是「从后往前数」的合法写法，但会静默删掉尾部的条目，
+    与调用方「删除第 2 条」的意图不符，因此一律拒绝负数。
+    """
+    if index is None or isinstance(index, bool):
+        return None
+    try:
+        idx = int(index)
+    except (TypeError, ValueError):
+        return None
+    return idx if idx >= 0 else None
+
+
+def _memory_batch(op: str, items: Any) -> Dict[str, Any]:
+    """批量执行记忆操作 —— 批量的唯一实现，工具与 API 共用。
+
+    op:    "add" | "update" | "delete"
+    items: [{"level":..., "identifier":..., "content":..., "index":...}, ...]
+
+    返回 {"success": [...], "failed": [{"index":i, "error":...}, ...]}，
+    每项带原始下标，便于调用方把失败定位到具体是哪一条。
+
+    语义：**逐条独立、部分失败不回滚**（与改造前工具侧行为一致）——
+    批量里一条禁用/越界不应让其余几条白做。
+    """
+    success: List[Dict[str, Any]] = []
+    failed: List[Dict[str, Any]] = []
+    if not isinstance(items, list):
+        return {"success": success,
+                "failed": [{"index": None, "error": "items 必须是数组"}]}
+
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            failed.append({"index": i, "error": "条目必须是对象"})
+            continue
+        level = item.get("level", "")
+        identifier = item.get("identifier", "")
+        try:
+            if not level or not identifier:
+                raise MemoryError_("缺少 level 或 identifier")
+            if op == "add":
+                content = item.get("content", "")
+                if not str(content or "").strip():
+                    raise MemoryError_("缺少 content")
+                _memory_add(level, identifier, content)
+            elif op == "update":
+                content = item.get("content", "")
+                if not str(content or "").strip():
+                    raise MemoryError_("缺少 content")
+                if item.get("index") is None:
+                    raise MemoryError_("缺少 index")
+                if not _memory_replace(level, identifier, item.get("index"), content):
+                    raise MemoryError_(f"索引 {item.get('index')} 越界或无效")
+            elif op == "delete":
+                if item.get("index") is None:
+                    raise MemoryError_("缺少 index")
+                if not _memory_remove(level, identifier, item.get("index")):
+                    raise MemoryError_(f"索引 {item.get('index')} 越界或无效")
+            else:
+                raise MemoryError_(f"未知批量操作 {op}")
+        except MemoryError_ as e:
+            failed.append({"index": i, "level": str(level), "identifier": str(identifier),
+                           "error": str(e)})
+            continue
+        except Exception as e:                      # 落盘失败等意外
+            failed.append({"index": i, "level": str(level), "identifier": str(identifier),
+                           "error": f"{type(e).__name__}: {e}"})
+            continue
+        success.append({"index": i, "level": str(level), "identifier": str(identifier)})
+
+    return {"success": success, "failed": failed}
 
 
 # ==================== 初始化：旧版 mirror / user_map 迁移 ====================

@@ -47,6 +47,9 @@ from memory import (
     load_user_map, load_mirror, load_history,
     get_user_name, get_group_name_from_mirror,
     append_message, mark_message_revoked,
+    set_message_hidden,   # 隐藏消息（is_hide=1，不发给 AI），与撤回独立
+    parse_history_ts,   # 从结构化 ts 字段解析消息时间
+    search_memory,      # 记忆关键词搜索（与 AI 工具共用同一份实现）
 )
 from client import BotClient
 from utils import parse_message_type
@@ -273,6 +276,9 @@ STRICT_PARAMS = {
     "/api/bot_state":     {"target_id", "app_id", "key"},
     "/api/mute/status":   {"target_id", "app_id", "with_names", "key"},
     "/api/revoke":        {"target_type", "target_id", "message_ids", "app_id", "key"},
+    # 隐藏消息（改 is_hide，不发给 AI，与撤回独立）
+    "/api/message/hide":  {"target_type", "target_id", "message_ids",
+                           "is_hide", "app_id", "key"},
     "/api/mute":          {"target_id", "members", "member_id", "op", "seconds",
                            "mute_expire_at", "app_id", "key"},
     "/api/push/create":   {"targets", "target_type", "target_id", "app_id",
@@ -291,17 +297,27 @@ STRICT_PARAMS = {
     "/api/push/delete":   {"task_id", "app_id", "key"},
     "/api/wakeup/update": {"task_id", "app_id", "key", "updates",
                            "description", "targets", "schedule_type", "schedule_time",
-                           "interval_seconds", "initiator", "status", "isolation_mode"},
+                           "interval_seconds", "initiator", "isolation_mode"},
     "/api/wakeup/delete": {"task_id", "app_id", "key"},
     "/api/wakeup/trigger":{"target_type", "target_id", "target_name", "description",
                            "initiator", "isolation_mode", "app_id", "key"},
     "/api/history":       {"target_type", "target_id", "app_id", "key",
-                           "keyword", "limit", "revoked", "markdown", "tools", "wakeup", "raw"},
+                           "keyword", "limit", "revoked", "markdown", "tools",
+                           "wakeup", "is_hide", "raw"},
     "/api/push/list":     set(_LIST_FILTER_PARAMS) | {"app_id", "key", "with_counts"},
     "/api/wakeup/list":   set(_LIST_FILTER_PARAMS) | {"app_id", "key", "with_counts"},
     "/api/config/get":    {"path", "app_id", "key"},
     "/api/config/list":   {"app_id", "scope", "key"},
     "/api/config/set":    {"path", "set", "value", "app_id", "key"},
+    # 记忆管理（与 AI 工具 view_memory / add_memory / modify_memory /
+    # delete_memory / enable_memory / disable_memory / search_memory 对应）
+    "/api/memory/list":   {"level", "identifier", "app_id", "key"},
+    "/api/memory/add":    {"level", "identifier", "content", "items", "app_id", "key"},
+    "/api/memory/update": {"level", "identifier", "index", "content", "items", "app_id", "key"},
+    "/api/memory/delete": {"level", "identifier", "index", "items", "app_id", "key"},
+    "/api/memory/toggle": {"level", "identifier", "enabled", "value", "app_id", "key"},
+    "/api/memory/search": {"keywords", "keyword", "q", "level", "identifier",
+                           "group_id", "c2c_user_id", "app_id", "key"},
 }
 
 
@@ -352,8 +368,24 @@ from tool import (                  # noqa: E402
     _split_multi as _split_multi,
     _parse_task_ts as _parse_ts,
     _task_search_text as _task_search_text,
-    _TASK_STATUS_ALIASES as _STATUS_ALIASES,
+    TASK_STATUSES as _TASK_STATUSES,
     _TASK_STATUS_LABELS as _STATUS_LABELS,
+)
+
+# 记忆管理：实现在 memory.py 的「记忆管理统一入口」一节，
+# 与 AI 工具的 view/add/modify/delete/enable/disable_memory 共用同一份函数对象。
+# 直接从 memory 导入（而非经 tool 转发），避免为用记忆而依赖工具定义模块。
+from memory import (                # noqa: E402
+    MEMORY_LEVELS as _MEMORY_LEVELS,
+    _memory_get as _memory_get,
+    _memory_add as _memory_add,
+    _memory_replace as _memory_replace,
+    _memory_remove as _memory_remove,
+    _memory_set_enabled as _memory_set_enabled,
+    _memory_batch as _memory_batch,
+    MemoryError_ as _MemoryError,
+    MemoryDisabledError as _MemoryDisabledError,
+    MemoryLevelError as _MemoryLevelError,
 )
 
 
@@ -703,18 +735,24 @@ async def h_bots(request: web.Request) -> web.Response:
 
 # ==================== 2. 消息查看 ====================
 async def h_history(request: web.Request) -> web.Response:
-    """消息查看：/api/history?target_type=group|c2c&target_id=xxx[&app_id=][&limit=20][&keyword=][&revoked=][&markdown=][&tools=][&wakeup=]
+    """消息查看：/api/history?target_type=group|c2c&target_id=xxx[&app_id=][&limit=20][&keyword=][&revoked=][&markdown=][&tools=][&wakeup=][&is_hide=]
 
     返回内容：原样保留聊天记录 json 的全部字段
-    （role / content / msg_id / msg_idx / ref_msg_idx / tool_calls / tool_call_id / is_summary / revoked ...）
+    （role / content / ts / username / user_id / msg_id / msg_idx / ref_msg_idx /
+     tool_calls / tool_call_id / is_summary / revoked / is_hide ...）
     在此基础上额外统一补充以下状态字段：
     - revoked      是否已撤回（bool）
+    - is_hide      是否已隐藏「不发给 AI」（1/0），与 revoked 完全无关
     - is_markdown  是否 Markdown 消息（1/0）
     - is_wakeup    是否唤醒消息，含定时唤醒与 API 唤醒（1/0）
     - is_tool_call 是否属于工具调用流程，发起与返回都为 1（1/0）
     - tool_names   仅发起方有，工具名数组
+    - is_thinking  是否为思考消息：assistant 且未真正发出（无 msg_id）（1/0）
 
-    过滤参数：revoked / markdown / tools / wakeup（1=只看，0=只看否）
+    说明：记录已是结构化格式 —— content 只含正文，时间戳/昵称/用户ID 分别
+    由 ts / username / user_id 字段承载，前端直接取字段即可，无需正则反解。
+
+    过滤参数：revoked / markdown / tools / wakeup / is_hide（1=只看，0=只看否）
     raw=1 为兼容别名，行为与默认一致。
     """
     if (e := _reject_unknown_params(request, "/api/history", {})):
@@ -778,12 +816,21 @@ async def h_history(request: web.Request) -> web.Response:
     elif wakeup_filter in ("0", "false", "no"):
         selected = [m for m in selected if not m.get("is_wakeup")]
 
+    # 按「隐藏」状态过滤：is_hide=1 只看已隐藏的，is_hide=0 只看参与上下文的。
+    # 注意这与 revoked 完全无关：撤回是消息在 QQ 侧被撤回，is_hide 是人工隐藏。
+    ishide_filter = (request.query.get("is_hide") or "").strip().lower()
+    if ishide_filter in ("1", "true", "yes"):
+        selected = [m for m in selected if m.get("is_hide")]
+    elif ishide_filter in ("0", "false", "no"):
+        selected = [m for m in selected if not m.get("is_hide")]
+
     # raw=1 作为兼容别名保留（默认模式现在已返回全部字段，两者行为一致）
     msgs = []
     revoked_count = 0
     markdown_count = 0
     tool_call_count = 0
     wakeup_count = 0
+    is_hide_count = 0
     for m in selected:
         item = {"role": m.get("role", ""), "content": m.get("content", "")}
         # 原样保留聊天记录 json 的全部字段（msg_id / msg_idx / ref_msg_idx /
@@ -794,6 +841,8 @@ async def h_history(request: web.Request) -> web.Response:
         item["revoked"] = bool(m.get("revoked"))
         item["is_markdown"] = 1 if m.get("is_markdown") else 0
         item["is_wakeup"] = 1 if m.get("is_wakeup") else 0
+        # is_hide：1=该条已隐藏、不发给 AI（默认 0）。与 revoked 无关，各自独立。
+        item["is_hide"] = 1 if m.get("is_hide") else 0
         # 媒体消息原始 URL（非媒体消息为 None）
         item["media_url"] = m.get("media_url") or None
 
@@ -810,6 +859,28 @@ async def h_history(request: web.Request) -> web.Response:
         else:
             item["is_tool_call"] = 0
 
+        # ---- 思考消息（模型中间轮，未真正发给用户）----
+        # 判据：assistant 且没有 msg_id。
+        # 有 msg_id 说明这条已作为真实消息发送出去；没有则是纯推理文本，
+        # 或"推理 + 工具调用"的中间产物。由后端统一判定并下发，
+        # 前端不再各自用「无 msg_id」这类经验规则去猜。
+        item["is_thinking"] = 1 if (m.get("role") == "assistant" and not m.get("msg_id")) else 0
+
+        # ---- 展示用结构化字段（结构性字段随 item 一起原样返回）----
+        # ts / username / user_id 已由存储层独立保存（见 memory.append_message），
+        # 前端直接取用即可，不必再从 content 里正则反解时间戳与昵称前缀。
+        item["ts"] = m.get("ts") or ""
+        item["username"] = m.get("username") or ""
+        item["user_id"] = m.get("user_id") or ""
+
+        # content 已是纯正文（不含时间戳/昵称前缀）。
+        # 兼容期兜底：极端情况下（如外部直接写入的文件未被归一）仍可能带前缀，
+        # 此时用结构化字段拼一份等价的展示文本，保证前端始终拿到同样的东西。
+        body = str(m.get("content", "") or "")
+        if m.get("revoked") and not body.startswith("[已撤回]"):
+            body = "[已撤回]" + body
+        item["content"] = body
+
         if item.get("revoked"):
             revoked_count += 1
         if item.get("is_markdown"):
@@ -818,6 +889,8 @@ async def h_history(request: web.Request) -> web.Response:
             tool_call_count += 1
         if item.get("is_wakeup"):
             wakeup_count += 1
+        if item.get("is_hide"):
+            is_hide_count += 1
         msgs.append(item)
 
     return ok({
@@ -829,6 +902,7 @@ async def h_history(request: web.Request) -> web.Response:
         "markdown_count": markdown_count,
         "tool_call_count": tool_call_count,
         "wakeup_count": wakeup_count,
+        "is_hide_count": is_hide_count,
         "messages": msgs,
     })
 
@@ -1051,6 +1125,107 @@ async def h_revoke(request: web.Request) -> web.Response:
     })
 
 
+async def h_message_hide(request: web.Request) -> web.Response:
+    """隐藏 / 取消隐藏消息：POST /api/message/hide
+
+    body: {
+      target_type, target_id,        # 必填，会话（group / c2c）
+      message_ids: [...],            # 必填，要修改的消息 ID 数组（也接受单个字符串）
+      is_hide: 0 | 1,                # 可选，默认 1（隐藏，即不发给 AI）
+      app_id?                        # 全局密钥通道可指定
+    }
+
+    作用：修改聊天记录里的 is_hide 字段。is_hide=1（已隐藏）的条目在构建
+    发给 AI 的上下文时被整条剔除（见 memory.get_history / filter_hidden_for_ai）。
+
+    与 /api/revoke 的区别（两者**完全独立**，互不影响）：
+      /api/revoke        —— 真的去 QQ 侧撤回消息，并写 revoked 状态；
+                            撤回后的消息仍会进上下文，只是带 [已撤回] 前缀。
+      /api/message/hide  —— 纯本地隐藏，不调用任何 QQ 接口、不碰 revoked；
+                            命中后模型彻底看不到这条。
+
+    因此本接口不要求消息未过期，也不校验机器人权限 —— 它只改本地 JSON。
+    返回每条消息的修改结果；未找到该 message_id 记为该条失败（不影响其它条）。
+    """
+    auth = request["auth"]
+    app_id, err = _resolve_app_id(auth, request)
+    if err:
+        return fail(err, 403 if auth["role"] == ROLE_BOT else 400)
+    if (e := _check_cross_allowed(auth, auth["app_id"], app_id)):
+        return fail(e, 403)
+
+    body = request.get("json_body") or await _read_json(request)
+    if (e := _reject_unknown_params(request, "/api/message/hide", body)):
+        return e
+
+    target_type = str(body.get("target_type") or "").strip().lower()
+    target_id = str(body.get("target_id") or "").strip()
+    if target_type not in ("group", "c2c"):
+        return fail("target_type 必须为 group 或 c2c")
+    if not target_id:
+        return fail("缺少 target_id")
+
+    # 统一为数组：只接受 message_ids（可传数组或单个字符串）
+    ids = body.get("message_ids")
+    if isinstance(ids, str):
+        ids = [ids] if ids.strip() else []
+    if not isinstance(ids, list) or not ids:
+        return fail("缺少 message_ids（数组形式，如 [\"xxx\"]）")
+    ids = [str(x).strip() for x in ids if str(x).strip()]
+    if not ids:
+        return fail("message_ids 不能为空")
+
+    # is_hide 默认 1：接口名就是「隐藏」，不传即按「隐藏」处理。
+    # 传 0/false 表示取消隐藏，该条重新参与 AI 上下文。
+    raw_flag = body.get("is_hide")
+    if raw_flag is None:
+        is_hide = True
+    else:
+        is_hide = str(raw_flag).strip().lower() in ("1", "true", "yes", "on")
+
+    thread_key = f"{target_type}_{target_id}"
+    ctx = LogCtx(app_id=app_id, thread_key=thread_key)
+
+    results = []
+    for message_id in ids:
+        changed = set_message_hidden(thread_key, message_id, is_hide)
+        if changed:
+            results.append({"message_id": message_id, "is_hide": 1 if is_hide else 0,
+                            "updated": changed})
+        else:
+            # 找不到 msg_id（或该条已是目标值）——分开说明，便于排查
+            results.append({"message_id": message_id, "is_hide": 1 if is_hide else 0,
+                            "updated": 0,
+                            "error": "未找到该 message_id（或值未发生变化）"})
+
+    ok_n = sum(1 for r in results if r["updated"])
+    info(f"[API] 隐藏消息 app={app_id} {thread_key} is_hide={1 if is_hide else 0} "
+         f"成功={ok_n}/{len(ids)}", ctx=ctx)
+
+    # 单条时保持扁平返回，与 /api/revoke 的写法一致
+    if len(ids) == 1:
+        r0 = results[0]
+        if r0["updated"]:
+            return ok({
+                "app_id": app_id,
+                "thread_key": thread_key,
+                "message_id": r0["message_id"],
+                "is_hide": r0["is_hide"],
+                "updated": r0["updated"],
+            })
+        return fail(r0.get("error") or "未找到该 message_id", 404)
+
+    return ok({
+        "app_id": app_id,
+        "thread_key": thread_key,
+        "total": len(ids),
+        "is_hide": 1 if is_hide else 0,
+        "updated_count": ok_n,
+        "failed_count": len(ids) - ok_n,
+        "results": results,
+    })
+
+
 async def h_batch_revoke(request: web.Request) -> web.Response:
     """批量撤回：POST /api/batch_revoke
 
@@ -1134,7 +1309,6 @@ async def h_batch_revoke(request: web.Request) -> web.Response:
         return fail(f"未找到机器人 {app_id} 的凭证", 400)
 
     hist = load_history(thread_key)
-    ts_pattern = re.compile(r"^\[(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})(?::(\d{2}))?\]")
     matched: List[Dict[str, Any]] = []
 
     for m in hist:
@@ -1147,17 +1321,10 @@ async def h_batch_revoke(request: web.Request) -> web.Response:
         if content.startswith("[已撤回]"):
             continue
 
+        # 时间从结构化 ts 字段解析（旧记录由 load_history 归一后同样可用），
+        # 不再从正文里正则抠 "[YYYY-MM-DD HH:MM]" 前缀。
         raw_content = content
-        msg_dt = None
-        tm = ts_pattern.match(content)
-        if tm:
-            y, mo, d, h, mi = (int(tm.group(i)) for i in range(1, 6))
-            s = int(tm.group(6)) if tm.group(6) else 0
-            try:
-                msg_dt = datetime(y, mo, d, h, mi, s, tzinfo=bj_tz)
-            except Exception:
-                pass
-            raw_content = content[tm.end():]
+        msg_dt = parse_history_ts(m)
 
         # 指定时间范围时，无法判断时间的条目一律排除
         if start_dt or end_dt:
@@ -1602,7 +1769,7 @@ async def h_push_list(request: web.Request) -> web.Response:
 
     查询参数（全部可选，可任意组合）：
       status       状态筛选，支持多值（逗号分隔或重复参数）
-                   取值：pending/running/completed/failed/cancelled
+                   取值：pending(未开始)/completed(执行完成)/failed(执行失败)
                    也接受中文：未开始/运行中/执行完成/执行失败/已取消
       keywords     关键词数组，多值（逗号分隔或重复参数），任一命中即可
       keyword/q    单关键词（等价于 keywords 只有一个）
@@ -2021,11 +2188,415 @@ async def h_wakeup_trigger(request: web.Request) -> web.Response:
     )
 
 
-# ==================== 9. 服务信息 ====================
+# ==================== 9. 记忆管理 ====================
+# 与 AI 工具的 view_memory / add_memory / modify_memory / delete_memory /
+# enable_memory / disable_memory / search_memory 共用底层函数
+# （实现都在 memory.py，本段只做参数解析与 JSON 组装）：
+#
+#     /api/memory/*  ==>  memory.py 的 _memory_*  <==  AI 工具 execute_tool_call
+#
+# 四个记忆级别（level）：
+#   global 全局记忆   identifier = app_id（各机器人隔离时按 app_id 分文件）
+#   bot    机器人记忆 identifier = app_id
+#   group  群聊记忆   identifier = 群 openid
+#   c2c    私聊记忆   identifier = 用户 openid
+#
+# identifier 一律必填、不做默认推断：global/bot 猜 app_id 尚可用 _resolve_app_id，
+# 但 group/c2c 的 identifier 是 openid，猜不出来 —— 与其对一半级别静默兜底、
+# 另一半报错，不如统一要求显式传入（缺省时给出的报错里会提示该填什么）。
+
+
+def _memory_ident_hint(level: str) -> str:
+    """identifier 缺失/为空时，按级别给出该填什么的提示。"""
+    return {"global": "机器人 APP_ID", "bot": "机器人 APP_ID",
+            "group": "群 openid", "c2c": "用户 openid"}.get(level, "记忆标识符")
+
+
+async def _memory_precheck(request: web.Request, path: str) -> Tuple[Optional[Dict], Optional[web.Response]]:
+    """记忆接口公共前置：参数名校验 + 鉴权 + 机器人权限校验。
+
+    返回 (body, None) 或 (None, 错误响应)。
+    """
+    auth = request["auth"]
+    body = request.get("json_body") or await _read_json(request)
+    if request.method in ("POST", "PUT", "PATCH"):
+        if (e := _reject_unknown_params(request, path, body)):
+            return None, e
+    app_id, err = _resolve_app_id(auth, request)
+    if err:
+        return None, fail(err, 403 if auth["role"] == ROLE_BOT else 400)
+    if (e := _check_cross_allowed(auth, auth["app_id"], app_id)):
+        return None, fail(e, 403)
+    return body, None
+
+
+def _memory_pick_level(body: Dict, request: web.Request, default: str = "all") -> str:
+    """取 level 参数（GET 走 query，POST 走 body）。"""
+    raw = body.get("level") if body else None
+    if raw is None:
+        raw = request.query.get("level")
+    return str(raw or default).strip().lower()
+
+
+def _memory_pick_identifier(body: Dict, request: web.Request, level: str = "") -> str:
+    """取 identifier 参数。
+
+    按级别优先取对应的专用参数名，便于调用方写出更像 REST 的请求：
+      group 级可传 group_id，c2c 级可传 c2c_user_id，二者都是 identifier 的别名。
+    """
+    if body:
+        if level == "group" and body.get("group_id"):
+            return str(body["group_id"]).strip()
+        if level == "c2c" and body.get("c2c_user_id"):
+            return str(body["c2c_user_id"]).strip()
+        if body.get("identifier"):
+            return str(body["identifier"]).strip()
+    if level == "group" and request.query.get("group_id"):
+        return request.query["group_id"].strip()
+    if level == "c2c" and request.query.get("c2c_user_id"):
+        return request.query["c2c_user_id"].strip()
+    return (request.query.get("identifier") or "").strip()
+
+
+def _memory_check_level(level: str) -> Optional[web.Response]:
+    """level 合法性检查；不合法返回错误响应。"""
+    if level not in _MEMORY_LEVELS:
+        return fail(f"未知记忆级别 {level or '(空)'}，可选：{'/'.join(_MEMORY_LEVELS)}")
+    return None
+
+
+def _memory_level_app_id(level: str, identifier: str) -> str:
+    """global / bot 两级记忆归属于某个机器人，返回其 app_id（其余级别返回空串）。"""
+    return identifier if level in ("global", "bot") else ""
+
+
+async def h_memory_list(request: web.Request) -> web.Response:
+    """读取某级记忆：GET /api/memory/list?level=&identifier=[&app_id=]
+
+    返回该级的记忆条目（带索引，可直接用于 update/delete）与启用状态。
+    对应 AI 工具 view_memory。level 省略时默认 global。
+    """
+    # GET 无 body，_memory_precheck 只看 body 会漏掉查询参数里的拼写错误，
+    # 故与 /api/push/list 等 GET 接口一样，在 handler 开头显式带 {} 校验一次
+    if (e := _reject_unknown_params(request, "/api/memory/list", {})):
+        return e
+
+    body, e = await _memory_precheck(request, "/api/memory/list")
+    if e:
+        return e
+
+    level = _memory_pick_level(body, request, default="global")
+    if (e := _memory_check_level(level)):
+        return e
+    identifier = _memory_pick_identifier(body, request, level)
+    if not identifier:
+        return fail(f"缺少 identifier（{level} 级记忆需填{_memory_ident_hint(level)}）")
+
+    try:
+        mem_list, enabled = _memory_get(level, identifier)
+    except _MemoryError as ex:
+        return fail(str(ex), 400)
+    except Exception as ex:
+        return fail(f"读取记忆异常: {ex}", 500)
+
+    # 带索引返回：调用方拿到后可直接拿去 update/delete，不必自己数下标
+    items = [{"index": i, "content": c} for i, c in enumerate(mem_list)]
+    return ok({
+        "level": level,
+        "identifier": identifier,
+        "app_id": _memory_level_app_id(level, identifier),
+        "enabled": enabled,
+        "total": len(items),
+        "items": items,
+    })
+
+
+async def h_memory_add(request: web.Request) -> web.Response:
+    """添加记忆：POST /api/memory/add
+
+    单条：{level, identifier, content}
+    批量：{items: [{level, identifier, content}, ...]}
+    对应 AI 工具 add_memory（同样支持 items 批量）。
+
+    注意：该级记忆被禁用时添加会被拒绝（与工具侧一致）；
+    如需先启用请调 /api/memory/toggle。
+    """
+    body, e = await _memory_precheck(request, "/api/memory/add")
+    if e:
+        return e
+
+    items = body.get("items")
+    if isinstance(items, list):
+        res = _memory_batch("add", items)
+        return ok({
+            "mode": "batch",
+            "total": len(items),
+            "success_count": len(res["success"]),
+            "failed_count": len(res["failed"]),
+            "success": res["success"],
+            "failed": res["failed"],
+        }, ok_result=not res["failed"])
+
+    level = _memory_pick_level(body, request, default="")
+    if (e := _memory_check_level(level)):
+        return e
+    identifier = _memory_pick_identifier(body, request, level)
+    content = str(body.get("content") or "")
+    if not identifier:
+        return fail(f"缺少 identifier（{level} 级记忆需填{_memory_ident_hint(level)}）")
+    if not content.strip():
+        return fail("缺少 content")
+
+    try:
+        _memory_add(level, identifier, content)
+    except _MemoryDisabledError:
+        return fail(f"{level} 级记忆当前已禁用，请先启用（/api/memory/toggle）", 409)
+    except _MemoryError as ex:
+        return fail(str(ex), 400)
+    except Exception as ex:
+        return fail(f"添加记忆异常: {ex}", 500)
+
+    info(f"[API] 记忆添加 {level}({identifier}): {content[:80]}", ctx=LogCtx(app_id=_memory_level_app_id(level, identifier)))
+    return ok({"mode": "single", "level": level, "identifier": identifier, "message": "已添加"})
+
+
+async def h_memory_update(request: web.Request) -> web.Response:
+    """修改某条记忆：POST /api/memory/update
+
+    单条：{level, identifier, index, content}
+    批量：{items: [{level, identifier, index, content}, ...]}
+    对应 AI 工具 modify_memory。索引从 0 开始，越界即失败（部分失败不回滚）。
+    """
+    body, e = await _memory_precheck(request, "/api/memory/update")
+    if e:
+        return e
+
+    items = body.get("items")
+    if isinstance(items, list):
+        res = _memory_batch("update", items)
+        return ok({
+            "mode": "batch",
+            "total": len(items),
+            "success_count": len(res["success"]),
+            "failed_count": len(res["failed"]),
+            "success": res["success"],
+            "failed": res["failed"],
+        }, ok_result=not res["failed"])
+
+    level = _memory_pick_level(body, request, default="")
+    if (e := _memory_check_level(level)):
+        return e
+    identifier = _memory_pick_identifier(body, request, level)
+    if not identifier:
+        return fail(f"缺少 identifier（{level} 级记忆需填{_memory_ident_hint(level)}）")
+    index = body.get("index")
+    if index is None:
+        return fail("缺少 index")
+    content = str(body.get("content") or "")
+    if not content.strip():
+        return fail("缺少 content")
+
+    try:
+        done = _memory_replace(level, identifier, index, content)
+    except _MemoryError as ex:
+        return fail(str(ex), 400)
+    except Exception as ex:
+        return fail(f"修改记忆异常: {ex}", 500)
+
+    if not done:
+        return fail(f"修改失败：索引 {index} 越界或无效", 404)
+    info(f"[API] 记忆修改 {level}({identifier})[{index}]", ctx=LogCtx(app_id=_memory_level_app_id(level, identifier)))
+    return ok({"mode": "single", "level": level, "identifier": identifier,
+               "index": index, "message": "已修改"})
+
+
+async def h_memory_delete(request: web.Request) -> web.Response:
+    """删除某条记忆：POST /api/memory/delete
+
+    单条：{level, identifier, index}
+    批量：{items: [{level, identifier, index}, ...]}
+    对应 AI 工具 delete_memory。
+    """
+    body, e = await _memory_precheck(request, "/api/memory/delete")
+    if e:
+        return e
+
+    items = body.get("items")
+    if isinstance(items, list):
+        res = _memory_batch("delete", items)
+        return ok({
+            "mode": "batch",
+            "total": len(items),
+            "success_count": len(res["success"]),
+            "failed_count": len(res["failed"]),
+            "success": res["success"],
+            "failed": res["failed"],
+        }, ok_result=not res["failed"])
+
+    level = _memory_pick_level(body, request, default="")
+    if (e := _memory_check_level(level)):
+        return e
+    identifier = _memory_pick_identifier(body, request, level)
+    if not identifier:
+        return fail(f"缺少 identifier（{level} 级记忆需填{_memory_ident_hint(level)}）")
+    index = body.get("index")
+    if index is None:
+        return fail("缺少 index")
+
+    try:
+        done = _memory_remove(level, identifier, index)
+    except _MemoryError as ex:
+        return fail(str(ex), 400)
+    except Exception as ex:
+        return fail(f"删除记忆异常: {ex}", 500)
+
+    if not done:
+        return fail(f"删除失败：索引 {index} 越界或无效", 404)
+    info(f"[API] 记忆删除 {level}({identifier})[{index}]", ctx=LogCtx(app_id=_memory_level_app_id(level, identifier)))
+    return ok({"mode": "single", "level": level, "identifier": identifier,
+               "index": index, "message": "已删除"})
+
+
+async def h_memory_toggle(request: web.Request) -> web.Response:
+    """启用/禁用某级记忆：POST /api/memory/toggle  body: {level, identifier, enabled}
+
+    对应 AI 工具的 enable_memory / disable_memory。
+    禁用只影响「是否注入系统提示」，记忆内容保留。
+    """
+    body, e = await _memory_precheck(request, "/api/memory/toggle")
+    if e:
+        return e
+
+    level = _memory_pick_level(body, request, default="")
+    if (e := _memory_check_level(level)):
+        return e
+    identifier = _memory_pick_identifier(body, request, level)
+    if not identifier:
+        return fail(f"缺少 identifier（{level} 级记忆需填{_memory_ident_hint(level)}）")
+
+    raw = body.get("enabled")
+    if raw is None:
+        raw = body.get("value")
+    if raw is None:
+        raw = request.query.get("enabled")
+    if raw is None:
+        return fail("缺少 enabled（true/false，也可用 value 或查询参数 enabled=1/0）")
+    enabled = str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+    try:
+        _memory_set_enabled(level, identifier, enabled)
+    except _MemoryError as ex:
+        return fail(str(ex), 400)
+    except Exception as ex:
+        return fail(f"切换记忆状态异常: {ex}", 500)
+
+    info(f"[API] 记忆 {level}({identifier}) 已{'启用' if enabled else '禁用'}",
+         ctx=LogCtx(app_id=_memory_level_app_id(level, identifier)))
+    return ok({"level": level, "identifier": identifier, "enabled": enabled,
+               "message": "已启用" if enabled else "已禁用"})
+
+
+async def h_memory_search(request: web.Request) -> web.Response:
+    """检索记忆：GET /api/memory/search?keywords=&level=&identifier=[&group_id=][&c2c_user_id=]
+
+    多关键词（逗号分隔或重复参数），命中任意一个即返回；跨层级搜索。
+    对应 AI 工具 search_memory —— 底层同为 memory.search_memory，
+    故这里额外提供结构化 matches（工具侧拿到的是拼好的中文文本）。
+    level: global / bot / group / c2c / all（默认 all、不区分大小写）
+    """
+    if (e := _reject_unknown_params(request, "/api/memory/search", {})):
+        return e
+
+    body, e = await _memory_precheck(request, "/api/memory/search")
+    if e:
+        return e
+
+    # 多关键词：keywords 支持逗号分隔与重复参数，keyword/q 为单数别名
+    raw_keywords: List[str] = []
+    for src in (request.query.getall("keywords", []), request.query.getall("keyword", []),
+                request.query.getall("q", [])):
+        for chunk in src:
+            raw_keywords.extend(_split_multi(chunk))
+    for key in ("keywords", "keyword", "q"):
+        val = body.get(key)
+        if val is not None:
+            for chunk in (val if isinstance(val, list) else [val]):
+                raw_keywords.extend(_split_multi(chunk))
+    seen: set = set()
+    keywords = [k for k in raw_keywords if not (k.lower() in seen or seen.add(k.lower()))]
+    if not keywords:
+        return fail("缺少 keywords（多个关键词用逗号分隔，或重复传该参数）")
+
+    level = _memory_pick_level(body, request, default="all")
+    if level not in ("all",) + tuple(_MEMORY_LEVELS):
+        return fail(f"未知记忆级别 {level}，可选：all/{'/'.join(_MEMORY_LEVELS)}")
+
+    auth = request["auth"]
+    app_id, err = _resolve_app_id(auth, request)
+    if err:
+        return fail(err, 403 if auth["role"] == ROLE_BOT else 400)
+
+    identifier = _memory_pick_identifier(body, request, level)
+    group_id = (body.get("group_id") or request.query.get("group_id") or "").strip()
+    c2c_id = (body.get("c2c_user_id") or request.query.get("c2c_user_id") or "").strip()
+
+    # 各层级所需标识符：global/bot 用 app_id，group/c2c 用 openid
+    search_app_id = identifier if level in ("global", "bot") else app_id
+    search_group_id = group_id or (identifier if level == "group" else "") or None
+    search_c2c_id = c2c_id or (identifier if level == "c2c" else "") or None
+
+    try:
+        text = search_memory(
+            keywords=keywords,
+            layer=level,
+            app_id=search_app_id,
+            group_id=search_group_id,
+            c2c_user_id=search_c2c_id,
+        )
+    except Exception as ex:
+        return fail(f"搜索记忆异常: {ex}", 500)
+
+    # 结构化结果：逐层列出匹配条目（工具侧只用 text，API 侧两者都给）
+    matches: List[Dict[str, Any]] = []
+
+    def _collect(lv: str, ident: Optional[str]):
+        if not ident:
+            return
+        try:
+            mem_list, enabled = _memory_get(lv, ident)
+        except Exception:
+            return
+        for i, c in enumerate(mem_list):
+            low = str(c).lower()
+            if any(k.lower() in low for k in keywords):
+                matches.append({"level": lv, "identifier": ident, "index": i,
+                                "content": c, "enabled": enabled})
+
+    if level in ("global", "all"):
+        _collect("global", search_app_id)
+    if level in ("bot", "all"):
+        _collect("bot", search_app_id)
+    if level in ("group", "all"):
+        _collect("group", search_group_id)
+    if level in ("c2c", "all"):
+        _collect("c2c", search_c2c_id)
+
+    info(f"[API] 记忆搜索 keywords={keywords} level={level} 命中 {len(matches)} 条",
+         ctx=LogCtx(app_id=search_app_id or ""))
+    return ok({
+        "keywords": keywords,
+        "level": level,
+        "total": len(matches),
+        "matches": matches,
+        "text": text,
+    })
+
+
+# ==================== 10. 服务信息 ====================
 async def h_root(request: web.Request) -> web.Response:
     """根路径：无需鉴权的服务信息"""
     return ok({
-        "service": "dsh-bot-api",
+        "service": "qqbot-api",
         "version": "1.0",
         "time": _now_iso(),
         "endpoints": [
@@ -2037,6 +2608,7 @@ async def h_root(request: web.Request) -> web.Response:
             "GET  /api/history",
             "POST /api/send",
             "POST /api/revoke",
+            "POST /api/message/hide",
             "POST /api/batch_revoke",
             "POST /api/mute",
             "GET  /api/mute/status",
@@ -2050,21 +2622,44 @@ async def h_root(request: web.Request) -> web.Response:
             "POST /api/wakeup/update",
             "POST /api/wakeup/delete",
             "POST /api/wakeup/trigger",
+            "GET  /api/memory/list",
+            "POST /api/memory/add",
+            "POST /api/memory/update",
+            "POST /api/memory/delete",
+            "POST /api/memory/toggle",
+            "GET  /api/memory/search",
         ],
+        "memory_api": {
+            "note": "记忆管理接口，与机器人工具 view_memory / add_memory / modify_memory / "
+                    "delete_memory / enable_memory / disable_memory / search_memory 共用同一套底层函数",
+            "levels": {
+                "global": "全局记忆，identifier = 机器人 APP_ID",
+                "bot": "机器人专属记忆，identifier = 机器人 APP_ID",
+                "group": "群聊记忆，identifier = 群 openid",
+                "c2c": "私聊记忆，identifier = 用户 openid",
+            },
+            "batch": "add / update / delete 三个接口都可用 items 数组一次操作多条",
+            "items_example": {
+                "items": [
+                    {"level": "group", "identifier": "群openid", "content": "要添加的内容"},
+                    {"level": "c2c", "identifier": "用户openid", "index": 0, "content": "替换后的内容"},
+                ]
+            },
+            "index_semantics": "index 从 0 开始；delete 为按下标删除，多条批量按数组顺序依次执行",
+        },
         "task_list_query": {
             "applies_to": ["GET /api/push/list", "GET /api/wakeup/list"],
             "note": "以下查询参数全部可选，可任意组合；多个值可用逗号分隔或重复同名参数",
             "status": {
-                "desc": "按状态筛选，可多值（或关系）",
+                "desc": "按状态筛选，可多值（或关系）。只接受任务真实产生的三种状态",
                 "values": {
                     "pending": "未开始",
-                    "running": "运行中",
                     "completed": "执行完成",
                     "failed": "执行失败",
-                    "cancelled": "已取消",
                 },
-                "also_accepts": ["未开始", "运行中", "执行完成", "执行失败", "已取消"],
+                "also_accepts": ["未开始", "执行完成", "执行失败"],
                 "example": "?status=pending,completed 或 ?status=未开始",
+                "note": "无法识别的值会被忽略，并在响应的 meta.filters.status_ignored 中回显",
             },
             "keywords": {
                 "desc": "关键词数组，任一命中即可（默认）",
@@ -2084,7 +2679,7 @@ async def h_root(request: web.Request) -> web.Response:
         "task_list_response": {
             "total": "过滤后的任务数",
             "tasks": "任务列表",
-            "counts": "过滤前的全量状态统计（total/pending/running/completed/failed/cancelled）",
+            "counts": "过滤前的全量状态统计（total/pending/completed/failed）",
             "filters": "本次实际生效的过滤条件回显（仅在有过滤时出现）",
         },
     })
@@ -2479,6 +3074,7 @@ def create_app() -> web.Application:
 
         web.post("/api/send", h_send),
         web.post("/api/revoke", h_revoke),
+        web.post("/api/message/hide", h_message_hide),
         web.post("/api/batch_revoke", h_batch_revoke),
         web.post("/api/mute", h_mute),
         web.get("/api/mute/status", h_mute_status),
@@ -2498,6 +3094,14 @@ def create_app() -> web.Application:
         web.get("/api/config/get", h_config_get),
         web.get("/api/config/list", h_config_list),
         web.post("/api/config/set", h_config_set),
+
+        # 记忆管理（与 AI 工具的 view/add/modify/delete/enable/disable/search_memory 共用底层）
+        web.get("/api/memory/list", h_memory_list),
+        web.post("/api/memory/add", h_memory_add),
+        web.post("/api/memory/update", h_memory_update),
+        web.post("/api/memory/delete", h_memory_delete),
+        web.post("/api/memory/toggle", h_memory_toggle),
+        web.get("/api/memory/search", h_memory_search),
     ])
     return app
 

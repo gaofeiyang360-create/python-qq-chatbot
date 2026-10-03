@@ -23,6 +23,7 @@ CHECK_INTERVAL = 5  # 秒，后台检查周期
 from task_core import (  # noqa: E402
     VALID_SCHEDULE_TYPES, WAKEUP_UPDATE_FIELDS,
     norm_schedule_type, apply_wakeup_updates,
+    TASK_STATUSES, task_status_of,
 )
 
 # ==================== 存储 ====================
@@ -40,9 +41,14 @@ def load_wakeups() -> List[Dict]:
             if "target" in t and "targets" not in t:
                 t["targets"] = [t.pop("target")]
                 needs_save = True
+            # 迁移旧版状态拼写（active -> pending 等）到规范值，一次性写回
+            norm = task_status_of(t)
+            if t.get("status") != norm and norm in TASK_STATUSES:
+                t["status"] = norm
+                needs_save = True
         if needs_save:
             save_wakeups(tasks)
-            info("[唤醒调度] 已自动迁移旧版唤醒任务数据（target → targets）", ctx=None)
+            info("[唤醒调度] 已自动迁移旧版唤醒任务数据（target → targets / 状态规范化）", ctx=None)
         return tasks
     except Exception as e:
         warn(f"[唤醒调度] 加载定时唤醒文件失败: {e}", ctx=None)
@@ -85,6 +91,31 @@ def _now_bj_iso() -> str:
     return _now_bj().isoformat(timespec="seconds")
 
 
+def _executed_on_date(history: List[Dict], day: datetime) -> bool:
+    """判断执行历史里是否存在"发生在 day 这一天（北京时间）"的记录。
+
+    原先用 h["time"].startswith("2026-09-30") 做前缀比较，隐含假设 time 一定是
+    "YYYY-MM-DD..." 开头且不带时区换算。写入侧目前是北京时间 ISO 字符串，
+    但一旦改成 UTC 存储、换成 "2026/09/30" 分隔符、或前补空格，前缀比较就会
+    静默判错 —— 表现为"每日任务在同一天被重复执行"或"当天不再执行"。
+
+    这里改为解析成 datetime 再按北京时间比较日期，兼容带时区（含 Z）、
+    空格分隔、纯日期等写法；无法解析的记录一律忽略（不参与"今天已执行"判断，
+    宁可多执行一次，也不要因为一条脏记录导致当天彻底不执行）。
+
+    与 scheduler._executed_on_date 保持同一实现（两个调度器各自独立，
+    不互相导入，避免循环依赖）。
+    """
+    want = day.astimezone(timezone(timedelta(hours=8))).date()
+    for h in history or []:
+        if not isinstance(h, dict):
+            continue
+        dt = _parse_rfc3339(str(h.get("time") or ""))
+        if dt and dt.date() == want:
+            return True
+    return False
+
+
 # ==================== 任务管理 ====================
 def add_wakeup(task_data: Dict) -> str:
     """添加一条定时唤醒任务，返回 task_id。
@@ -94,7 +125,7 @@ def add_wakeup(task_data: Dict) -> str:
     tasks = load_wakeups()
     task_id = str(uuid.uuid4())[:8]
     task_data["task_id"] = task_id
-    task_data["status"] = "active"
+    task_data["status"] = "pending"
     task_data["schedule_type"] = norm_schedule_type(task_data.get("schedule_type"))
     task_data["created_at"] = _now_bj_iso()
     task_data.setdefault("execution_history", [])
@@ -251,7 +282,8 @@ async def run_wakeup_on_target(task: Dict, target: Dict, bot_cache: Dict[str, Bo
     wakeup_msg = build_wakeup_message(task, tag=tag)
 
     # 1. 记录到聊天历史（标记 is_wakeup=1，API 返回，发给 AI 前会剥离）
-    append_message(thread_key, "user", wakeup_msg, is_wakeup=True)
+    append_message(thread_key, "user", wakeup_msg, is_wakeup=True,
+                   username=initiator_name, user_id=initiator_id)
     info(f"[唤醒] 任务 {task.get('task_id')} 已写入聊天历史: {thread_key}", ctx=ctx)
 
     # 2. 尝试调用 AI 生成回复
@@ -354,8 +386,8 @@ async def check_and_execute_wakeups():
     remaining = []
 
     for t in tasks:
-        status = t.get("status", "active")
-        if status != "active":
+        status = t.get("status", "pending")
+        if status != "pending":
             remaining.append(t)
             continue
 
@@ -370,8 +402,7 @@ async def check_and_execute_wakeups():
             if sched and now >= sched:
                 info(f"[唤醒调度] 一次性任务 {task_id} 到期，准备执行", ctx=ctx)
                 due.append(t)
-                # 执行后标记为 completed
-                t["status"] = "completed"
+                # 最终状态由下面的执行循环按实际结果写成 completed / failed
                 remaining.append(t)
             else:
                 remaining.append(t)
@@ -389,10 +420,8 @@ async def check_and_execute_wakeups():
                 else:
                     # 后续执行：每天同一时分
                     today_sched = now.replace(hour=sched.hour, minute=sched.minute, second=sched.second, microsecond=0)
-                    today_str = now.strftime("%Y-%m-%d")
-                    executed_today = any(
-                        h.get("time", "").startswith(today_str) for h in history
-                    )
+                    # 按日期比较（不再用字符串前缀），见 _executed_on_date
+                    executed_today = _executed_on_date(history, now)
                     if not executed_today and now >= today_sched:
                         info(f"[唤醒调度] 每日任务 {task_id} 到期（每天 {today_sched.time()}），准备执行", ctx=ctx)
                         due.append(t)
@@ -451,14 +480,10 @@ async def check_and_execute_wakeups():
             history = t.setdefault("execution_history", [])
             success_count = sum(1 for r in target_results if r.get("ok"))
             fail_count = len(target_results) - success_count
-            if not target_results:
-                overall = "failed"
-            elif fail_count == 0:
-                overall = "success"
-            elif success_count > 0:
-                overall = "partial"
-            else:
-                overall = "failed"
+            # 只写规范状态：全部成功 = completed，其余一律 failed。
+            # 唤醒是直接拿返回值判定，不存在陈旧 result 问题；
+            # 但仍要求至少有一个成功目标，避免「无目标」被算成完成。
+            overall = "completed" if (success_count > 0 and fail_count == 0) else "failed"
             history.append({
                 "time": now_iso,
                 "status": overall,
@@ -469,11 +494,16 @@ async def check_and_execute_wakeups():
             })
             if len(history) > 3:
                 t["execution_history"] = history[-3:]
+            # 任务级状态跟随实际结果，否则失败任务永远停在初始值
+            t["status"] = overall
+            t["finished_at"] = now_iso
         except Exception as e:
             error(f"[唤醒调度] 任务 {t.get('task_id')} 执行异常: {e}", ctx=ctx)
             t.setdefault("execution_history", []).append({
                 "time": now_iso, "status": "failed", "error": str(e)[:100]
             })
+            t["status"] = "failed"
+            t["finished_at"] = now_iso
 
     save_wakeups(remaining)
 

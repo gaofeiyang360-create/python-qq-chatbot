@@ -21,6 +21,7 @@ from memory import (
     get_cached_media_summary, set_cached_media, get_media_cache_key, get_url_cache_key,
     load_user_map, load_mirror, get_user_name, get_group_name_from_mirror,
     append_message, load_history, mark_message_revoked,
+    parse_history_ts,   # 从结构化 ts 字段解析消息时间
     get_global_memory, add_global_memory, remove_global_memory, replace_global_memory,
     get_global_memory_enabled, set_global_memory_enabled,
     get_bot_memory_list, add_bot_memory, remove_bot_memory, replace_bot_memory,
@@ -30,6 +31,17 @@ from memory import (
     get_c2c_memory_list, add_c2c_memory, remove_c2c_memory, replace_c2c_memory,
     get_c2c_memory_enabled, set_c2c_memory_enabled,
     search_memory,
+    # 记忆管理统一入口（与 api_server 的 /api/memory/* 共用同一份实现）
+    MEMORY_LEVELS,
+    MemoryError_ as MemoryError_,
+    MemoryDisabledError,
+    MemoryLevelError,
+    _memory_get,
+    _memory_add,
+    _memory_replace,
+    _memory_remove,
+    _memory_set_enabled,
+    _memory_batch,
 )
 from scheduler import add_task, delete_task, update_task, list_tasks, load_tasks
 from wakeup_scheduler import add_wakeup, delete_wakeup, update_wakeup, list_wakeups
@@ -49,60 +61,13 @@ _LIST_FILTER_KEYS = {
 # 参数来源用 _TaskParams 适配：既能吃普通 dict（AI 工具参数），
 # 也能吃 aiohttp 的 request.query / request 对象。
 
-# ==================== 状态归一化 ====================
-
-# 把内部状态映射到对外统一的语义状态。
-# 内部取值来自 scheduler / wakeup_scheduler：
-#   推送：pending(未开始) / sent(执行完成)
-#   唤醒：active(未开始)     / completed(执行完成)
-# 另外把执行中、失败等也算进来，方便调用方按语义筛选。
-_TASK_STATUS_ALIASES = {
-    # 未开始
-    "pending": "pending",
-    "active": "pending",
-    "waiting": "pending",
-    "scheduled": "pending",
-    "not_started": "pending",
-    "未开始": "pending",
-    "待执行": "pending",
-    # 执行完成
-    "sent": "completed",
-    "completed": "completed",
-    "done": "completed",
-    "finished": "completed",
-    "success": "completed",
-    "执行完成": "completed",
-    "已完成": "completed",
-    # 运行中
-    "running": "running",
-    "executing": "running",
-    "in_progress": "running",
-    "运行中": "running",
-    "执行中": "running",
-    # 失败 / 已取消
-    "failed": "failed",
-    "error": "failed",
-    "执行失败": "failed",
-    "失败": "failed",
-    "cancelled": "cancelled",
-    "canceled": "cancelled",
-    "已取消": "cancelled",
-}
-
-# 对外的中文状态名，便于直接展示
-_TASK_STATUS_LABELS = {
-    "pending": "未开始",
-    "running": "运行中",
-    "completed": "执行完成",
-    "failed": "执行失败",
-    "cancelled": "已取消",
-}
-
-
-def _norm_task_status(raw: Any) -> str:
-    """把任务内部状态归一化为对外状态值（pending/running/completed/failed/cancelled）。"""
-    s = str(raw or "").strip().lower()
-    return _TASK_STATUS_ALIASES.get(s, s or "pending")
+# ==================== 状态定义 ====================
+# 唯一事实来源在 task_core.py（scheduler / wakeup_scheduler 也要用它，
+# 放这里会与「tool 延迟导入 scheduler」形成循环导入）。
+from task_core import (  # noqa: E402
+    TASK_STATUSES, _TASK_STATUS_LABELS, _STATUS_CN, _LEGACY_STATUS,
+    norm_task_status as _norm_task_status, task_status_of,
+)
 
 
 def _split_multi(raw: Any) -> List[str]:
@@ -306,13 +271,21 @@ def _filter_tasks(tasks: List[Dict[str, Any]], params: Any,
     out = list(tasks)
 
     # ---- 状态过滤 ----
-    want_status = [_norm_task_status(s) for s in _split_multi(p.multi("status", "state"))]
+    # 只接受规范状态（pending/completed/failed）与其中文标签。
+    # 无法识别的值不再静默兜底，而是让筛选结果为空，并在 meta 里回显
+    # 以便调用方知道条件没生效（例如 status=运行中 这种旧写法）。
+    raw_status = _split_multi(p.multi("status", "state"))
+    want_status = [_norm_task_status(s) for s in raw_status]
     if want_status:
         # 去重保序
         seen_s: set = set()
         want_status = [s for s in want_status if not (s in seen_s or seen_s.add(s))]
-        out = [t for t in out if _norm_task_status(t.get("status")) in want_status]
-        meta["filters"]["status"] = want_status
+        unknown = [s for s in want_status if s not in _TASK_STATUS_LABELS]
+        valid = [s for s in want_status if s in _TASK_STATUS_LABELS]
+        out = [t for t in out if task_status_of(t) in valid] if valid else []
+        meta["filters"]["status"] = valid
+        if unknown:
+            meta["filters"]["status_ignored"] = unknown
 
     # ---- 关键词过滤（多关键词，默认任一命中）----
     keywords: List[str] = []
@@ -452,10 +425,11 @@ def _filter_tasks(tasks: List[Dict[str, Any]], params: Any,
 
 
 def _task_counts(tasks: List[Dict[str, Any]]) -> Dict[str, int]:
-    """按归一化状态统计数量，便于展示筛选标签。"""
-    counts = {k: 0 for k in _TASK_STATUS_LABELS}
+    """按状态统计数量。键严格等于 TASK_STATUSES + total，
+    保证每个 count 都能对应到一个真实存在的筛选 tab（不会多出无名键）。"""
+    counts = {k: 0 for k in TASK_STATUSES}
     for t in tasks:
-        s = _norm_task_status(t.get("status"))
+        s = task_status_of(t)
         counts[s] = counts.get(s, 0) + 1
     counts["total"] = len(tasks)
     return counts
@@ -464,7 +438,7 @@ def _task_counts(tasks: List[Dict[str, Any]]) -> Dict[str, int]:
 def _status_summary_text(counts: Dict[str, int]) -> str:
     """把状态统计拼成一行中文摘要，供 AI 工具输出使用。"""
     parts = []
-    for k in ("pending", "running", "completed", "failed", "cancelled"):
+    for k in TASK_STATUSES:
         n = counts.get(k, 0)
         if n:
             parts.append(f"{_TASK_STATUS_LABELS[k]} {n}")
@@ -479,6 +453,8 @@ def _describe_filters(meta: Dict[str, Any]) -> str:
     parts = []
     if f.get("status"):
         parts.append("状态=" + "/".join(_TASK_STATUS_LABELS.get(s, s) for s in f["status"]))
+    if f.get("status_ignored"):
+        parts.append("（忽略无法识别的状态：" + "/".join(f["status_ignored"]) + "）")
     if f.get("keywords"):
         kw = "、".join(f["keywords"])
         parts.append(f"关键词={'全部含' if f.get('match_all') else '任一含'}「{kw}」")
@@ -503,6 +479,14 @@ def _describe_filters(meta: Dict[str, Any]) -> str:
     if f.get("time_error"):
         parts.append("⚠ " + f["time_error"])
     return "，".join(parts)
+
+
+# ==================== 记忆管理（API / AI 工具共用） ====================
+# 业务层实现在 memory.py 的「记忆管理统一入口」一节，本文件在顶部 import 导入。
+#   1. AI 工具 execute_tool_call 的 view_memory / add_memory / modify_memory /
+#      delete_memory / enable_memory / disable_memory
+#   2. api_server.py 的 /api/memory/* 接口
+# 两边导入的是 memory.py 里同一份函数对象，不是各写一份。
 
 
 # ==================== 媒体推送策略判断 ====================
@@ -531,7 +515,7 @@ def get_tools_description(enable_group_manage: bool = False) -> str:
         "你可以使用工具来完成任务：通过 http_request 发起任意网络请求获取信息；"
         "使用 send_media 发送图片、视频或文件（支持 HTTP/HTTPS URL ，系统会自动处理上传）。调用 send_media 时必须明确传入 file_type 与 file_name，不得省略；file_type 取值：1=图片（jpg/jpeg/png/gif/webp/bmp 等），2=视频（mp4/mov/mkv 等），3=语音（通用音频如 mp3/wav/ogg 填 3 或 4 都可以），4=文件（文档、压缩包等其余类型）；"
         "使用 send_text 向当前会话发送纯文本文字（当你需要通过工具发送自定义文本时使用，发送后请调用 skip_reply 以结束工具调用循环，避免重复发送）；"
-        "使用 recognize_media 主动识别媒体内容并获取摘要；"
+        "使用 recognize_media 主动识别媒体内容并获取摘要（可选传入 prompt 从特定角度重新识别，结果会追加到原摘要之后）；"
         "使用 search_music 搜索歌曲；"
         "使用 play_music 根据歌曲ID播放音乐（仅限非VIP歌曲）。"
         "使用 get_targets 获取所有机器人的私聊用户、群及群成员的列表（含名称、ID、所属机器人 APP_ID、推送/唤醒权限标注），"
@@ -720,6 +704,9 @@ def get_tools_definition(enable_group_manage: bool = False) -> List[Dict]:
                     "重要：很多媒体URL（尤其 QQ 的 multimedia.nt.qq.com.cn/download?...）路径里不带扩展名，"
                     "此时若只传 media_url，将无法判断媒体类型而失败。media_url、media_type、filename 三个参数都必填，请务必一并传入。"
                     "上下文中形如 [收到图片：xxx.png] 的占位已注明该传的参数，照抄即可。"
+                    "可选参数 prompt：当你需要从某个特定角度重新识别时传入（例如\"读出图中所有文字\"、"
+                    "\"这张图里有没有表格\"）。传了 prompt 会忽略缓存重新识别一次，"
+                    "并把新的识别结果追加到已有摘要之后（不会覆盖），因此可以多次用不同角度提问，逐步补充细节。"
                 ),
                 "parameters": {
                     "type": "object",
@@ -744,6 +731,15 @@ def get_tools_definition(enable_group_manage: bool = False) -> List[Dict]:
                                 "文件名（必填），需带扩展名，如 xxx.png / v.mp4。"
                                 "每次调用都必须明确写出该参数。"
                                 "上下文占位里写了 filename=\"...\" 时请照抄。"
+                            )
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": (
+                                "可选。本次识别的额外关注点，会附加到识别提示词中让模型聚焦，"
+                                "例如\"重点描述图中人物的表情\"、\"完整读出所有文字\"。"
+                                "传入后会忽略缓存重新识别，并把结果追加到原摘要之后。"
+                                "只想拿已有摘要时不要传该参数。"
                             )
                         },
                         "disable_cache": {
@@ -1012,7 +1008,7 @@ def get_tools_definition(enable_group_manage: bool = False) -> List[Dict]:
                     "properties": {
                         "status": {
                             "type": "string",
-                            "description": "按状态筛选，可多选（逗号分隔取「或」）。取值：pending(未开始)/running(运行中)/completed(执行完成)/failed(执行失败)/cancelled(已取消)，也接受中文写法。例如 \"completed\" 或 \"pending,completed\""
+                            "description": "按状态筛选，可多选（逗号分隔取「或」）。取值：pending(未开始)/completed(执行完成)/failed(执行失败)，也接受中文写法。例如 \"completed\" 或 \"pending,completed\""
                         },
                         "keywords": {
                             "type": "array",
@@ -1288,7 +1284,7 @@ def get_tools_definition(enable_group_manage: bool = False) -> List[Dict]:
                     "properties": {
                         "status": {
                             "type": "string",
-                            "description": "按状态筛选，可多选（逗号分隔取「或」）。取值：pending(未开始)/running(运行中)/completed(执行完成)/failed(执行失败)/cancelled(已取消)，也接受中文写法。例如 \"completed\" 或 \"pending,completed\""
+                            "description": "按状态筛选，可多选（逗号分隔取「或」）。取值：pending(未开始)/completed(执行完成)/failed(执行失败)，也接受中文写法。例如 \"completed\" 或 \"pending,completed\""
                         },
                         "keywords": {
                             "type": "array",
@@ -1424,11 +1420,6 @@ def get_tools_definition(enable_group_manage: bool = False) -> List[Dict]:
                                 "group_name": {"type": "string", "description": "群名称（可选）"}
                             },
                             "description": "新的发起者信息（可选）"
-                        },
-                        "status": {
-                            "type": "string",
-                            "enum": ["active", "paused"],
-                            "description": "新的状态：active=启用，paused=暂停（可选）"
                         },
                         "isolation_mode": {
                             "type": "integer",
@@ -2239,6 +2230,9 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
         media_type = arguments.get("media_type")
         filename = arguments.get("filename", "媒体")
         disable_cache = arguments.get("disable_cache", False)  # 新增
+        # 可选：本次识别的额外关注点。传了即进入聚焦识别
+        # （忽略缓存重新识别，并把结果追加到原摘要之后，见 ai.recognize_media）
+        focus_prompt = arguments.get("prompt")
         if not media_url:
             result_content = "错误：recognize_media 缺少 media_url 参数"
         else:
@@ -2247,7 +2241,8 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                 import ai
                 result_content = await ai.recognize_media_by_url(
                     media_url, filename, media_type, disable_cache=disable_cache,
-                    app_id=getattr(bot_client, "app_id", None)
+                    app_id=getattr(bot_client, "app_id", None),
+                    prompt=focus_prompt,
                 )
             except Exception as e:
                 result_content = f"媒体识别失败：{e}"
@@ -2610,8 +2605,6 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                             result_content = f"错误：end_time 格式无效 '{end_time_str}': {e}"
                             return {"role": "tool", "tool_call_id": tool_call_id, "content": result_content}
 
-                    ts_pattern = re.compile(r'^\[(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})(?::(\d{2}))?\]')
-
                     # 取最近的 range 条（按时间倒序），然后过滤
                     recent = list(reversed(hist[-range_count:] if range_count <= len(hist) else hist))
                     lines = []
@@ -2625,18 +2618,10 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                         if role == "tool":
                             continue
 
-                        # 提取消息时间戳
-                        msg_dt = None
-                        display_no_ts = raw_content
-                        ts_match = ts_pattern.match(raw_content)
-                        if ts_match:
-                            y, mo, d, h, mi = int(ts_match.group(1)), int(ts_match.group(2)), int(ts_match.group(3)), int(ts_match.group(4)), int(ts_match.group(5))
-                            s = int(ts_match.group(6)) if ts_match.group(6) else 0
-                            try:
-                                msg_dt = datetime(y, mo, d, h, mi, s, tzinfo=beijing_tz)
-                            except Exception:
-                                pass
-                            display_no_ts = raw_content[ts_match.end():]
+                        # 消息时间取结构化 ts 字段（旧记录由 load_history 归一后同样可用），
+                        # 不再从正文里正则抠 "[YYYY-MM-DD HH:MM]" 前缀。
+                        # content 已是纯正文，无需再剥前缀。
+                        msg_dt = parse_history_ts(msg)
 
                         # 时间范围过滤
                         if start_dt and msg_dt and msg_dt < start_dt:
@@ -2646,7 +2631,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
 
                         # 多关键词过滤（OR 逻辑，任一匹配即返回）
                         if all_keywords:
-                            content_lower = display_no_ts.lower()
+                            content_lower = raw_content.lower()
                             matched = any(kw.lower() in content_lower for kw in all_keywords)
                             if not matched:
                                 continue
@@ -2662,6 +2647,11 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                             meta_parts.append(f"msg_idx={msg_idx}")
                         if ref_idx:
                             meta_parts.append(f"ref_msg_idx={ref_idx}")
+                        # 发送者信息取自结构化字段（正文里不再含 "昵称(id): " 前缀）
+                        sender = msg.get("username") or ""
+                        sender_id = msg.get("user_id") or ""
+                        if sender or sender_id:
+                            meta_parts.append(f"from={sender}({sender_id})" if sender_id else f"from={sender}")
                         meta_str = f" ({', '.join(meta_parts)})" if meta_parts else ""
 
                         # 时间标签
@@ -2805,7 +2795,6 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                     if not hist:
                         result_content = f"会话 {thread_key_target} 暂无聊天记录"
                     else:
-                        ts_pattern = re.compile(r'^\[(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})(?::(\d{2}))?\]')
                         matched_messages = []
 
                         for msg in hist:
@@ -2819,23 +2808,15 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                             if content.startswith("[已撤回]"):
                                 continue
 
-                            raw_content_no_ts = content
-                            msg_dt = None
-                            ts_match = ts_pattern.match(content)
-                            if ts_match:
-                                y, mo, d, h, mi = int(ts_match.group(1)), int(ts_match.group(2)), int(ts_match.group(3)), int(ts_match.group(4)), int(ts_match.group(5))
-                                s = int(ts_match.group(6)) if ts_match.group(6) else 0
-                                try:
-                                    msg_dt = datetime(y, mo, d, h, mi, s, tzinfo=beijing_tz)
-                                except Exception:
-                                    pass
-                                raw_content_no_ts = content[ts_match.end():]
+                            # 时间取结构化 ts 字段（旧记录由 load_history 归一后同样可用）；
+                            # content 已是纯正文，无需再剥时间戳前缀。
+                            msg_dt = parse_history_ts(msg)
 
                             # 时间范围过滤。
-                            # 注意：历史记录里少数条目没有 [YYYY-MM-DD HH:MM] 前缀
-                            # （如工具调用记录），此时 msg_dt 为 None，无法判断时间。
+                            # 注意：历史记录里少数条目（如工具调用记录）没有时间信息，
+                            # 此时 msg_dt 为 None，无法判断时间。
                             # 这类条目在指定了时间范围时一律排除 —— 否则"撤今天上午的消息"
-                            # 会把无时间戳的旧消息也一起撤掉。
+                            # 会把无时间的旧消息也一起撤掉。
                             if start_dt or end_dt:
                                 if msg_dt is None:
                                     continue
@@ -2844,7 +2825,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                                 if end_dt and msg_dt > end_dt:
                                     continue
 
-                            content_lower = raw_content_no_ts.lower()
+                            content_lower = content.lower()
                             matched_keyword = None
                             for kw in keywords:
                                 if kw.lower() in content_lower:
@@ -2855,7 +2836,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                             if matched_keyword or not keywords:
                                 matched_messages.append({
                                     "msg_id": msg_id_val,
-                                    "content_preview": raw_content_no_ts[:60],
+                                    "content_preview": content[:60],
                                     "keyword": matched_keyword,
                                     "timestamp": msg_dt,
                                     "role": role,
@@ -3363,7 +3344,10 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                         "targets": targets,
                         "schedule_type": "one_time",
                         "schedule_time": datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds"),
-                        "status": "sent",
+                        # 这是「立即发送」的记录，结果已出，按真实成败落规范状态。
+                        # 之前无条件写 completed，导致发送失败也显示「执行完成」。
+                        "status": ("completed" if (total > 0 and success_count > 0 and fail_count == 0)
+                                   else "failed"),
                         "created_at": datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds"),
                         "initiator_info": {
                             "app_id": caller_app_id,
@@ -3379,7 +3363,9 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                         },
                         "execution_history": [{
                             "time": datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds"),
-                            "status": "success" if fail_count == 0 else "partial" if success_count > 0 else "failed",
+                            # 执行历史同样只使用规范状态，界面徽章才能统一着色。
+                            # 必须同时看 success_count：发不出去时 fail_count 也是 0。
+                            "status": "completed" if (total > 0 and success_count > 0 and fail_count == 0) else "failed",
                             "success_count": success_count,
                             "fail_count": fail_count,
                             "total": total,
@@ -3516,7 +3502,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                 lines = [header]
                 for t in tasks:
                     tid = t.get("task_id", "?")
-                    status = t.get("status", "?")
+                    status = _TASK_STATUS_LABELS.get(task_status_of(t), "?")
                     schedule_type = t.get("schedule_type", "one_time")
                     app = t.get("app_id", "?")
                     sched_time = t.get("schedule_time", "")
@@ -3634,7 +3620,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                         recent = history[-3:]
                         for h in recent:
                             h_time = h.get("time", "?")
-                            h_status = h.get("status", "?")
+                            h_status = _TASK_STATUS_LABELS.get(_norm_task_status(h.get("status")), h.get("status", "?"))
                             h_err = h.get("error", "")
                             # 执行结果详情（兼容新旧格式）
                             h_sc = h.get("success_count")
@@ -3945,7 +3931,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                 lines = [header]
                 for t in tasks:
                     tid = t.get("task_id", "?")
-                    status = t.get("status", "?")
+                    status = _TASK_STATUS_LABELS.get(task_status_of(t), "?")
                     sched_type = t.get("schedule_type", "?")
                     app = t.get("app_id", "?")
                     sched_time = t.get("schedule_time", "") or "（未设置）"
@@ -4042,7 +4028,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                         lines.append(f"     共执行 {len(history)} 次，最近 {len(recent)} 次:")
                         for h in recent:
                             h_time = h.get("time", "?")
-                            h_status = h.get("status", "?")
+                            h_status = _TASK_STATUS_LABELS.get(_norm_task_status(h.get("status")), h.get("status", "?"))
                             h_err = h.get("error", "")
                             err_info = f" - {h_err}" if h_err else ""
                             lines.append(f"       · {h_time} [{h_status}]{err_info}")
@@ -4109,9 +4095,8 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                 initiator = arguments.get("initiator")
                 if initiator is not None:
                     updates["initiator"] = initiator
-                status = arguments.get("status")
-                if status is not None:
-                    updates["status"] = status
+                # 状态由调度器根据执行结果写入（pending/completed/failed），
+                # 不接受外部直接改，避免出现程序从不生成的状态值
                 isolation_mode = arguments.get("isolation_mode")
                 if isolation_mode is not None:
                     updates["isolation_mode"] = 1 if isolation_mode else 0
@@ -4130,6 +4115,8 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
         result_content = "已标记跳过回复，结束工具调用循环"
 
     # ==================== 记忆管理工具 ====================
+    # 业务逻辑一律走上面的共用函数（与 api_server 的 /api/memory/* 同一份实现），
+    # 这里只负责把结构化结果拼成给模型看的中文文案。
     elif function_name == "view_memory":
         level = arguments.get("level", "")
         identifier = arguments.get("identifier", "")
@@ -4137,31 +4124,15 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
             result_content = "错误：view_memory 缺少 level 或 identifier 参数"
         else:
             try:
-                if level == "global":
-                    mem_list = get_global_memory(identifier)
-                    enabled = get_global_memory_enabled(identifier)
-                elif level == "bot":
-                    mem_list = get_bot_memory_list(identifier)
-                    enabled = get_bot_memory_enabled(identifier)
-                elif level == "group":
-                    mem_list = get_qun_memory_list(identifier)
-                    enabled = get_qun_memory_enabled(identifier)
-                elif level == "c2c":
-                    mem_list = get_c2c_memory_list(identifier)
-                    enabled = get_c2c_memory_enabled(identifier)
-                else:
-                    result_content = f"错误：未知记忆级别 {level}"
-                    return {
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "content": result_content
-                    }
+                mem_list, enabled = _memory_get(level, identifier)
                 status_text = "启用" if enabled else "禁用"
                 if mem_list:
                     items = "\n".join([f"  [{i}] {item}" for i, item in enumerate(mem_list)])
                     result_content = f"记忆级别: {level}（{status_text}）共 {len(mem_list)} 条：\n{items}"
                 else:
                     result_content = f"记忆级别: {level}（{status_text}）当前无记忆"
+            except MemoryLevelError as e:
+                result_content = f"错误：未知记忆级别 {e.level}"
             except Exception as e:
                 result_content = f"查看记忆异常：{e}"
 
@@ -4170,42 +4141,9 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
         if items and isinstance(items, list):
             # 批量模式
             try:
-                success_list = []
-                fail_list = []
-                for item in items:
-                    level = item.get("level", "")
-                    identifier = item.get("identifier", "")
-                    content = item.get("content", "")
-                    if not level or not identifier or not content:
-                        fail_list.append(f"（参数不完整: level={level}, identifier={identifier}）")
-                        continue
-                    try:
-                        if level == "global":
-                            if not get_global_memory_enabled(identifier):
-                                fail_list.append(f"全局记忆({identifier}) 已禁用")
-                                continue
-                            add_global_memory(content, identifier)
-                        elif level == "bot":
-                            if not get_bot_memory_enabled(identifier):
-                                fail_list.append(f"机器人记忆({identifier}) 已禁用")
-                                continue
-                            add_bot_memory(identifier, content)
-                        elif level == "group":
-                            if not get_qun_memory_enabled(identifier):
-                                fail_list.append(f"群聊记忆({identifier}) 已禁用")
-                                continue
-                            add_qun_memory(identifier, content)
-                        elif level == "c2c":
-                            if not get_c2c_memory_enabled(identifier):
-                                fail_list.append(f"私聊记忆({identifier}) 已禁用")
-                                continue
-                            add_c2c_memory(identifier, content)
-                        else:
-                            fail_list.append(f"未知级别 {level}")
-                            continue
-                        success_list.append(f"{level}({identifier})")
-                    except Exception as e:
-                        fail_list.append(f"{level}({identifier}): {e}")
+                res = _memory_batch("add", items)
+                success_list = res["success"]
+                fail_list = [f"第{d['index']}条: {d['error']}" for d in res["failed"]]
                 parts = []
                 if success_list:
                     parts.append(f"成功 {len(success_list)} 条")
@@ -4224,31 +4162,17 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                 result_content = "错误：add_memory 缺少 level、identifier 或 content 参数"
             else:
                 try:
-                    if level == "global":
-                        if not get_global_memory_enabled(identifier):
-                            result_content = f"错误：全局记忆当前已禁用，请先使用 enable_memory 启用"
-                            return {"role": "tool", "tool_call_id": tool_call_id, "content": result_content}
-                        add_global_memory(content, identifier)
-                    elif level == "bot":
-                        if not get_bot_memory_enabled(identifier):
-                            result_content = f"错误：机器人记忆当前已禁用，请先使用 enable_memory 启用"
-                            return {"role": "tool", "tool_call_id": tool_call_id, "content": result_content}
-                        add_bot_memory(identifier, content)
-                    elif level == "group":
-                        if not get_qun_memory_enabled(identifier):
-                            result_content = f"错误：群聊记忆当前已禁用，请先使用 enable_memory 启用"
-                            return {"role": "tool", "tool_call_id": tool_call_id, "content": result_content}
-                        add_qun_memory(identifier, content)
-                    elif level == "c2c":
-                        if not get_c2c_memory_enabled(identifier):
-                            result_content = f"错误：私聊记忆当前已禁用，请先使用 enable_memory 启用"
-                            return {"role": "tool", "tool_call_id": tool_call_id, "content": result_content}
-                        add_c2c_memory(identifier, content)
-                    else:
-                        result_content = f"错误：未知记忆级别 {level}"
-                        return {"role": "tool", "tool_call_id": tool_call_id, "content": result_content}
+                    _memory_add(level, identifier, content)
                     result_content = f"已向 {level} 记忆添加：{content}"
                     info(f"[记忆工具] {level} 添加: {content}", ctx=ctx)
+                except MemoryDisabledError:
+                    _label = {"global": "全局记忆", "bot": "机器人记忆",
+                              "group": "群聊记忆", "c2c": "私聊记忆"}.get(level, f"{level} 记忆")
+                    result_content = f"错误：{_label}当前已禁用，请先使用 enable_memory 启用"
+                    return {"role": "tool", "tool_call_id": tool_call_id, "content": result_content}
+                except MemoryLevelError as e:
+                    result_content = f"错误：未知记忆级别 {e.level}"
+                    return {"role": "tool", "tool_call_id": tool_call_id, "content": result_content}
                 except Exception as e:
                     result_content = f"添加记忆异常：{e}"
 
@@ -4257,35 +4181,9 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
         if items and isinstance(items, list):
             # 批量模式
             try:
-                success_list = []
-                fail_list = []
-                for item in items:
-                    level = item.get("level", "")
-                    identifier = item.get("identifier", "")
-                    idx = item.get("index")
-                    content = item.get("content", "")
-                    if not level or not identifier or idx is None or not content:
-                        fail_list.append(f"（参数不完整: level={level}, identifier={identifier}, index={idx}）")
-                        continue
-                    try:
-                        ok = False
-                        if level == "global":
-                            ok = replace_global_memory(idx, content, identifier)
-                        elif level == "bot":
-                            ok = replace_bot_memory(identifier, idx, content)
-                        elif level == "group":
-                            ok = replace_qun_memory(identifier, idx, content)
-                        elif level == "c2c":
-                            ok = replace_c2c_memory(identifier, idx, content)
-                        else:
-                            fail_list.append(f"未知级别 {level}")
-                            continue
-                        if ok:
-                            success_list.append(f"{level}({identifier})[{idx}]")
-                        else:
-                            fail_list.append(f"{level}({identifier})[{idx}] 索引越界")
-                    except Exception as e:
-                        fail_list.append(f"{level}({identifier})[{idx}]: {e}")
+                res = _memory_batch("update", items)
+                success_list = res["success"]
+                fail_list = [f"第{d['index']}条: {d['error']}" for d in res["failed"]]
                 parts = []
                 if success_list:
                     parts.append(f"成功 {len(success_list)} 条")
@@ -4305,23 +4203,15 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                 result_content = "错误：modify_memory 缺少 level、identifier、index 或 content 参数"
             else:
                 try:
-                    ok = False
-                    if level == "global":
-                        ok = replace_global_memory(idx, content, identifier)
-                    elif level == "bot":
-                        ok = replace_bot_memory(identifier, idx, content)
-                    elif level == "group":
-                        ok = replace_qun_memory(identifier, idx, content)
-                    elif level == "c2c":
-                        ok = replace_c2c_memory(identifier, idx, content)
-                    else:
-                        result_content = f"错误：未知记忆级别 {level}"
-                        return {"role": "tool", "tool_call_id": tool_call_id, "content": result_content}
+                    ok = _memory_replace(level, identifier, idx, content)
                     if ok:
                         result_content = f"已修改 {level} 记忆索引 {idx} 为：{content}"
                         info(f"[记忆工具] {level} 修改索引 {idx}", ctx=ctx)
                     else:
                         result_content = f"修改失败：索引 {idx} 超出范围或无效"
+                except MemoryLevelError as e:
+                    result_content = f"错误：未知记忆级别 {e.level}"
+                    return {"role": "tool", "tool_call_id": tool_call_id, "content": result_content}
                 except Exception as e:
                     result_content = f"修改记忆异常：{e}"
 
@@ -4330,34 +4220,9 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
         if items and isinstance(items, list):
             # 批量模式
             try:
-                success_list = []
-                fail_list = []
-                for item in items:
-                    level = item.get("level", "")
-                    identifier = item.get("identifier", "")
-                    idx = item.get("index")
-                    if not level or not identifier or idx is None:
-                        fail_list.append(f"（参数不完整: level={level}, identifier={identifier}）")
-                        continue
-                    try:
-                        ok = False
-                        if level == "global":
-                            ok = remove_global_memory(idx, identifier)
-                        elif level == "bot":
-                            ok = remove_bot_memory(identifier, idx)
-                        elif level == "group":
-                            ok = remove_qun_memory(identifier, idx)
-                        elif level == "c2c":
-                            ok = remove_c2c_memory(identifier, idx)
-                        else:
-                            fail_list.append(f"未知级别 {level}")
-                            continue
-                        if ok:
-                            success_list.append(f"{level}({identifier})[{idx}]")
-                        else:
-                            fail_list.append(f"{level}({identifier})[{idx}] 索引越界")
-                    except Exception as e:
-                        fail_list.append(f"{level}({identifier})[{idx}]: {e}")
+                res = _memory_batch("delete", items)
+                success_list = res["success"]
+                fail_list = [f"第{d['index']}条: {d['error']}" for d in res["failed"]]
                 parts = []
                 if success_list:
                     parts.append(f"成功 {len(success_list)} 条")
@@ -4376,23 +4241,15 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                 result_content = "错误：delete_memory 缺少 level、identifier 或 index 参数"
             else:
                 try:
-                    ok = False
-                    if level == "global":
-                        ok = remove_global_memory(idx, identifier)
-                    elif level == "bot":
-                        ok = remove_bot_memory(identifier, idx)
-                    elif level == "group":
-                        ok = remove_qun_memory(identifier, idx)
-                    elif level == "c2c":
-                        ok = remove_c2c_memory(identifier, idx)
-                    else:
-                        result_content = f"错误：未知记忆级别 {level}"
-                        return {"role": "tool", "tool_call_id": tool_call_id, "content": result_content}
+                    ok = _memory_remove(level, identifier, idx)
                     if ok:
                         result_content = f"已删除 {level} 记忆索引 {idx}"
                         info(f"[记忆工具] {level} 删除索引 {idx}", ctx=ctx)
                     else:
                         result_content = f"删除失败：索引 {idx} 超出范围或无效"
+                except MemoryLevelError as e:
+                    result_content = f"错误：未知记忆级别 {e.level}"
+                    return {"role": "tool", "tool_call_id": tool_call_id, "content": result_content}
                 except Exception as e:
                     result_content = f"删除记忆异常：{e}"
 
@@ -4403,19 +4260,12 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
             result_content = "错误：enable_memory 缺少 level 或 identifier 参数"
         else:
             try:
-                if level == "global":
-                    set_global_memory_enabled(True, identifier)
-                elif level == "bot":
-                    set_bot_memory_enabled(identifier, True)
-                elif level == "group":
-                    set_qun_memory_enabled(identifier, True)
-                elif level == "c2c":
-                    set_c2c_memory_enabled(identifier, True)
-                else:
-                    result_content = f"错误：未知记忆级别 {level}"
-                    return {"role": "tool", "tool_call_id": tool_call_id, "content": result_content}
+                _memory_set_enabled(level, identifier, True)
                 result_content = f"已启用 {level} 记忆"
                 info(f"[记忆工具] {level} 记忆已启用", ctx=ctx)
+            except MemoryLevelError as e:
+                result_content = f"错误：未知记忆级别 {e.level}"
+                return {"role": "tool", "tool_call_id": tool_call_id, "content": result_content}
             except Exception as e:
                 result_content = f"启用记忆异常：{e}"
 
@@ -4426,19 +4276,12 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
             result_content = "错误：disable_memory 缺少 level 或 identifier 参数"
         else:
             try:
-                if level == "global":
-                    set_global_memory_enabled(False, identifier)
-                elif level == "bot":
-                    set_bot_memory_enabled(identifier, False)
-                elif level == "group":
-                    set_qun_memory_enabled(identifier, False)
-                elif level == "c2c":
-                    set_c2c_memory_enabled(identifier, False)
-                else:
-                    result_content = f"错误：未知记忆级别 {level}"
-                    return {"role": "tool", "tool_call_id": tool_call_id, "content": result_content}
+                _memory_set_enabled(level, identifier, False)
                 result_content = f"已禁用 {level} 记忆"
                 info(f"[记忆工具] {level} 记忆已禁用", ctx=ctx)
+            except MemoryLevelError as e:
+                result_content = f"错误：未知记忆级别 {e.level}"
+                return {"role": "tool", "tool_call_id": tool_call_id, "content": result_content}
             except Exception as e:
                 result_content = f"禁用记忆异常：{e}"
 

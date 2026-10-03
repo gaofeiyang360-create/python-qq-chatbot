@@ -24,6 +24,7 @@ from memory import (
 )
 from ai import (
     generate_reply, should_reply_in_group, recognize_media, recognize_media_by_url,
+    media_result_ok,
     INTERRUPT_CONTEXT,
 )
 from utils import recognize_kind, RECOGNIZE_IMAGE_EXTS, VIDEO_EXTS
@@ -58,6 +59,26 @@ TYPE_NAME_TO_RECOGNIZE_ARG = {
     "视频": "video",
     "媒体": "image",
 }
+
+# message_scene.ext 的条目解析：文档规定为 "键=值" 字符串，键名如 msg_idx / ref_msg_idx。
+# 兼容 "=" / ":" 分隔、等号两侧空格、大小写；值部分由调用方再按 "&" 取第一段。
+_EXT_KV_RE = re.compile(r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*[=:]\s*(.*)$')
+
+
+def annotate_media_summary(summary: str) -> str:
+    """对识别摘要做轻量标注（不截断）。
+
+    原先这里会在摘要超过 600 字时砍掉后半段（"摘要过长，已截断"）。
+    实测中长摘要往往正是因为画面文字多、信息密 —— 被砍掉的恰恰是最该让
+    机器人看到的部分，导致它答复时漏掉关键内容。因此改为完整保留，
+    只对"过短"仍加一句提示（过短通常意味着识别不完整，值得标注）。
+
+    截断移除后，摘要长度完全由视觉模型的输出决定，不再有本地上限。
+    """
+    text = str(summary or "")
+    if len(text) < 50:
+        return text + "（摘要过短，可能识别不完整）"
+    return text
 
 
 def unrecognized_media_block(kind: str, filename: str, url: str, prefix: str = "") -> str:
@@ -110,6 +131,24 @@ def _detach_to_background(task: "asyncio.Task", filename: str) -> None:
     task.add_done_callback(_done)
 
 
+def _media_task_outcome(task: "asyncio.Task") -> tuple:
+    """把已完成的识别任务结果转成 (ok, value)。
+
+    成功 → (True, 摘要文本)
+    失败 → (False, 占位说明)：调用方据此改用 unrecognized_media_block，
+           把 URL 交给机器人自己用工具识别。成功与否取 ai.MediaResult.ok，
+           不再靠匹配返回文本里的中文文案。
+    """
+    try:
+        result = task.result()
+    except Exception as e:
+        error(f"[媒体识别] 识别任务异常: {e}", ctx=None)
+        return False, f"（媒体识别失败: {e}）"
+    if media_result_ok(result):
+        return True, result
+    return False, str(result)
+
+
 async def recognize_media_cancellable(media_type: str, url: str, filename: str,
                                       height: int, width: int, app_id: str,
                                       thread_key: str, gen_at_start: int):
@@ -117,8 +156,13 @@ async def recognize_media_cancellable(media_type: str, url: str, filename: str,
     媒体识别：是否阻塞由全局实时配置 MEDIA_BLOCK 决定。
 
     返回 (ok, value)：
-      - ok=True  → value 是识别摘要（本轮直接就拿到了）
-      - ok=False → value 固定为 "superseded"：本轮改用占位（URL + 照抄参数）
+      - ok=True  → value 是识别摘要（本轮直接就拿到了，且识别确实成功）
+      - ok=False → value 为 "superseded"：本轮改用占位（URL + 照抄参数）；
+                   或为识别失败的占位说明（识别跑完了但没拿到有效摘要）
+
+    说明：识别失败（模型返回空/超时/不支持的类型）与"被新消息打断"是两种不同的
+    让位原因，但调用方处理方式一致 —— 都改用 unrecognized_media_block 占位，
+    把 URL 留给机器人自己用工具识别。成功与否由 ai.MediaResult.ok 结构化判定。
 
     MEDIA_BLOCK=1（阻塞，旧逻辑）：
       一直等到识别出结果才返回，期间不理会世代号变化。接收循环因此被占用，
@@ -148,13 +192,13 @@ async def recognize_media_cancellable(media_type: str, url: str, filename: str,
         while True:
             done, _ = await asyncio.wait({task}, timeout=_MEDIA_POLL_INTERVAL)
             if task in done:
-                return True, task.result()
+                return _media_task_outcome(task)
             # 阻塞模式下忽略"来了新消息"，继续等识别结果（旧逻辑）
             if not blocking and media_should_abort(thread_key, gen_at_start):
                 # 判定让位时再确认一次：可能在轮询间隔内刚好跑完，那就直接用结果。
                 if task.done():
                     debug(f"[媒体识别] 判定让位时识别已完成，采用其结果: {filename}", ctx=ctx)
-                    return True, task.result()
+                    return _media_task_outcome(task)
                 # ★ 不 cancel：把任务转交后台，让它跑完并写缓存。
                 _detach_to_background(task, filename)
                 debug(f"[媒体识别] 新消息到达，本轮改用占位；识别转后台继续（完成后写缓存）: {filename}", ctx=ctx)
@@ -241,6 +285,15 @@ def replace_mentions_with_names(text: str, mentions: List[Dict]) -> str:
 
 # ==================== 聊天记录转发媒体解析 ====================
 def parse_forwarded_chatlog(text: str) -> Tuple[str, List[Dict]]:
+    """把转发聊天记录里的附件行替换成占位符，返回 (替换后文本, 媒体列表)。
+
+    media_list[i] 对应文本里的 [MEDIA_PLACEHOLDER_i]。两者由同一个
+    placeholder_index 递增产生，因此**始终一一对应**：无 URL 的附件行走
+    else 分支、保留原文，不生成占位符也不占下标。
+
+    调用方请用 media_list 的下标去替换占位符（见 replace_media_placeholders），
+    不要自己拼序号 —— 序号文案属于本函数的内部约定。
+    """
     lines = text.split('\n')
     result_lines = []
     media_list = []
@@ -289,7 +342,7 @@ def parse_forwarded_chatlog(text: str) -> Tuple[str, List[Dict]]:
                     'width': width,
                     'raw_type': raw_type
                 })
-                placeholder = f"[MEDIA_PLACEHOLDER_{placeholder_index}]"
+                placeholder = make_media_placeholder(placeholder_index)
                 result_lines.append(placeholder)
                 placeholder_index += 1
             else:
@@ -298,6 +351,39 @@ def parse_forwarded_chatlog(text: str) -> Tuple[str, List[Dict]]:
             result_lines.append(line)
 
     return '\n'.join(result_lines), media_list
+
+
+def make_media_placeholder(idx: int) -> str:
+    """生成媒体占位符。序号生成与替换统一走这里，避免两处各拼一遍文案。"""
+    return f"[MEDIA_PLACEHOLDER_{idx}]"
+
+
+def replace_media_placeholders(text: str, replacements: Dict[int, str]) -> str:
+    """按 media_list 下标替换占位符，每处只替换一次。
+
+    原先调用方直接用 str.replace("[MEDIA_PLACEHOLDER_i]", ...)。str.replace
+    会替换**所有**出现位置，因此转发内容里若原本就含有 "[MEDIA_PLACEHOLDER_0]"
+    这样的字面文本（用户手打、或转发的内容本身就是一段带占位符的日志），
+    那处原文会被一并改写成媒体描述，污染聊天记录。
+
+    这里改为从上到下扫描、命中的占位符就地消费一次，保证：
+      - 每个下标只替换它自己那一处
+      - 原文里碰巧同名的字样，若已被真实占位符消费则不再受影响
+      - 未被替换的占位符原样保留（便于排查）
+    """
+    if not replacements:
+        return text
+
+    def _sub(match: "re.Match") -> str:
+        idx = int(match.group(1))
+        # 只在首次出现时替换，之后同下标的文本保留原样
+        repl = replacements.get(idx)
+        if repl is None:
+            return match.group(0)
+        del replacements[idx]
+        return repl
+
+    return re.sub(r'\[MEDIA_PLACEHOLDER_(\d+)\]', _sub, text)
 
 
 # ==================== RFC3339 时间规范化 ====================
@@ -335,6 +421,143 @@ async def handle_group_manage(thread_key: str, user_message: str, reply: str,
     pass
 
 
+# ==================== ARK 卡片消息格式化 ====================
+# 说明：本模块对 ark_data 不做任何字段硬编码 —— 字段名一律沿用 ark_data 的原始键名，
+# 因此 QQ 新增/改名字段时无需改动此文件。下方仅保留渲染所需的最小常量。
+
+# markdown 表格单元格内必须处理的字符。
+#
+# ★ 竖线一律替换为全角「｜」而不是用反斜杠转义：
+#   `\|` 只在普通行内文本里被可靠识别，一旦内容处于代码段/含反斜杠的 JSON 中，
+#   许多解析器仍把它当作分列符，表格会被撑破（实测切列数从 3 变 5）。
+#   全角竖线语义等价、视觉可辨，且在任何解析器下都不可能分列。
+# 换行/回车压成空格，避免一行被拆断。
+_ARK_CELL_ESCAPE = str.maketrans({"|": "｜", "\n": " ", "\r": " "})
+
+# ark_data 中这些键的值是「子字典的容器」，拆开展示而不是塞成一坨 JSON。
+# 注意：这不是字段白名单 —— 未列出的键照样会被完整渲染，
+# 只是它们本身是 dict 时也会被展平，行为与 fields 一致。
+_ARK_NESTED_KEYS = ("fields", "kv", "values", "data")
+
+
+def _ark_cell(value: Any) -> str:
+    """
+    把任意值安全地渲染为 markdown 表格单元格文本。
+
+    数组 / 字典 → JSON 文本（如 ["a", "b"]、{"k": 1}），保持标准 JSON 间距便于阅读；
+    None → 空串（由调用方跳过该行）；
+    其余标量 → 原样 str()。
+    """
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        try:
+            text = json.dumps(value, ensure_ascii=False)
+        except Exception:
+            text = str(value)
+    else:
+        text = str(value)
+    text = text.translate(_ARK_CELL_ESCAPE).strip()
+    return text
+
+
+def _ark_flatten(ark_data: Dict) -> List[Tuple[str, Any]]:
+    """
+    把 ark_data 展平成「字段名 → 值」的有序列表。
+
+    完全通用，不做任何字段硬编码：
+      - 顶层每个键都成为一行，字段名就是它自己的键名（如 ark_type、ark_name、prompt）；
+      - 容器键（fields / kv / values / data）里的键值对被摊平到同一层，
+        字段名保留其原始键名（如 title、source、tag、preview）；
+      - 容器与顶层键名冲突时用「父键.子键」消歧，保证不丢字段、不覆盖；
+      - 嵌套 dict 且非容器键时，递归展平为「父.子」多行，避免大段 JSON 难以阅读；
+      - list 保持为一行，按 JSON 文本呈现（如 ["a", "b"]），不逐项拆行 —— 逐项拆行没有
+        确定的语义（可能是多图、多链接、多标签），JSON 能完整保留结构与顺序。
+    """
+    rows: List[Tuple[str, Any]] = []
+    seen_names = set()
+
+    def emit(name: str, value: Any) -> None:
+        # 同名冲突时加序号后缀，宁可名字难看也不能覆盖丢数据
+        final = name
+        n = 2
+        while final in seen_names:
+            final = f"{name}#{n}"
+            n += 1
+        seen_names.add(final)
+        rows.append((final, value))
+
+    def walk(container: Dict, prefix: str = "", depth: int = 0) -> None:
+        for key, value in container.items():
+            name = f"{prefix}.{key}" if prefix else str(key)
+            # 非空 dict 才递归展平；空 dict 落到 emit，由 _ark_cell 渲染为 {}
+            if isinstance(value, dict) and value and depth < 8:
+                # 容器键不加前缀，让子字段保持其原始键名（fields.title → title）
+                walk(value, "" if str(key) in _ARK_NESTED_KEYS else name, depth + 1)
+            else:
+                # list / 标量 / 空 dict / 超深嵌套：整体作为一个单元格（数组按 JSON 显示）
+                emit(name, value)
+
+    walk(ark_data)
+    return rows
+
+
+def format_ark_message(ark_data: Dict) -> str:
+    """
+    把 QQ 机器人下发的 ark_data 卡片消息格式化成 markdown 表格文本。
+
+    输入形如：
+        {
+          "ark_type": "miniapp",
+          "ark_name": "小程序",
+          "prompt": "[每日打卡]快来完成今日学习打卡",
+          "fields": {
+            "title": "快来完成今日学习打卡",
+            "source": "学习助手",
+            "tag": "微信小程序",
+            "preview": "https://...",
+            "source_logo": "https://...",
+            "tag_icon": "https://..."
+          }
+        }
+
+    输出形如：
+        | 字段 | 内容 |
+        | --- | --- |
+        | ark_type | miniapp |
+        | ark_name | 小程序 |
+        | prompt | [每日打卡]快来完成今日学习打卡 |
+        | title | 快来完成今日学习打卡 |
+        | source | 学习助手 |
+        ...
+
+    设计要点：
+      - 本函数是「派生视图生成器」，只依据 ark_data 自身渲染，不接触也不改写原始 content；
+      - ★ 不硬编码任何字段名：字段名一律使用 ark_data 里的原始键名，
+        因此 QQ 新增字段、改字段名、或用本文档没描述过的卡片类型时都不会丢数据；
+      - 容器键（fields/kv/values/data）内的键值对摊平到同一层，字段名保持原样；
+      - 值为空的字段跳过（空字符串/None），非空值一律保留，不做「看起来像链接」之类的猜测；
+      - 无任何可渲染字段时返回空串，由调用方决定回退策略（原始 content 始终由调用方保留）。
+    """
+    if not isinstance(ark_data, dict) or not ark_data:
+        return ""
+
+    rows = _ark_flatten(ark_data)
+
+    lines = ["| 字段 | 内容 |", "| --- | --- |"]
+    emitted = 0
+    for name, value in rows:
+        cell = _ark_cell(value)
+        if not cell:
+            continue
+        lines.append(f"| {_ark_cell(name)} | {cell} |")
+        emitted += 1
+
+    if not emitted:
+        return ""
+    return "\n".join(lines)
+
+
 # ==================== 消息解析 ====================
 def parse_message(data: Dict, bot_appid: str = "") -> Dict:
     event_type = data.get("t")
@@ -359,14 +582,26 @@ def parse_message(data: Dict, bot_appid: str = "") -> Dict:
         "ref_media": [],
     }
 
-    # 处理 ark_data，将 prompt 追加到 content
+    # 处理 ark_data：卡片消息格式化为 markdown 表格（含 prompt/fields 全部字段）
+    #
+    # ★ 原始 content 必须原样保留 —— 它是 QQ 下发的权威文本视图，而表格是我们
+    #   依据 ark_data.fields 重建的派生视图。二者来源不同：只要 fields 缺字段、
+    #   键名未收录、或结构变更，派生表格就可能比原始 content 少信息。
+    #   因此表格只做「追加增强」，绝不替换或删除任何原始内容。
     ark_data = payload.get("ark_data", {})
-    if ark_data and ark_data.get("prompt"):
-        prompt = ark_data["prompt"].strip()
-        if result["content"]:
-            result["content"] += " [ARK:" + prompt + "]"
-        else:
-            result["content"] = "[ARK:" + prompt + "]"
+    if isinstance(ark_data, dict) and ark_data:
+        raw_content = result["content"] or ""
+        ark_text = format_ark_message(ark_data)
+        if ark_text:
+            # 保留 [ARK:...] 标记，兼容既有依赖该标记的历史逻辑/记忆
+            prompt_marker = str(ark_data.get("prompt") or "").strip()
+            marker = f"[ARK:{prompt_marker}]" if prompt_marker else "[ARK]"
+            if raw_content.strip():
+                result["content"] = f"{raw_content}\n{ark_text}\n{marker}"
+            else:
+                result["content"] = f"{ark_text}\n{marker}"
+    # 便于下游（记忆/日志/历史）直接取用结构化卡片信息
+    result["ark_data"] = ark_data if isinstance(ark_data, dict) else {}
 
     # 语音消息
     attachments = payload.get("attachments", [])
@@ -449,18 +684,36 @@ def parse_message(data: Dict, bot_appid: str = "") -> Dict:
     result["ref_media"] = ref_media
 
     # 提取 msg_idx / ref_msg_idx（来自 message_scene.ext）
+    # ext 是文档规定的 "键=值" 字符串数组，故按 k=v 解析（不是 JSON 对象）。
+    # 这里只做健壮性加固，不改变格式约定：
+    #   - 容忍 "=" / ":" 两种分隔符、等号两侧空格、键名大小写
+    #   - 值里若混入 "&" 分隔的其它字段，只取第一段（避免脏值落进历史记录）
+    #   - 空值归一为 None（原先会存成空串，下游 if 判假但字段已存在）
+    #   - 解析不到时留一条 debug，不再完全静默
     msg_idx = None
     ref_msg_idx = None
     message_scene = payload.get("message_scene", {})
     if isinstance(message_scene, dict):
         ext_list = message_scene.get("ext", [])
         if isinstance(ext_list, list):
+            skipped = []
             for ext_item in ext_list:
-                if isinstance(ext_item, str):
-                    if ext_item.startswith("msg_idx="):
-                        msg_idx = ext_item[len("msg_idx="):]
-                    elif ext_item.startswith("ref_msg_idx="):
-                        ref_msg_idx = ext_item[len("ref_msg_idx="):]
+                if not isinstance(ext_item, str):
+                    continue
+                m = _EXT_KV_RE.match(ext_item)
+                if not m:
+                    skipped.append(ext_item[:60])
+                    continue
+                key = m.group(1).lower()
+                # 只取值的第一段：文档里每个条目对应一个字段，
+                # 万一上游把多个字段塞进同一条目也能拿到正确的值
+                value = m.group(2).split("&", 1)[0].strip() or None
+                if key == "msg_idx":
+                    msg_idx = value
+                elif key == "ref_msg_idx":
+                    ref_msg_idx = value
+            if skipped:
+                warn(f"[索引解析] message_scene.ext 有 {len(skipped)} 条无法解析为 k=v: {skipped}", ctx=None)
     result["msg_idx"] = msg_idx
     result["ref_msg_idx"] = ref_msg_idx
 
@@ -820,7 +1073,11 @@ async def record_group_info(bot_client, group_openid: str, member_id: str = None
 def format_referenced_message(thread_key: str, ref_msg_idx: str) -> Optional[Dict]:
     """
     根据 ref_msg_idx 在聊天历史中查找被引用的原消息。
-    返回 {"content": "完整内容", "role": "user"|"assistant"}，找不到则返回 None。
+    返回 {"content": "完整内容", "role": "user"|"assistant", "username": ..., "user_id": ...}，
+    找不到则返回 None。
+
+    记录已是结构化格式（content 不含时间戳、不含昵称前缀），
+    这里直接取字段，不再用正则去剥前缀。
     """
     if not ref_msg_idx:
         return None
@@ -828,11 +1085,12 @@ def format_referenced_message(thread_key: str, ref_msg_idx: str) -> Optional[Dic
         hist = load_history(thread_key)
         for msg in hist:
             if msg.get("msg_idx") == ref_msg_idx:
-                raw = msg.get("content", "")
-                # 去掉时间戳前缀 [YYYY-MM-DD HH:MM]
-                cleaned = re.sub(r'^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\]', '', raw).strip()
-                role = msg.get("role", "user")
-                return {"content": cleaned, "role": role}
+                return {
+                    "content": str(msg.get("content", "")),
+                    "role": msg.get("role", "user"),
+                    "username": msg.get("username", ""),
+                    "user_id": msg.get("user_id", ""),
+                }
     except Exception:
         pass
     return None
@@ -952,19 +1210,23 @@ async def handle_message(data: Dict, bot_client: 'BotClient'):
                 return (idx, f"[转发附件: {filename}] 无法识别类型\nURL: {url}")
 
         media_tasks = []
+        # 先把"不需要跑识别"的下标定下来，与识别结果统一走一次替换
+        # （逐个 replace 既慢，也会让原文里同名字样被反复命中）
+        immediate = {}
         for idx, media in enumerate(media_list):
             # 关闭 AI 回复时：完全跳过转发媒体识别，仅记录文件名与 URL
             if ai_reply_disabled:
-                placeholder = f"[MEDIA_PLACEHOLDER_{idx}]"
-                decoded_content = decoded_content.replace(
-                    placeholder,
-                    f"[转发媒体: {media['filename']}] (已关闭AI回复，未识别) URL: {media.get('url', '无')}"
+                immediate[idx] = (
+                    f"[转发媒体: {media['filename']}] (已关闭AI回复，未识别) "
+                    f"URL: {media.get('url', '无')}"
                 )
                 continue
             process_this = media.get('_cached', False) or media in media_to_process
             if not process_this:
-                placeholder = f"[MEDIA_PLACEHOLDER_{idx}]"
-                decoded_content = decoded_content.replace(placeholder, f"[媒体附件: {media['filename']}] (超过处理限制，已忽略) URL: {media.get('url', '无')}")
+                immediate[idx] = (
+                    f"[媒体附件: {media['filename']}] (超过处理限制，已忽略) "
+                    f"URL: {media.get('url', '无')}"
+                )
                 continue
             media_tasks.append(process_forwarded_media(idx, media))
 
@@ -975,8 +1237,10 @@ async def handle_message(data: Dict, bot_client: 'BotClient'):
                     error(f"[转发解析] 媒体处理异常: {res}", ctx=None)
                     continue
                 idx, result_text = res
-                placeholder = f"[MEDIA_PLACEHOLDER_{idx}]"
-                decoded_content = decoded_content.replace(placeholder, result_text)
+                immediate[idx] = result_text
+
+        if immediate:
+            decoded_content = replace_media_placeholders(decoded_content, immediate)
 
     # 处理当前消息的附件（并发处理）
     attachments = parsed.get("attachments", [])
@@ -1010,10 +1274,7 @@ async def handle_message(data: Dict, bot_client: 'BotClient'):
                 # 识别被打断/超时：只保留 URL，让机器人自己用工具识别
                 return unrecognized_media_block(
                     "图片" if media_type == "image" else "视频", filename, url)
-            if len(summary) < 50:
-                summary = summary + "（摘要过短，可能识别不完整）"
-            elif len(summary) > 600:
-                summary = summary[:600] + "...（摘要过长，已截断）"
+            summary = annotate_media_summary(summary)
             if media_type == "image":
                 return f"[收到图片：{filename}]\nURL: {url}\n===图片{filename}摘要开始===\n{summary}\n===图片{filename}摘要结束==="
             else:
@@ -1077,10 +1338,7 @@ async def handle_message(data: Dict, bot_client: 'BotClient'):
                 return unrecognized_media_block(
                     "图片" if media_type == "image" else "视频",
                     filename, url, prefix="引用")
-            if len(summary) < 50:
-                summary = summary + "（摘要过短，可能识别不完整）"
-            elif len(summary) > 600:
-                summary = summary[:600] + "...（摘要过长，已截断）"
+            summary = annotate_media_summary(summary)
             if media_type == "image":
                 return f"[引用图片：{filename}]\nURL: {url}\n===图片{filename}摘要开始===\n{summary}\n===图片{filename}摘要结束==="
             else:
@@ -1169,7 +1427,9 @@ async def handle_message(data: Dict, bot_client: 'BotClient'):
         thread_display = get_display_name(author_id, msg_username, bot_client.app_id)
     ctx = ctx.with_(thread_display=thread_display)
 
-    store_content = f"{user_identifier}: {decoded_content}" if decoded_content else f"{user_identifier} 发送了附件或引用"
+    # 正文不再拼 "昵称(id): " 前缀 —— 昵称与 openid 作为独立字段随记录一起保存，
+    # 只在发给 AI 时由 render_history_for_ai 拼回可读行。
+    store_content = decoded_content if decoded_content else "发送了附件或引用"
 
     # 尝试从历史中查找被引用的原消息完整内容
     ref_original = None
@@ -1188,7 +1448,9 @@ async def handle_message(data: Dict, bot_client: 'BotClient'):
     append_message(thread_key, "user", store_content,
                    msg_id=msg_id,
                    msg_idx=parsed.get("msg_idx"),
-                   ref_msg_idx=parsed.get("ref_msg_idx"))
+                   ref_msg_idx=parsed.get("ref_msg_idx"),
+                   username=display_username,
+                   user_id=author_id)
 
     # 取消旧的处理任务
     # 隔离唤醒期间：不取消、也不启动新任务，用户消息只入队，等唤醒结束后再处理
@@ -1286,7 +1548,8 @@ async def handle_event(data: Dict, bot_client: 'BotClient'):
         group_name = get_group_name_from_mirror(bot_client.app_id, group_openid) or ""
         ctx = ctx.with_(thread_key=thread_key, thread_display=group_name)
         join_msg = f"{username} 加入了群聊"
-        append_message(thread_key, "user", join_msg)
+        append_message(thread_key, "user", join_msg,
+                       username=username, user_id=member_openid)
 
         if get_bot_enabled(bot_client.app_id) and get_bot_auto_welcome(bot_client.app_id) \
                 and not get_bot_disable_ai_reply(bot_client.app_id):
@@ -1331,7 +1594,8 @@ async def handle_event(data: Dict, bot_client: 'BotClient'):
         group_name = get_group_name_from_mirror(bot_client.app_id, group_openid) or ""
         ctx = ctx.with_(thread_key=thread_key, thread_display=group_name)
         leave_msg = f"{username} 退出了群聊"
-        append_message(thread_key, "user", leave_msg)
+        append_message(thread_key, "user", leave_msg,
+                       username=username, user_id=member_openid)
 
         if get_bot_enabled(bot_client.app_id) and not get_bot_disable_ai_reply(bot_client.app_id):
             recent_history = get_recent_history(thread_key, get_judge_context_limit())

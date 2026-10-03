@@ -10,6 +10,77 @@
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+# ==================== 任务状态（唯一事实来源） ====================
+# 任务级 status 只有以下三种，且写进文件的就是这三个字面量：
+#   pending    未开始 —— 创建时的初始值
+#   completed  执行完成 —— 到期执行成功后置位
+#   failed     执行失败 —— 执行出错或有目标失败时置位
+#
+# 放在 task_core 而不是 tool.py：scheduler / wakeup_scheduler 都要用它
+# （读旧文件时归类），而 tool.py 会延迟导入 scheduler，放在那边会循环导入。
+TASK_STATUSES = ("pending", "completed", "failed")
+
+_TASK_STATUS_LABELS = {
+    "pending": "未开始",
+    "completed": "执行完成",
+    "failed": "执行失败",
+}
+
+# 中文写法也接受（仅用于筛选参数，不落库）
+_STATUS_CN = {
+    "未开始": "pending",
+    "执行完成": "completed",
+    "执行失败": "failed",
+}
+
+# 历史文件的兼容映射。
+#
+# 这不是「别名表」，区别很关键：
+#   - 别名：给程序从不产生的值编显示名（旧表的 running/cancelled 就是，
+#     结果界面有 tab、数据永远为空）。这类已彻底删除。
+#   - 兼容映射：旧版本程序**确实写进过磁盘**的状态拼写。现在改写成规范值，
+#     但老文件不会自动重写，读到时必须按它当初的真实含义归类。
+#
+# 旧版本实际写入：
+#   推送  scheduler.py        : pending(未开始) -> sent(执行完成)
+#   唤醒  wakeup_scheduler.py : active(未开始)  -> completed(执行完成)
+# 所以 sent 归 completed（已发送就是执行完成），active 归 pending。
+_LEGACY_STATUS = {
+    "sent": "completed",
+    "active": "pending",
+}
+
+
+def norm_task_status(raw: Any) -> str:
+    """把状态值规范化成规范状态之一。
+
+    只认规范值、中文标签、以及历史文件的旧拼写；
+    其余无法识别的值**原样返回**，让上层按「无匹配」处理，
+    而不是静默兜底成 pending
+    （静默兜底会让 ?status=乱填 变成「筛出全部未开始」，很误导）。
+    """
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    low = s.lower()
+    if low in _TASK_STATUS_LABELS:
+        return low
+    if s in _STATUS_CN:
+        return _STATUS_CN[s]
+    if low in _LEGACY_STATUS:
+        return _LEGACY_STATUS[low]
+    return low
+
+
+def task_status_of(t: Dict[str, Any]) -> str:
+    """取任务级状态并归类到三个规范状态之一。
+
+    兼容旧文件里的 sent/active；只有真正无法识别的脏值才兜底为 pending
+    （此时它是「未知」，而不是被冒充成某个已知状态）。
+    """
+    s = norm_task_status((t or {}).get("status"))
+    return s if s in _TASK_STATUS_LABELS else "pending"
+
 # ==================== 统一参数命名 ====================
 # 两边过去各叫各的，同一个东西好几个名字（group_id / group_openid / id），
 # 调用方要猜。现在只保留**一个**规范名，不再接受任何别名：
@@ -49,9 +120,11 @@ PUSH_UPDATE_FIELDS = {
 }
 
 # 唤醒更新字段白名单
+# 注意：不含 status —— 任务状态由调度器按执行结果写入
+# （pending/completed/failed），外部不可直接改。
 WAKEUP_UPDATE_FIELDS = {
     "schedule_type", "schedule_time", "interval_seconds",
-    "targets", "initiator", "description", "status", "isolation_mode",
+    "targets", "initiator", "description", "isolation_mode",
 }
 
 # 创建推送时允许直接落库的字段（除 targets/schedule_* 等必填）

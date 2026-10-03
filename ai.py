@@ -25,6 +25,7 @@ from memory import (
     compute_similarity,
     append_message,
     strip_message_meta,
+    filter_hidden_for_ai,   # 剔除 is_hide=1 的记录（已隐藏、不发给 AI 的消息）
     get_group_name_from_mirror, get_user_name,
 )
 
@@ -40,6 +41,14 @@ from tool import (
 
 # ==================== 存储每个线程当前任务的消息上下文（用于打断保存） ====================
 INTERRUPT_CONTEXT: Dict[str, List[Dict]] = {}
+
+# ==================== AI 返回体：空内容用空串表示 ====================
+# call_ai / call_ai_with_tools 无法返回结构化结果（调用方要的是纯文本），
+# 因此"模型没给出有效内容"这一状态统一用**空串**承载 —— 空串是空内容的
+# 诚实表示，调用方一律 `if result and result.strip()` 判断。
+#
+# 这里不再有任何"占位文案"常量：AI 层不产出约定字符串，调用方也不匹配字符串，
+# 控制流与可读文案彻底解耦（文案改动不会让任何逻辑静默失效）。
 
 # ==================== 多 Key 故障切换（全局状态） ====================
 # {model_key: 当前使用的 Key 索引}，多 Key 模式下错误即切换、循环回绕
@@ -151,7 +160,10 @@ async def call_ai(messages: List[Dict], model_key: str, stream: bool = False,
                 if data.get("choices") and len(data["choices"]) > 0:
                     content = data["choices"][0].get("message", {}).get("content", "")
                     return content.strip()
-                return "（AI 未返回有效内容）"
+                # 无有效 choices：返回空串（不是占位文案）。
+                # 调用方统一用 `if result and result.strip()` 判断，
+                # 从此不再依赖任何约定的错误字符串。
+                return ""
             except requests.exceptions.RequestException as e:
                 last_exc = e
                 if hasattr(e, 'response') and e.response is not None:
@@ -238,7 +250,7 @@ async def call_ai(messages: List[Dict], model_key: str, stream: bool = False,
 # ==================== 带工具的 AI 调用（带自动重试 + 多Key故障切换） ====================
 async def call_ai_with_tools(messages: List[Dict], model_key: str,
                              tools: List[Dict], temperature: float = 0.7,
-                             ctx=None) -> Dict:
+                             ctx=None, tool_choice: str = None) -> Dict:
     """
     调用 AI 并支持 function calling，返回完整的 message dict（含 content 和 tool_calls）。
 
@@ -247,10 +259,19 @@ async def call_ai_with_tools(messages: List[Dict], model_key: str,
       - 多 Key → 任一错误立即切换并持续使用，循环回绕
 
     ctx: LogCtx（或 app_id 字符串），用于日志标识，调用方必须传入。
+
+    tool_choice: 覆盖全局 TOOL_CHOICE 配置，显式指定 "required" / "auto"。
+      用于那些"必须拿到工具调用结果"的调用方 —— 典型是 Judge：它只有一个工具、
+      提示词也明确要求调用，若受全局配置影响退化为 "auto"，模型可能只回一句文本，
+      调用方就只能走兜底分支（判成"永远回复"）。传 None（默认）时维持原有行为，
+      仍由 TOOL_CHOICE 决定。
     """
-    # 读取全局 tool_choice 配置
-    tc = get_tool_choice()
-    tool_choice_value = "required" if tc == 1 else "auto"
+    # tool_choice：调用方显式指定优先；否则读全局配置
+    if tool_choice is not None:
+        tool_choice_value = tool_choice
+    else:
+        tc = get_tool_choice()
+        tool_choice_value = "required" if tc == 1 else "auto"
 
     slots = _ai_model_slots(model_key)
     total = len(slots)
@@ -302,7 +323,7 @@ async def call_ai_with_tools(messages: List[Dict], model_key: str,
                         "content": msg.get("content", "") or "",
                         "tool_calls": msg.get("tool_calls", [])
                     }
-                return {"role": "assistant", "content": "（AI 未返回有效内容）", "tool_calls": []}
+                return {"role": "assistant", "content": "", "tool_calls": []}
             except requests.exceptions.RequestException as e:
                 last_exc = e
                 if hasattr(e, 'response') and e.response is not None:
@@ -391,6 +412,95 @@ async def call_ai_with_tools(messages: List[Dict], model_key: str,
     raise last_exc if last_exc else RuntimeError("所有 API Key 均调用失败")
 
 # ==================== 媒体识别（基础 AI 能力，保留在此） ====================
+# ---------- 识别结果的结构化载体 ----------
+# 历史实现用「中文文案前缀」当错误码，例如：
+#     if result.startswith("（媒体识别失败"): ...
+#     if "（AI 未返回有效内容）" not in result: ...
+# 这种写法把控制流（是否写缓存、是否算成功）绑死在人类可读文案上，
+# 任何一次文案微调（少个括号、多个字）都会静默失效 —— 最坏情况是把
+# 失败结果当成功写进缓存，之后同一媒体永远命中这条失败记录。
+#
+# 现在改为返回 MediaResult：它是 str 的子类，所有既有调用方（拼接、切片、
+# 判断真假）完全不受影响，但成功/失败由 .ok 结构化携带，不再依赖文案匹配。
+MEDIA_ERR_DISABLED = "disabled"      # 已关闭 AI 回复，未识别
+MEDIA_ERR_UNSUPPORTED = "unsupported"  # 媒体类型不支持
+MEDIA_ERR_UNKNOWN_TYPE = "unknown_type"  # 无法判断媒体类型
+MEDIA_ERR_EMPTY = "empty"            # 模型未返回有效内容
+MEDIA_ERR_EXCEPTION = "exception"    # 调用/下载异常
+
+# 多段摘要拼接时的分隔符。带 prompt 的追加识别会以它为界分段累积，
+# 因此不能用可能出现在摘要正文里的普通符号（如 "---"），改用明确的中文标记。
+MEDIA_SUMMARY_SEP = "\n\n===== 补充识别 =====\n\n"
+
+
+class MediaResult(str):
+    """媒体识别结果：既是可直接使用的字符串，又带结构化状态。
+
+    ok=True   —— 识别成功，result 即摘要正文，可写缓存
+    ok=False  —— 识别失败，result 是给模型看的占位说明，绝不可写缓存
+    reason    —— 失败原因码（MEDIA_ERR_* 之一），仅用于日志与排查
+    """
+
+    __slots__ = ("ok", "reason")
+
+    def __new__(cls, text: str, ok: bool, reason: str = ""):
+        obj = super().__new__(cls, text)
+        obj.ok = ok
+        obj.reason = reason
+        return obj
+
+    @property
+    def failed(self) -> bool:
+        return not self.ok
+
+    def __repr__(self) -> str:
+        return f"MediaResult({str.__repr__(self)}, ok={self.ok}, reason={self.reason!r})"
+
+
+def _apply_media_prompt(base_hint: str, prompt: Optional[str]) -> str:
+    """把调用方给的关注点拼进视觉模型的基础提示词。
+
+    拼在后面而不是替换：base_hint 里"原样返回所有文本内容"这类要求是各条
+    识别链路共用的底线，不能被自定义提示词顶掉；prompt 只做追加聚焦。
+    """
+    extra = str(prompt or "").strip()
+    if not extra:
+        return base_hint
+    return f"{base_hint}\n\n【本次识别的额外要求】\n{extra}"
+
+
+def _merge_media_summary(old: Optional[str], new: str) -> str:
+    """把本次识别结果追加到已有摘要之后，形成累积的多段摘要。
+
+    带 prompt 的识别是"换个角度再看一遍"，新结果与原摘要描述的是同一媒体的
+    不同侧面，二者都该保留 —— 直接覆盖会把上一次的关注点丢掉。
+
+    去重：新结果若已完整包含在旧摘要里（模型对同一提示词给出相同输出），
+    则原样返回旧摘要，避免缓存被重复段落越撑越长。
+    """
+    old = (old or "").strip()
+    new = (new or "").strip()
+    if not old:
+        return new
+    if not new:
+        return old
+    if new in old:
+        return old
+    return f"{old}{MEDIA_SUMMARY_SEP}{new}"
+
+
+def media_result_ok(result) -> bool:
+    """判断识别结果是否成功。
+
+    MediaResult 直接看 .ok；历史遗留的纯 str（如缓存里读出的旧摘要、
+    或外部调用方自行构造的字符串）按「非空且不是已知错误文案」处理，
+    保持向后兼容 —— 但新代码一律返回 MediaResult，不再新增文案判断。
+    """
+    if isinstance(result, MediaResult):
+        return result.ok
+    return bool(result)
+
+
 # 媒体摘要缓存有两套 key：
 #   A. get_media_cache_key(media_type, filename, height, width) —— 自动识别路径使用
 #   B. get_media_cache_key(media_type, filename)               —— 手动识别路径使用
@@ -429,20 +539,28 @@ def _store_media_cache(media_type: str, filename: str, height: int, width: int,
 
 async def recognize_media_by_url(media_url: str, filename: str = "媒体",
                                  media_type: str = None, disable_cache: bool = False,
-                                 app_id: Optional[str] = None) -> str:
+                                 app_id: Optional[str] = None,
+                                 prompt: str = None) -> MediaResult:
+    """按 URL 识别媒体。
+
+    prompt（可选）：本轮的额外关注点（见 recognize_media 的说明）。
+      传了 prompt 即进入"聚焦识别"：绕过两层缓存、把结果追加到原缓存之后。
+    """
     ctx = LogCtx(app_id=app_id)
+    focused = bool(prompt and str(prompt).strip())
 
     # 关闭 AI 回复时，不做媒体识别，也不写入 media_cache 缓存文件
     if app_id and get_bot_disable_ai_reply(app_id):
         debug(f"[媒体识别] 已关闭 AI 回复，跳过 URL 识别与缓存: {filename}", ctx=ctx)
-        return "（已关闭 AI 回复，未识别媒体内容）"
+        return MediaResult("（已关闭 AI 回复，未识别媒体内容）", False, MEDIA_ERR_DISABLED)
 
     cache_key = get_url_cache_key(media_url)
-    if not disable_cache:
+    if not disable_cache and not focused:
         cached = get_cached_media_summary(cache_key)
         if cached:
             debug(f"[媒体缓存] URL 命中: {media_url[:50]}...", ctx=ctx)
-            return cached
+            # 缓存里存的必然是成功摘要（失败不写缓存），故为 ok
+            return MediaResult(cached, True)
 
     if not media_type:
         media_type = recognize_kind(filename, media_url)
@@ -451,87 +569,195 @@ async def recognize_media_by_url(media_url: str, filename: str = "媒体",
     # 自动识别路径（msg.py）用的是 get_media_cache_key(media_type, filename, h, w)，
     # 与上面的 URL key 不同；若只查 URL key，自动识别刚写进缓存的摘要就命中不了，
     # 手动调用会白白再请求一次视觉模型。
-    media_cache_key = None
-    if not disable_cache and media_type:
+    if not disable_cache and not focused and media_type:
         cached = _lookup_media_cache(media_type, filename)
         if cached:
             debug(f"[媒体缓存] 媒体特征命中: {filename}", ctx=ctx)
-            return cached
+            return MediaResult(cached, True)
 
     if not media_type:
         # 类型未知同样不写缓存：多数是 URL 无扩展名导致的临时判断失败，
         # 缓存后即便之后补上了 filename 也会一直命中这条失败记录。
         error(f"[媒体识别] 无法判断媒体类型（不写缓存）: {filename} / {media_url[:60]}", ctx=ctx)
-        return "（内容无法获取/为未知文件格式）"
+        return MediaResult("（内容无法获取/为未知文件格式）", False, MEDIA_ERR_UNKNOWN_TYPE)
 
     debug(f"[媒体识别] 通过 URL 识别: {media_type}, {filename}", ctx=ctx)
     try:
         result = await recognize_media(media_type, media_url, filename, 0, 0,
-                                       disable_cache=disable_cache, app_id=app_id)
+                                       disable_cache=disable_cache, app_id=app_id,
+                                       prompt=prompt)
         # recognize_media 内部已按"媒体特征"写好缓存；这里补写 URL key，
         # 使后续用同一 URL 但换了个 filename 的调用也能命中。
         # 仅成功结果才补写 —— 失败不写缓存（见 recognize_media）。
-        if (not disable_cache and result
-                and not result.startswith("（媒体识别失败")
-                and not result.startswith("（AI 未返回有效内容")):
-            set_cached_media(cache_key, result, media_type, filename, media_url)
+        # 成功与否由 result.ok 结构化判定，不再匹配中文文案。
+        if not disable_cache and media_result_ok(result):
+            # 聚焦识别时，recognize_media 返回的已经是"原媒体特征缓存 + 本次结果"
+            # 的合并文本。URL key 要与之保持一致，就**不能**再拿这个已合并的文本
+            # 去和 URL 旧值合并一次 —— 那会把旧摘要重复写进去
+            # （原摘要 + 分隔符 + 原摘要 + 分隔符 + 新结果）。
+            # 正确做法：只有 URL key 尚无值时（说明旧摘要只存在于特征 key），
+            # 才把 URL 旧值与新结果接上；否则直接对齐特征 key 的最终结果。
+            existing_url = get_cached_media_summary(cache_key) if focused else None
+            if focused and existing_url:
+                # URL 旧值与特征 key 的旧值可能不同（两条链路各自写过），
+                # 取"本次返回文本"为准即可 —— 它已含特征 key 侧完整的累积内容。
+                final_value = str(result)
+                if existing_url not in final_value:
+                    final_value = _merge_media_summary(existing_url, final_value)
+            else:
+                final_value = str(result)
+            set_cached_media(cache_key, final_value, media_type, filename, media_url)
         return result
     except Exception as e:
         error(f"[媒体识别] URL 识别失败（不写缓存）: {e}", ctx=ctx)
-        return f"（媒体识别失败: {e}）"
+        return MediaResult(f"（媒体识别失败: {e}）", False, MEDIA_ERR_EXCEPTION)
 
 async def recognize_media(media_type: str, media_url: str, filename: str = "媒体",
                           height: int = 0, width: int = 0, disable_cache: bool = False,
-                          app_id: Optional[str] = None) -> str:
+                          app_id: Optional[str] = None,
+                          prompt: str = None) -> MediaResult:
+    """识别媒体内容，返回 MediaResult（str 子类，带 .ok / .reason）。
+
+    prompt（可选）：本轮的额外关注点，直接拼进视觉模型的提示词，让识别聚焦于
+      调用方关心的方面（如"重点读出所有文字""这个图里有没有表格"）。
+
+      传了 prompt 时行为有三点变化（三者为一体，不会只生效一半）：
+        1. 强制绕过缓存 —— 目的是"换个角度再看一遍"，命中旧缓存就达不到目的；
+        2. 结果**追加**到原缓存之后而非覆盖，多次不同角度的识别累积成更完整的描述；
+           （原缓存取不到时等价于直接写入新结果）
+        3. 即便识别失败也不动缓存，原有摘要完好无损。
+
+      不传 prompt 时：走缓存、命中即返回、成功后覆盖写入 —— 与既有行为完全一致。
+    """
     ctx = LogCtx(app_id=app_id)
+    focused = bool(prompt and str(prompt).strip())
 
     # 关闭 AI 回复时，完全不做媒体识别：
     # 不读缓存、不调视觉模型、不下载、不写 media_cache 文件，直接返回占位文本
     if app_id and get_bot_disable_ai_reply(app_id):
         debug(f"[媒体识别] 已关闭 AI 回复，完全跳过识别与缓存: {filename}", ctx=ctx)
-        return "（已关闭 AI 回复，未识别媒体内容）"
+        return MediaResult("（已关闭 AI 回复，未识别媒体内容）", False, MEDIA_ERR_DISABLED)
 
     # 媒体类型不受支持时直接返回，避免走到写缓存分支
     if media_type not in ("image", "video"):
         debug(f"[媒体识别] 不支持的媒体类型，跳过: {media_type}", ctx=ctx)
-        return "（不支持的媒体类型）"
+        return MediaResult("（不支持的媒体类型）", False, MEDIA_ERR_UNSUPPORTED)
 
-    cache_key = get_media_cache_key(media_type, filename, height, width)
-    if not disable_cache:
-        cached = _lookup_media_cache(media_type, filename, height, width)
-        if cached:
+    # 聚焦识别要拿到"原缓存"用于追加，因此无论是否 disable_cache 都先读一次。
+    # 普通识别维持原语义：disable_cache=True 时不读缓存、只做覆盖写入。
+    existing = None
+    if focused or not disable_cache:
+        existing = _lookup_media_cache(media_type, filename, height, width)
+        if existing and not focused:
             debug(f"[媒体缓存] 命中: {filename}", ctx=ctx)
-            return cached
+            return MediaResult(existing, True)
 
     if media_type == "image":
+        base_hint = ("请描述这张图片的内容，请原样返回所有文本内容！"
+                     "如果没有文本内容，就重点描述图片中的主要对象、场景、颜色、构图或可能表达的情感。")
         content_parts = [
-            {"type": "text", "text": "请描述这张图片的内容，请原样返回所有文本内容！如果没有文本内容，就重点描述图片中的主要对象、场景、颜色、构图或可能表达的情感。"},
+            {"type": "text", "text": _apply_media_prompt(base_hint, prompt)},
             {"type": "image_url", "image_url": {"url": media_url}}
         ]
     else:  # video
+        base_hint = ("请描述这个视频的内容，请原样返回所有文本内容！"
+                     "如果没有文本内容，就重点描述视频中的主要场景、动作、颜色或可能表达的情感。")
         content_parts = [
-            {"type": "text", "text": "请描述这个视频的内容，请原样返回所有文本内容！如果没有文本内容，就重点描述视频中的主要场景、动作、颜色或可能表达的情感。"},
+            {"type": "text", "text": _apply_media_prompt(base_hint, prompt)},
             {"type": "video_url", "video_url": {"url": media_url}}
         ]
+
+    if focused:
+        debug(f"[媒体识别] 聚焦识别（已绕过缓存）: {filename}｜提示词: {str(prompt)[:100]}", ctx=ctx)
 
     try:
         messages = [{"role": "user", "content": content_parts}]
         result = await call_ai(messages, "vision", temperature=0.3, ctx=ctx)
-        if result and "（AI 未返回有效内容）" not in result:
+        # call_ai 无有效内容时返回空串，因此这里只需判空 —— 不再匹配任何文案
+        if result and result.strip():
+            # 聚焦识别：追加到原摘要之后；普通识别：直接覆盖
+            final = _merge_media_summary(existing, result) if focused else result
             _store_media_cache(media_type, filename, height, width,
-                               result, media_url)
-            return result
+                               final, media_url)
+            if focused and existing:
+                debug(f"[媒体识别] 已追加到原摘要（{len(existing)} → {len(final)} 字）: {filename}", ctx=ctx)
+            return MediaResult(final, True)
         else:
             # 识别失败不写缓存：失败多为临时性（模型超时/限流/返回空），
             # 若写入缓存，后续同一媒体会一直命中这个失败结果而不再重试。
+            # 聚焦识别失败时同样不动缓存 —— 原有摘要必须完好保留。
             error(f"[媒体识别] 模型未返回有效内容，不写缓存: {filename}", ctx=ctx)
-            return "（媒体识别失败，模型未返回有效内容）"
+            return MediaResult("（媒体识别失败，模型未返回有效内容）", False, MEDIA_ERR_EMPTY)
     except Exception as e:
         # 同上：异常也不写缓存，留给下次重试的机会
         error(f"[媒体识别] 识别失败（不写缓存）{media_url}: {e}", ctx=ctx)
-        return f"（媒体识别失败: {e}）"
+        return MediaResult(f"（媒体识别失败: {e}）", False, MEDIA_ERR_EXCEPTION)
 
 # ==================== 群聊是否需要回复判定 ====================
+# Judge 判定工具：用 function calling 取结构化结论，
+# 不再解析模型自由文本（"是/否"子串匹配会把"不是""这是一个…"等误判为需要回复）。
+#
+# 只留 should_reply 一个字段：判定结果是唯一需要的东西，让模型少生成一个
+# reason 字段就少一段解码时间 —— Judge 处在每条群消息的必经路径上，
+# 这点开销会直接体现在响应延迟上。
+JUDGE_REPLY_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "judge_reply",
+        "description": "提交是否需要机器人回复当前消息的判定结论",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "should_reply": {
+                    "type": "boolean",
+                    "description": "需要机器人回复当前消息时为 true，否则为 false"
+                }
+            },
+            "required": ["should_reply"]
+        }
+    }
+}
+
+
+def _parse_judge_tool_call(ai_msg: Dict) -> Optional[bool]:
+    """从 Judge 的 AI 返回中取出判定结论。
+
+    返回 True/False；未按约定调用工具时返回 None，
+    由调用方决定兜底策略 —— 不在这里猜测模型意图。
+    """
+    tool_calls = (ai_msg or {}).get("tool_calls") or []
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") or {}
+        if fn.get("name") != "judge_reply":
+            continue
+        raw_args = fn.get("arguments")
+        # arguments 规范上是 JSON 字符串，但模型/兼容层有时直接给对象（见
+        # memory._extract_memories_from_ai_msg 的同款处理）。两种形态都接受。
+        if isinstance(raw_args, dict):
+            args = raw_args
+        else:
+            try:
+                args = _json.loads(raw_args or "{}")
+            except (ValueError, TypeError):
+                continue
+        if not isinstance(args, dict) or "should_reply" not in args:
+            continue
+        raw = args.get("should_reply")
+        # 明确接受布尔值；字符串形式（"true"/"是"）也容忍，其余一律视为无效
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, str):
+            v = raw.strip().lower()
+            if v in ("true", "1", "yes", "是"):
+                return True
+            if v in ("false", "0", "no", "否"):
+                return False
+        continue
+    return None
+
+
 async def should_reply_in_group(history: List[Dict], current_message: str,
                                 mentions: List[Dict], app_id: str,
                                 bot_name: str = "蓝狼") -> bool:
@@ -550,14 +776,16 @@ async def should_reply_in_group(history: List[Dict], current_message: str,
         role = msg.get("role", "")
         content = msg.get("content", "")
         if role == "user":
-            if ": " in content:
-                parts = content.split(": ", 1)
-                user_name = parts[0]
-                text = parts[1] if len(parts) > 1 else ""
+            # 记录已结构化：昵称/ID 是独立字段，直接取用，
+            # 不再从 "昵称(id): 正文" 里按 ": " 反解（正文本身含 ": " 时会切错）
+            user_name = msg.get("username") or ""
+            user_id = msg.get("user_id") or ""
+            label = f"{user_name}({user_id})" if user_id else (user_name or "用户")
+            text = content
+            if msg.get("ts"):
+                history_lines.append(f"[{msg['ts']}] [{label}]: {text}")
             else:
-                user_name = "用户"
-                text = content
-            history_lines.append(f"[{user_name}]: {text}")
+                history_lines.append(f"[{label}]: {text}")
         elif role == "assistant":
             history_lines.append(f"[机器人]: {content}")
         elif msg.get("is_summary"):
@@ -579,25 +807,37 @@ async def should_reply_in_group(history: List[Dict], current_message: str,
         "请先阅读以下【上文】（之前的对话历史），然后重点关注【当前消息】。\n"
         f"机器人的名字是 {bot_name}。如果当前消息或上文中明确提到这个机器人名字，或者请求机器人帮助，则应当回复。\n"
         "判断标准：\n"
-        "1. 如果当前消息或上文明确提到机器人、请求机器人帮助，或者话题与机器人有关，回复“是”。\n"
+        "1. 如果当前消息或上文明确提到机器人、请求机器人帮助，或者话题与机器人有关，判定为需要回复。\n"
         "2. 如果当前消息中 @ 了某人（包括机器人），且@的是机器人，或者@了之前与机器人互动过的人，则很可能需要回复。\n"
-        "3. 如果上文中有机器人参与对话，且当前消息是后续跟进，回复“是”。\n"
-        "4. 即使当前消息只是表情包、语音消息或简短情感表达（如“哈哈哈”、“好气啊”等），也请结合上下文判断：如果这些消息是用户在主动与机器人或群友互动，则倾向于回复“是”；如果完全无关（如单方面发泄情绪且未指向任何人），可回复“否”。\n"
+        "3. 如果上文中有机器人参与对话，且当前消息是后续跟进，判定为需要回复。\n"
+        "4. 即使当前消息只是表情包、语音消息或简短情感表达（如“哈哈哈”、“好气啊”等），也请结合上下文判断：如果这些消息是用户在主动与机器人或群友互动，则倾向于判定为需要回复；如果完全无关（如单方面发泄情绪且未指向任何人），判定为不需要回复。\n"
         "重要提示：请更加重视新消息，当新消息涉及情感表达、语音消息或与机器人有一定关联时，优先考虑回复以延续对话氛围。\n"
-        "只回答“是”或“否”，不要有其他内容。\n\n"
+        "请调用 judge_reply 工具提交你的判断结果，不要输出其他内容。\n\n"
         f"【上文】\n{history_text}\n\n"
-        f"【当前消息】\n{current_text}\n\n"
-        "请回答：是否需要机器人回复？（是/否）"
+        f"【当前消息】\n{current_text}"
     )
     judge_messages = [
-        {"role": "system", "content": "你是一个精准的判断助手，只回答'是'或'否'。"},
+        {"role": "system", "content": "你是一个精准的判断助手，只需调用 judge_reply 工具给出结论。"},
         {"role": "user", "content": judge_prompt}
     ]
     try:
-        result = await call_ai(judge_messages, "judge", stream=False, temperature=0.2, ctx=ctx)
-        result_clean = result.strip().lower()
-        info(f"[AI Judge 结果] {result_clean}", ctx=ctx)
-        return "是" in result_clean or "yes" in result_clean
+        ai_msg = await call_ai_with_tools(
+            judge_messages, "judge", [JUDGE_REPLY_TOOL],
+            temperature=0.2, ctx=ctx,
+            # 固定 required：Judge 只有一个工具、提示词也明确要求调用，
+            # 不受全局 TOOL_CHOICE 影响 —— 否则配置为 auto 时模型可能只回文本，
+            # 判定就退化成兜底的"永远回复"。
+            tool_choice="required",
+        )
+        verdict = _parse_judge_tool_call(ai_msg)
+        if verdict is None:
+            # 模型没按约定调用工具：不再靠关键词猜测，直接按"需要回复"兜底
+            # （与旧版异常兜底一致，宁可多回一条也不漏掉该回的消息）
+            warn(f"[AI Judge] 未获得有效判定结果，按需要回复兜底"
+                 f"（content={str(ai_msg.get('content', ''))[:80]!r}）", ctx=ctx)
+            return True
+        info(f"[AI Judge 结果] {'是' if verdict else '否'}", ctx=ctx)
+        return verdict
     except Exception as e:
         warn(f"[AI Judge Error] {e}", ctx=ctx)
         return True
@@ -628,6 +868,10 @@ async def generate_and_insert_summary(thread_key: str, retries: int = 3):
 
             content_for_summary = ""
             for msg in msgs_to_summarize:
+                # is_hide=1 的消息不参与摘要：既然它不该进模型上下文，
+                # 也就不能让它的内容经由「摘要」这条路径绕回来。
+                if msg.get("is_hide"):
+                    continue
                 role = msg.get("role", "")
                 content = msg.get("content", "")
                 if role == "user":
@@ -646,13 +890,18 @@ async def generate_and_insert_summary(thread_key: str, retries: int = 3):
                     "judge",
                     temperature=0.3
                 , ctx=ctx)
-                if summary and "（AI 未返回有效内容）" not in summary:
+                if summary and summary.strip():
                     summary_text = summary
             except Exception as e:
                 error(f"[摘要生成] 尝试 {attempt+1}/{retries} 失败: {e}", ctx=ctx)
 
+            # 生成失败时不要把"失败占位"当成摘要写进历史（否则会污染上下文，
+            # 且下一次摘要的起点会被这条假摘要跳过）。这里直接返回，
+            # 等消息继续累积后由后续调用重试。
             if summary_text is None:
-                summary_text = "（摘要生成失败，请稍后重试）"
+                warn(f"[摘要生成] 第 {attempt+1}/{retries} 次未获得有效摘要，本次不插入", ctx=ctx)
+                await asyncio.sleep(2)
+                continue
 
             # 二次检查并插入
             hist = load_history(thread_key)
@@ -823,8 +1072,8 @@ def build_system_prompt(thread_key: str, user_message: str, username: str,
         f"{memory_text}\n"
         f"{context_line}\n"
         f"当前时间（北京时间）：{now_rfc3339}\n"
-        "在群聊中，如果需要提及某位用户，请直接使用“@用户名”的形式，例如“@张三”。\n"
-        "重要：在回复内容中提及用户时，请仅使用“@用户名”的格式，严禁显示用户的ID和时间（即不用在回复前添加时间，不要在用户名后面添加括号和ID序列）。\n"
+        "在群聊中，如果需要提及某位用户，请直接使用markdown格式的 <@!user_id> 或者直接使用 @用户名 。\n"
+        "重要：在回复内容中，严禁显示用户的ID和时间（即不用在回复前添加时间，不要在用户名后面添加括号和ID序列）。\n"
         "用户可能会发送语音消息、文本文件、图片、视频或包含网页链接的消息。语音消息已被自动转写成文字，并显示为 [语音：转文字内容]。文本文件内容会被自动读取并嵌入消息中，格式为 [文件：文件名] 后跟文件内容块。图片和视频会被自动识别并生成摘要，格式为 [收到图片：文件名] 或 [收到视频：文件名] 后跟摘要。你可以根据这些内容进行回复。\n"
         f"{tools_desc}\n"
         "注意：系统内部会使用『【使用工具】』格式记录工具调用，但你不应该在回复中模仿或使用这种格式。\n"
@@ -901,8 +1150,8 @@ async def generate_reply(
     # 构建初始 messages
     if initial_messages is not None:
         messages = initial_messages.copy()
-        # 剥离内部元数据后发送给 AI
-        messages = [strip_message_meta(m) if isinstance(m, dict) else m for m in messages]
+        # 剥离内部元数据后发送给 AI；is_hide=1 的条目在此剔除
+        messages = filter_hidden_for_ai(messages)
         if messages and messages[0].get("role") == "system":
             messages[0] = {"role": "system", "content": system_prompt}
         else:
@@ -914,8 +1163,9 @@ async def generate_reply(
         json_context = f"以下是当前消息的原始 JSON 数据，你可以从中获取发送者ID等信息以便使用 @ 功能和禁言工具：\n```json\n{raw_message_json}\n```"
         messages.append({"role": "user", "content": json_context})
         hist = get_history(thread_key)
-        # 剥离内部元数据（msg_id, msg_idx, ref_msg_idx）后发送给 AI
-        hist_clean = [strip_message_meta(m) for m in hist]
+        # get_history 已剔除 is_hide=1 的条目；这里再统一渲染一次，
+        # 确保「已隐藏」的记录绝不出现在上下文里
+        hist_clean = filter_hidden_for_ai(hist)
         messages.extend(hist_clean)
         if not messages or messages[-1]["role"] != "user":
             messages.append({"role": "user", "content": user_message})

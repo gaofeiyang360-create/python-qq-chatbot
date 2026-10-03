@@ -22,6 +22,7 @@ CHECK_INTERVAL = 5  # 秒，后台检查周期
 from task_core import (  # noqa: E402
     VALID_SCHEDULE_TYPES, PUSH_UPDATE_FIELDS,
     norm_schedule_type, apply_push_updates, normalize_push_task,
+    TASK_STATUSES, task_status_of,
 )
 
 
@@ -51,6 +52,28 @@ def _now_bj_iso() -> str:
     return _now_bj().isoformat(timespec="seconds")
 
 
+def _executed_on_date(history: List[Dict], day: datetime) -> bool:
+    """判断执行历史里是否存在"发生在 day 这一天（北京时间）"的记录。
+
+    原先用 h["time"].startswith("2026-09-30") 做前缀比较，隐含假设 time 一定是
+    "YYYY-MM-DD..." 开头且不带时区换算。写入侧目前是北京时间 ISO 字符串，
+    但一旦改成 UTC 存储、换成 "2026/09/30" 分隔符、或前补空格，前缀比较就会
+    静默判错 —— 表现为"每日任务在同一天被重复执行"或"当天不再执行"。
+
+    这里改为解析成 datetime 再按北京时间比较日期，兼容带时区（含 Z）、
+    空格分隔、纯日期等写法；无法解析的记录一律忽略（不参与"今天已执行"判断，
+    宁可多执行一次，也不要因为一条脏记录导致当天彻底不执行）。
+    """
+    want = day.astimezone(timezone(timedelta(hours=8))).date()
+    for h in history or []:
+        if not isinstance(h, dict):
+            continue
+        dt = _parse_rfc3339(str(h.get("time") or ""))
+        if dt and dt.date() == want:
+            return True
+    return False
+
+
 # ==================== 存储 ====================
 def load_tasks() -> List[Dict]:
     """加载所有定时推送任务，迁移旧数据（无 schedule_type 的视为 one_time）"""
@@ -65,6 +88,12 @@ def load_tasks() -> List[Dict]:
         for t in tasks:
             if "schedule_type" not in t:
                 t["schedule_type"] = "one_time"
+                needs_save = True
+            # 迁移旧版状态拼写（sent -> completed 等）到规范值，
+            # 一次性写回，避免旧值长期滞留、每次读取都要现场归类
+            norm = task_status_of(t)
+            if t.get("status") != norm and norm in TASK_STATUSES:
+                t["status"] = norm
                 needs_save = True
             # 迁移早期 API 写入的扁平媒体字段 -> 执行器认识的嵌套 media
             if not t.get("media") and t.get("media_source"):
@@ -199,6 +228,17 @@ async def execute_task(task: Dict, bot_cache: Dict[str, BotClient]):
 
     if not targets:
         warn(f"[调度] 任务 {task.get('task_id')} 无目标，跳过", ctx=task_ctx)
+        # 必须显式落一个「失败」结果再返回。
+        # 否则 result 会保持上一轮的旧值（或压根不存在），
+        # 调用方读到 fail_count=0 就误判成「执行完成」——
+        # 一个目标都没有、什么都没发出去，绝不算完成。
+        task["result"] = {
+            "success_count": 0,
+            "fail_count": 0,
+            "total": 0,
+            "details": [],
+            "no_targets": True,
+        }
         return
 
     # 构建定时推送 footer
@@ -353,7 +393,8 @@ async def check_and_execute():
                 if sched and now >= sched:
                     info(f"[调度] 一次性任务 {task_id} 到期，准备执行", ctx=ctx)
                     due.append(t)
-                    t["status"] = "sent"
+                    # 这里不再预置 "sent"：最终状态由下面的执行循环按实际结果
+                    # 写成 completed / failed，避免「还没执行就显示完成」
                     t["executed_at"] = _now_bj_iso()
                     remaining.append(t)
                 else:
@@ -375,10 +416,8 @@ async def check_and_execute():
                         due.append(t)
                 else:
                     today_sched = now.replace(hour=sched.hour, minute=sched.minute, second=sched.second, microsecond=0)
-                    today_str = now.strftime("%Y-%m-%d")
-                    executed_today = any(
-                        h.get("time", "").startswith(today_str) for h in history
-                    )
+                    # 按日期比较（不再用字符串前缀），见 _executed_on_date
+                    executed_today = _executed_on_date(history, now)
                     if not executed_today and now >= today_sched:
                         info(f"[调度] 每日任务 {task_id} 到期（每天 {today_sched.time()}），准备执行", ctx=ctx)
                         due.append(t)
@@ -447,9 +486,14 @@ async def check_and_execute():
                     "ok": d.get("ok", False),
                     "error": d.get("error", ""),
                 })
+            # 只写规范状态：全部成功 = completed，其余一律 failed。
+            # 判定必须同时看 total 与 sc，不能只看 fail_count == 0——
+            # 无目标或结果缺失时 fc 也是 0，只看它会把「什么都没发出去」
+            # 误判成「执行完成」（这正是之前失败被算进完成的根因）。
+            run_status = "completed" if (to > 0 and sc > 0 and fc == 0) else "failed"
             history.append({
                 "time": now_iso,
-                "status": "success" if fc == 0 else "partial" if sc > 0 else "failed",
+                "status": run_status,
                 "success_count": sc,
                 "fail_count": fc,
                 "total": to,
@@ -457,11 +501,18 @@ async def check_and_execute():
             })
             if len(history) > 3:
                 t["execution_history"] = history[-3:]
+            # 任务级状态也要跟着更新：否则失败任务会一直停在初始值，
+            # 「执行失败」筛选永远筛不出东西（旧版就是这个毛病）
+            t["status"] = run_status
+            t["finished_at"] = now_iso
         except Exception as e:
             error(f"[调度] 任务 {t.get('task_id')} 执行异常: {e}", ctx=ctx)
             t.setdefault("execution_history", []).append({
                 "time": now_iso, "status": "failed", "error": str(e)[:100]
             })
+            # 抛异常同样落到任务级 failed，保证「执行失败」能筛出来
+            t["status"] = "failed"
+            t["finished_at"] = now_iso
 
     save_tasks(remaining)
 
