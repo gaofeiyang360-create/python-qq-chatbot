@@ -4,10 +4,11 @@ import json
 import time
 import uuid
 import asyncio
+from utils import atomic_write_json
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 
-from log import info, warn, error, LogCtx
+from log import info, warn, error, debug, LogCtx
 from config import BASE_DIR, get_bots, get_bot_allow_manage_all_push, \
     get_bot_allow_cross_push, get_bot_allow_cross_push_incoming
 from client import BotClient, send_with_policy
@@ -22,7 +23,7 @@ CHECK_INTERVAL = 5  # 秒，后台检查周期
 from task_core import (  # noqa: E402
     VALID_SCHEDULE_TYPES, PUSH_UPDATE_FIELDS,
     norm_schedule_type, apply_push_updates, normalize_push_task,
-    TASK_STATUSES, task_status_of,
+    TASK_STATUSES, task_status_of, task_status_of_raw,
 )
 
 
@@ -90,8 +91,10 @@ def load_tasks() -> List[Dict]:
                 t["schedule_type"] = "one_time"
                 needs_save = True
             # 迁移旧版状态拼写（sent -> completed 等）到规范值，
-            # 一次性写回，避免旧值长期滞留、每次读取都要现场归类
-            norm = task_status_of(t)
+            # 一次性写回，避免旧值长期滞留、每次读取都要现场归类。
+            # 必须用 task_status_of_raw：task_status_of 对周期任务会返回
+            # last_run_status，拿它回写会把 status 覆盖成上次的执行结果。
+            norm = task_status_of_raw(t)
             if t.get("status") != norm and norm in TASK_STATUSES:
                 t["status"] = norm
                 needs_save = True
@@ -120,13 +123,70 @@ def load_tasks() -> List[Dict]:
 
 
 def save_tasks(tasks: List[Dict]):
-    """保存所有定时推送任务"""
+    """保存所有定时推送任务（整表覆盖）。
+
+    ★ 仅供「本就在同一次同步读改写内」的调用方使用（add_task / update_task /
+      delete_task 等）：它们 load 后立刻改、立刻 save，中间没有 await，
+      因此不存在覆盖他人写入的窗口。
+
+      调度器的执行循环**不能**用这个函数 —— 它跨越 await 持有分钟级旧快照，
+      整表写回会抹掉期间新建/修改的任务，请改用 merge_task_updates。
+    """
     try:
-        SCHEDULE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(SCHEDULE_FILE, "w", encoding="utf-8") as f:
-            json.dump(tasks, f, ensure_ascii=False, indent=2)
+        # 原子写：原先的 open(SCHEDULE_FILE,"w") 是先截断再写，
+        # 中途失败/被杀会留下半截 JSON，下次读取解析不回 → 全部定时任务消失。
+        atomic_write_json(SCHEDULE_FILE, tasks)
+        return True
     except Exception as e:
         error(f"[调度] 保存定时任务文件失败: {e}", ctx=None)
+        return False
+
+
+def merge_task_updates(updates: Dict[str, Dict], removed_ids=None):
+    """把执行结果**定点合并**回磁盘，而不是整表覆盖。
+
+    为什么需要它：调度器 check_and_execute 在开头 load_tasks() 读入快照，
+    随后对每个到期任务 await execute_task(...)（LLM 往返 + 发送重试，可达
+    数十秒）。在这个 await 窗口里，API 或 AI 工具完全可能新建/修改/删除
+    定时任务。若结束时用开头那份旧快照整表写回，这些改动会被**静默抹掉** ——
+    接口已返回 200 和 task_id，任务却不存在了。
+
+    因此这里以「磁盘现状」为基准，只把本次确实执行过的任务（updates 的键）
+    的字段覆盖上去；磁盘上新增的条目原样保留，磁盘上已删除的不会被复活。
+
+    updates:     {task_id: {字段: 新值}}  仅含本次执行真正改动过的字段
+    removed_ids: 本次执行后应当移除的 task_id 集合（如一次性任务执行完毕）
+    """
+    try:
+        fresh = load_tasks()
+    except Exception as e:
+        error(f"[调度] 合并任务状态前读取失败，放弃本次写入: {e}", ctx=None)
+        return False
+
+    if removed_ids:
+        removed_ids = set(removed_ids)
+        fresh = [t for t in fresh if t.get("task_id") not in removed_ids]
+
+    changed = 0
+    for t in fresh:
+        upd = updates.get(t.get("task_id"))
+        if not upd:
+            continue
+        # 只覆盖本次执行改动的字段 —— 磁盘上的其它字段（用户刚改过的
+        # 内容/时间/目标）必须原样保留，否则同样等于回滚用户的修改
+        for k, v in upd.items():
+            if t.get(k) != v:
+                t[k] = v
+                changed += 1
+
+    try:
+        atomic_write_json(SCHEDULE_FILE, fresh)
+        debug(f"[调度] 已合并 {len(updates)} 个任务的执行状态（{changed} 处变更）",
+              ctx=None)
+        return True
+    except Exception as e:
+        error(f"[调度] 合并写入定时任务文件失败: {e}", ctx=None)
+        return False
 
 
 # ==================== 任务管理 ====================
@@ -191,24 +251,33 @@ def update_task(task_id: str, caller_app_id: str, updates: Dict) -> Tuple[bool, 
 
 def list_tasks(caller_app_id: str) -> List[Dict]:
     """列出当前机器人可见的所有定时推送任务（含全部状态）。
-    可见规则：
-    - 自己的任务始终可见
-    - 其他机器人的任务：需要同时满足 caller 的 ALLOW_CROSS_BOT_PUSH=1 和对方的 ALLOW_CROSS_BOT_PUSH_INCOMING=1
-    - ALLOW_MANAGE_ALL_PUSH=1 可见所有
+
+    可见规则（按「谁在问」分两种口径，别混淆）：
+
+    1) 运维视角 —— 全局密钥
+       调用方以空 caller_app_id 表达自己是全局密钥（见 api_server
+       的 _resolve_app_id 与 /api/push/list 的 caller 计算）。此时返回全量，
+       供管理面板一把查看。
+
+    2) 机器人密钥 —— 一律只回自己的任务
+       **即使该机器人开了 ALLOW_MANAGE_ALL_PUSH=1 也不并入他人任务**：
+       那个开关的语义是「允许它对别人的任务执行管理动作」
+       （delete/update/revoke 走各自的 handler），而不是「允许它读取
+       别人的任务内容」。任务体里含 targets（他人群/用户 openid）与
+       content（推送正文），一旦并入即泄露他人会话标识与消息内容。
+
+       同理，对方 ALLOW_CROSS_BOT_PUSH_INCOMING=1 只表示「允许被推送」，
+       不表示允许读取任务列表 —— 原实现据此并入，在本项目默认配置
+       （9 个 ALLOW_CROSS_* 全为 1）下等于默认泄露。
     """
     tasks = load_tasks()
-    can_manage_all = get_bot_allow_manage_all_push(caller_app_id)
-    if can_manage_all:
+
+    # 全局密钥（无以归属的 caller）→ 运维全量视图
+    if not caller_app_id:
         return tasks
-    caller_can_push = get_bot_allow_cross_push(caller_app_id)
-    result = []
-    for t in tasks:
-        t_app_id = t.get("app_id", "")
-        if t_app_id == caller_app_id:
-            result.append(t)
-        elif caller_can_push and get_bot_allow_cross_push_incoming(t_app_id):
-            result.append(t)
-    return result
+
+    # 机器人密钥：只回自己的任务
+    return [t for t in tasks if t.get("app_id", "") == caller_app_id]
 
 
 # ==================== 后台执行 ====================
@@ -378,7 +447,11 @@ async def check_and_execute():
     bot_cache: Dict[str, BotClient] = {}
 
     due = []
-    remaining = []
+
+    # 本循环只负责挑出「到期该执行」的任务（due）。
+    # 不再构建 remaining 列表 —— 它是旧版 save_tasks(remaining) 整表覆盖的残留：
+    # 自从改为 merge_task_updates 定点合并后，未到期任务的落盘状态一律以磁盘
+    # 现状为准，磁盘上的条目既不会被丢弃也不会被复活，无需再收集一份副本。
 
     for t in tasks:
         status = t.get("status", "pending")
@@ -396,16 +469,9 @@ async def check_and_execute():
                     # 这里不再预置 "sent"：最终状态由下面的执行循环按实际结果
                     # 写成 completed / failed，避免「还没执行就显示完成」
                     t["executed_at"] = _now_bj_iso()
-                    remaining.append(t)
-                else:
-                    remaining.append(t)
-            else:
-                # 已完成的 also kept
-                remaining.append(t)
 
         elif schedule_type == "daily":
             if status != "pending":
-                remaining.append(t)
                 continue
             sched = _parse_rfc3339(t.get("schedule_time", ""))
             if sched:
@@ -421,14 +487,11 @@ async def check_and_execute():
                     if not executed_today and now >= today_sched:
                         info(f"[调度] 每日任务 {task_id} 到期（每天 {today_sched.time()}），准备执行", ctx=ctx)
                         due.append(t)
-                remaining.append(t)
             else:
                 warn(f"[调度] 每日任务 {task_id} schedule_time 无效: {t.get('schedule_time')}", ctx=ctx)
-                remaining.append(t)
 
         elif schedule_type == "interval":
             if status != "pending":
-                remaining.append(t)
                 continue
             interval = int(t.get("interval_seconds", 3600))
             history = t.get("execution_history", [])
@@ -448,27 +511,31 @@ async def check_and_execute():
                 elif now >= start_time:
                     info(f"[调度] 间隔任务 {task_id} 首次到期（{start_time}），准备执行", ctx=ctx)
                     due.append(t)
-                remaining.append(t)
             else:
                 next_time = last_time + timedelta(seconds=interval)
                 if now >= next_time:
                     info(f"[调度] 间隔任务 {task_id} 到期（上次 {last_time.isoformat()}，间隔 {interval}s），准备执行", ctx=ctx)
                     due.append(t)
-                remaining.append(t)
         else:
             warn(f"[调度] 任务 {task_id} 未知类型: {schedule_type}", ctx=ctx)
-            remaining.append(t)
 
     if not due:
         return
 
     info(f"[调度] 发现 {len(due)} 个待执行任务", ctx=None)
 
-    # 执行到期任务
+    # 执行到期任务。
+    # ★ 这里**不**写回开头读到的 tasks 快照 —— 执行过程跨越 await（LLM 往返 +
+    #   发送重试，可达数十秒），期间 API/AI 工具可能已新建或修改任务。改为把
+    #   本次真正改动的字段收集到 task_updates，最后 merge_task_updates 定点合并。
+    task_updates: Dict[str, Dict] = {}
     for t in due:
         now_iso = _now_bj_iso()
+        task_id = t.get("task_id")
+        schedule_type = t.get("schedule_type", "one_time")
         # 每个待执行任务的标识可能不同，循环内重新构造 ctx
         ctx = LogCtx(app_id=t.get("app_id", ""))
+        updates: Dict[str, Any] = {}
         try:
             await execute_task(t, bot_cache)
             # 记录执行历史（含每个目标的执行情况）
@@ -486,11 +553,20 @@ async def check_and_execute():
                     "ok": d.get("ok", False),
                     "error": d.get("error", ""),
                 })
-            # 只写规范状态：全部成功 = completed，其余一律 failed。
+            # 只写规范状态。三态判定（M10）：
+            #   全成功 → completed
+            #   有成功也有失败 → partial（此前被误记为 completed，掩盖了
+            #                        多目标里有一半没发出去的事实）
+            #   全失败/无目标 → failed
             # 判定必须同时看 total 与 sc，不能只看 fail_count == 0——
             # 无目标或结果缺失时 fc 也是 0，只看它会把「什么都没发出去」
             # 误判成「执行完成」（这正是之前失败被算进完成的根因）。
-            run_status = "completed" if (to > 0 and sc > 0 and fc == 0) else "failed"
+            if to > 0 and sc > 0 and fc == 0:
+                run_status = "completed"
+            elif sc > 0 and fc > 0:
+                run_status = "partial"
+            else:
+                run_status = "failed"
             history.append({
                 "time": now_iso,
                 "status": run_status,
@@ -499,22 +575,43 @@ async def check_and_execute():
                 "total": to,
                 "target_results": target_results,
             })
-            if len(history) > 3:
-                t["execution_history"] = history[-3:]
-            # 任务级状态也要跟着更新：否则失败任务会一直停在初始值，
-            # 「执行失败」筛选永远筛不出东西（旧版就是这个毛病）
-            t["status"] = run_status
-            t["finished_at"] = now_iso
+            updates["execution_history"] = history[-3:]
+            # 周期性任务（daily/interval）执行后必须把 status 复位为 pending，
+            # 否则会永久停摆：上方 407/430 行的到期判定要求 status=="pending"，
+            # 一旦写成 completed/failed 就在下一轮被直接跳过，再也不执行 ——
+            # 表现为「每日推送跑了一次就没了」，且状态显示为「已结束」而非出错。
+            # 一次性任务（one_time）保持 run_status，因为它本就只跑一次。
+            if schedule_type in ("daily", "interval"):
+                updates["status"] = "pending"
+            else:
+                updates["status"] = run_status
+            # 最近一次执行结果单独留档，供列表展示与「执行失败」筛选使用
+            # （status 复位后不能再承载这个信息，故必须有独立字段）
+            updates["last_run_status"] = run_status
+            updates["finished_at"] = now_iso
         except Exception as e:
-            error(f"[调度] 任务 {t.get('task_id')} 执行异常: {e}", ctx=ctx)
-            t.setdefault("execution_history", []).append({
+            error(f"[调度] 任务 {task_id} 执行异常: {e}", ctx=ctx)
+            hist = t.setdefault("execution_history", [])
+            hist.append({
                 "time": now_iso, "status": "failed", "error": str(e)[:100]
             })
-            # 抛异常同样落到任务级 failed，保证「执行失败」能筛出来
-            t["status"] = "failed"
-            t["finished_at"] = now_iso
+            updates["execution_history"] = hist[-3:]
+            # 同成功路径：周期任务即便本轮异常也要复位，否则一次网络抖动
+            # 就会让该任务此后永久不再执行
+            if schedule_type in ("daily", "interval"):
+                updates["status"] = "pending"
+            else:
+                updates["status"] = "failed"
+            updates["last_run_status"] = "failed"
+            updates["finished_at"] = now_iso
 
-    save_tasks(remaining)
+        if task_id:
+            task_updates[task_id] = updates
+        else:
+            warn("[调度] 到期任务缺少 task_id，其执行结果无法回写", ctx=ctx)
+
+    # 定点合并回磁盘（磁盘上新增的任务保留，已删除的不复活）
+    merge_task_updates(task_updates)
 
 
 async def scheduler_loop():

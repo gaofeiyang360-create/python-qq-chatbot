@@ -13,6 +13,9 @@ from api_server import api_server_loop
 
 # 新增 bot 检测间隔（秒）
 SYNC_INTERVAL = 3
+# 关闭时等待各任务真正结束的上限（秒）。
+# 不能无限等：任务可能卡在不可取消的阻塞调用里，关机流程不能因此挂死。
+_SHUTDOWN_WAIT_SECONDS = 5.0
 
 
 async def run_bot_for_client(bot_client: BotClient):
@@ -120,6 +123,12 @@ class BotManager:
             if task and not task.done():
                 task.cancel()
                 info(f"[管理器] 机器人 {app_id} 已被移除/禁用，发送停止信号", ctx=ctx)
+                # LOW：取消后等一下，让该机器人的收尾日志（连接关闭等）
+                # 有机会写出来再继续。上限 2s，避免个别卡死的连接拖住 sync。
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                    pass
 
         # 清理已自然结束的 task
         for app_id in list(self._bot_tasks.keys()):
@@ -160,24 +169,56 @@ class BotManager:
                 error(f"[管理器] 同步异常: {e}", ctx=None)
 
         # 停止定时推送调度器
-        if self._scheduler_task and not self._scheduler_task.done():
-            self._scheduler_task.cancel()
-        # 停止定时唤醒调度器
-        if self._wakeup_scheduler_task and not self._wakeup_scheduler_task.done():
-            self._wakeup_scheduler_task.cancel()
-        # 停止 HTTP API 服务
-        if self._api_task and not self._api_task.done():
-            self._api_task.cancel()
+        #
+        # ★ LOW 修复：cancel() 之后必须 await，否则被取消的任务还没跑到自己
+        #   的清理/收尾日志，事件循环就可能先退出 —— 表现为「关闭时最后几条
+        #   日志丢失」，排查停机原因时看不到任何线索。
+        #   return_exceptions=True：任务被取消会抛 CancelledError，这里只是
+        #   等它结束，不是要传播异常（传播出去反而会让关闭流程中断）。
+        await self._cancel_and_wait([
+            ("定时推送调度器", self._scheduler_task),
+            ("定时唤醒调度器", self._wakeup_scheduler_task),
+            ("HTTP API 服务", self._api_task),
+        ])
 
         # 停止所有机器人
+        bot_items = []
         for app_id in list(self._bot_tasks.keys()):
-            # 循环内构造：每个 app_id 是不同机器人，标识随之变化
-            ctx = LogCtx(app_id=app_id)
             task = self._bot_tasks.pop(app_id, None)
             self._bot_clients.pop(app_id, None)
             if task and not task.done():
+                # 循环内构造：每个 app_id 是不同机器人，标识随之变化
+                ctx = LogCtx(app_id=app_id)
                 task.cancel()
                 info(f"[管理器] 机器人 {app_id} 已发送停止信号", ctx=ctx)
+                bot_items.append((f"机器人 {app_id}", task))
+        await self._cancel_and_wait(bot_items)
+
+    async def _cancel_and_wait(self, items):
+        """取消若干任务并等待它们真正结束（LOW：取消后必须 await）。
+
+        items: [(描述, task), ...]，描述仅用于超时告警的可读性。
+        超时保护：个别任务可能卡在不可取消的阻塞调用里，不能因此让整个
+        关闭流程永久挂住 —— 超时后记一条告警继续，剩下的交给进程退出。
+        """
+        pending = [(d, t) for d, t in items if t is not None and not t.done()]
+        for _, t in pending:
+            t.cancel()
+        if not pending:
+            return
+        done, still = await asyncio.wait(
+            [t for _, t in pending], timeout=_SHUTDOWN_WAIT_SECONDS)
+        for desc, t in pending:
+            if t in still:
+                warn(f"[管理器] 停止 {desc} 超时（{_SHUTDOWN_WAIT_SECONDS}s），"
+                     f"不再等待", ctx=None)
+        # 取走异常，避免 "Task exception was never retrieved" 噪音
+        for t in done:
+            if not t.cancelled():
+                try:
+                    t.exception()
+                except (asyncio.CancelledError, Exception):
+                    pass
 
     def stop(self):
         """请求停止管理器"""

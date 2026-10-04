@@ -11,18 +11,30 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 # ==================== 任务状态（唯一事实来源） ====================
-# 任务级 status 只有以下三种，且写进文件的就是这三个字面量：
+# 任务级 status 只有以下四种，且写进文件的就是这四个字面量：
 #   pending    未开始 —— 创建时的初始值
-#   completed  执行完成 —— 到期执行成功后置位
-#   failed     执行失败 —— 执行出错或有目标失败时置位
+#   completed  执行完成 —— 到期执行成功且**所有目标**都成功
+#   partial    部分失败 —— 有目标成功、也有目标失败（M10 新增）
+#   failed     执行失败 —— 执行出错，或所有目标都失败
+#
+# ★ 为什么需要 partial（M10）：
+#   一个推送任务可以带多个目标（多个群/多个用户）。此前只有 completed /
+#   failed 二选一，判定是 `sc > 0 and fc == 0`，于是「10 个目标成功 3 个、
+#   失败 7 个」被记成 completed。调用方看任务状态是「执行完成」，完全
+#   看不出有一半没发出去 —— 而 success_count/fail_count 虽然写进了
+#   execution_history，但那是历史数组，不是筛选口径。
+#   新增 partial 后：全成功=completed，部分成功=partial，全失败=failed。
+#   筛选 ?status=failed 时同时匹配 partial（见 status_matches_filter），
+#   这样「筛执行失败」不会漏掉部分失败的批次。
 #
 # 放在 task_core 而不是 tool.py：scheduler / wakeup_scheduler 都要用它
 # （读旧文件时归类），而 tool.py 会延迟导入 scheduler，放在那边会循环导入。
-TASK_STATUSES = ("pending", "completed", "failed")
+TASK_STATUSES = ("pending", "completed", "partial", "failed")
 
 _TASK_STATUS_LABELS = {
     "pending": "未开始",
     "completed": "执行完成",
+    "partial": "部分失败",
     "failed": "执行失败",
 }
 
@@ -30,6 +42,7 @@ _TASK_STATUS_LABELS = {
 _STATUS_CN = {
     "未开始": "pending",
     "执行完成": "completed",
+    "部分失败": "partial",
     "执行失败": "failed",
 }
 
@@ -77,9 +90,42 @@ def task_status_of(t: Dict[str, Any]) -> str:
 
     兼容旧文件里的 sent/active；只有真正无法识别的脏值才兜底为 pending
     （此时它是「未知」，而不是被冒充成某个已知状态）。
+
+    ★ 周期性任务（daily/interval）读 last_run_status：
+      这类任务执行后 status 会被调度器复位为 pending（否则会被「非 pending
+      即跳过」的到期判定永久卡死，见 scheduler.check_and_execute 的说明）。
+      复位后 status 只表示「还会不会继续跑」，不再表示「上次跑得怎么样」，
+      因此展示与「执行失败」筛选都必须改读 last_run_status —— 否则每日任务
+      跑完后会永远显示「未开始」、且筛不出失败。
+      无 last_run_status 的旧数据（尚未执行过）自然回落到 status。
     """
+    status = task_status_of_raw(t)
+    if t and t.get("schedule_type") in ("daily", "interval"):
+        last = norm_task_status(t.get("last_run_status"))
+        if last in _TASK_STATUS_LABELS:
+            return last
+    return status
+
+
+def task_status_of_raw(t: Dict[str, Any]) -> str:
+    """只看 status 字段本身（不掺 last_run_status）—— 供调度器判定用。"""
     s = norm_task_status((t or {}).get("status"))
     return s if s in _TASK_STATUS_LABELS else "pending"
+
+
+def status_matches_filter(actual: str, wanted: str) -> bool:
+    """筛选时的状态匹配（M10）。
+
+    ★ `?status=failed` 必须同时命中 partial：
+      用户的意图是「找出没发成功的任务」，部分失败显然属于此列。
+      只比字符串相等会把 partial 漏掉，等于把「3 成功 7 失败」藏起来。
+      反向不成立：筛 partial 就只要 partial，不带上全部 failed。
+    """
+    if actual == wanted:
+        return True
+    if wanted == "failed" and actual == "partial":
+        return True
+    return False
 
 # ==================== 统一参数命名 ====================
 # 两边过去各叫各的，同一个东西好几个名字（group_id / group_openid / id），

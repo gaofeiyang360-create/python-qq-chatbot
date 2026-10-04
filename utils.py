@@ -7,6 +7,7 @@
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Optional
+import re
 
 
 # ==================== 媒体类型常量 ====================
@@ -178,3 +179,76 @@ def parse_message_type(args: dict, allow_markdown_only: bool = False) -> tuple:
             body = str(body)
 
     return is_markdown, body
+
+
+# ==================== 异常文本脱敏 ====================
+# 异常原文里常含**部署绝对路径**、用户名、盘符。这类文本一旦回给模型
+# （tool.py 的 32 处「xx异常：{e}」）就会写进聊天记录，之后任何人用
+# query_history 都能再读出来 —— 等于把服务端目录结构永久留在历史里。
+# API 侧同理（api_server 的 14 处 fail 已改用各自的 _safe_error）。
+#
+# 这里保留「异常类型 + 原因」，只抹掉路径部分：排查需要的信息（是权限问题
+# 还是文件不存在）都在，泄露部署信息的部分不在。
+_UNSAFE_PATH_RES = (
+    re.compile(r"[A-Za-z]:\\[^\s'\"<>|]+"),                                 # Windows 盘符
+    re.compile(r"\\\\[^\s'\"<>|]+"),                                        # UNC
+    re.compile(r"/(?:home|root|usr|var|opt|tmp|etc|Users)/[^\s'\"<>|]+"),   # POSIX
+)
+
+
+def safe_exc_text(exc, *, limit: int = 200) -> str:
+    """把异常转成可安全外发的短文本：`类型: 脱敏消息`。
+
+    例：FileNotFoundError: [Errno 2] No such file: '<path>'
+    """
+    try:
+        msg = str(exc)
+    except Exception:
+        msg = repr(type(exc).__name__)
+    for pat in _UNSAFE_PATH_RES:
+        msg = pat.sub("<path>", msg)
+    # 兜底：任何残留的盘符开头片段
+    msg = re.sub(r"[A-Za-z]:\\\S*", "<path>", msg)
+    if len(msg) > limit:
+        msg = msg[:limit] + "…"
+    return f"{type(exc).__name__}: {msg}"
+
+
+# ==================== 原子 JSON 写入 ====================
+def atomic_write_json(path, data, *, indent: int = 2) -> None:
+    """原子地把 data 写成 JSON 文件（tmp + fsync + os.replace）。
+
+    为什么不能用 open(path, "w") 就地写：截断和写入是两步，进程在中间
+    被杀（或被同时运行的另一个写入者交错）会留下**半截文件**。JSON 一旦
+    被截断就再也解析不回来，调用方的 safe_load_json 只能返回默认空值 ——
+    对本项目意味着「全部定时任务/全部记忆一次性消失」。
+
+    os.replace 在同一文件系统上是原子的：要么看到旧内容，要么看到新内容，
+    不会看到中间态。与 config.write_config 用的是同一套模板。
+
+    失败时尽力清理临时文件，并把异常抛给调用方决定如何记录。
+    """
+    import json as _json
+    import os as _os
+    from pathlib import Path as _Path
+
+    p = _Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    # 先序列化并自校验：非法内容绝不写入磁盘
+    text = _json.dumps(data, ensure_ascii=False, indent=indent)
+    _json.loads(text)
+
+    tmp = p.with_name(p.name + ".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            _os.fsync(f.fileno())
+        _os.replace(tmp, p)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise

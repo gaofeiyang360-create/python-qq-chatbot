@@ -23,6 +23,7 @@
 """
 import asyncio
 import json
+import os
 import re
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List, Tuple
@@ -41,8 +42,10 @@ from config import (
     get_bot_allow_cross_history, get_bot_allow_cross_history_incoming,
     get_config, write_config, is_sensitive_key, is_api_key_field,
     DEFAULT_CONFIG, deep_patch_defaults,
+    get_log_file, get_enable_log, get_log_level, get_max_log_length,   # /api/logs
 )
 from log import info, warn, error, debug, LogCtx
+from log import _split_log_entries   # 日志按「条」切分（与写入端同一套口径）
 from memory import (
     load_user_map, load_mirror, load_history,
     get_user_name, get_group_name_from_mirror,
@@ -234,8 +237,67 @@ def fail(message: str, status: int = 400, **extra) -> web.Response:
     )
 
 
+# ==================== 异常信息脱敏（M15） ====================
+# 请求体大小上限（M14）。1MB 与 aiohttp 默认 client_max_size 对齐。
+_MAX_BODY_BYTES = 1024 * 1024
+
+# 异常文本里需要抹掉的绝对路径：
+#   Windows  D:\dsh-workspace\xxx.json / C:\Users\name\...
+#   POSIX    /home/user/app/xxx.json
+# 以及常见的环境变量展开痕迹。
+#
+# 为什么必须脱敏：约 30 处 fail(f"...异常: {e}", 500) 会把原始异常直接回给
+# 调用方。FileNotFoundError / PermissionError 这类异常的 str() 里**含部署
+# 绝对路径**，等于把服务端目录结构、用户名、盘符免费送给任何能调用 API 的人
+# （在无密钥模式下更是对所有人开放）。完整异常仍然写进日志，排查不受影响。
+_PATH_PATTERNS = (
+    re.compile(r"[A-Za-z]:\\[^\s'\"<>|]+"),      # Windows 盘符路径
+    re.compile(r"\\\\[^\s'\"<>|]+"),              # UNC 路径
+    re.compile(r"/(?:home|root|usr|var|opt|tmp|etc|Users)/[^\s'\"<>|]+"),  # POSIX
+)
+
+
+def _safe_error(exc: Exception, action: str, *, ctx=None, status: int = 500) -> web.Response:
+    """把异常转成给调用方的响应：**保留异常类型与语义，去掉路径等敏感细节**。
+
+    - 日志记录完整异常（含堆栈上下文），排查照旧；
+    - 响应只给「动作 + 异常类型 + 脱敏后的消息」，让调用方知道发生了什么，
+      但拿不到部署路径。
+    """
+    raw = f"{type(exc).__name__}: {exc}"
+    error(f"[API] {action}失败: {raw}", ctx=ctx)          # 完整信息只进日志
+
+    safe = str(exc)
+    for pat in _PATH_PATTERNS:
+        safe = pat.sub("<path>", safe)
+    # 兜底：万一还有别的盘符/长路径痕迹，压掉连续反斜杠后的内容
+    safe = re.sub(r"[A-Za-z]:\\\S*", "<path>", safe)
+    if len(safe) > 300:
+        safe = safe[:300] + "…"
+
+    return fail(f"{action}失败（{type(exc).__name__}）：{safe}", status)
+
+
 async def _read_json(request: web.Request) -> Dict:
-    """安全读取 JSON body，并缓存到 request['json_body'] 供 app_id 解析使用"""
+    """安全读取 JSON body，并缓存到 request['json_body'] 供 app_id 解析使用。
+
+    ★ 读之前先按 Content-Length 拒绝超大请求体（M14）：
+      aiohttp 默认的 client_max_size 是 1MB，但它在**读满时**才抛错，且
+      本中间件链会先调用本函数把整个 body 读进内存，等于用一个无上限的
+      read 去挡一个本该在入口拒绝的请求。显式比对 Content-Length 可以在
+      进入读取前就返回 413，避免大 body 占用内存。
+      Content-Length 缺失时（chunked）退回 aiohttp 自身的上限保护。
+    """
+    declared = request.headers.get("Content-Length")
+    if declared:
+        try:
+            if int(declared) > _MAX_BODY_BYTES:
+                request["json_body"] = {}
+                return {}
+        except (TypeError, ValueError):
+            request["json_body"] = {}
+            return {}
+
     body: Dict = {}
     if request.can_read_body:
         try:
@@ -318,6 +380,7 @@ STRICT_PARAMS = {
     "/api/memory/toggle": {"level", "identifier", "enabled", "value", "app_id", "key"},
     "/api/memory/search": {"keywords", "keyword", "q", "level", "identifier",
                            "group_id", "c2c_user_id", "app_id", "key"},
+    "/api/logs":          {"lines", "keyword", "level", "app_id", "reverse", "key"},
 }
 
 
@@ -393,6 +456,11 @@ from memory import (                # noqa: E402
 # 允许的来源列表。"*" 表示允许所有来源（回显请求的 Origin，以兼容携带凭证的场景）。
 # 注意：Origin 为 "null" 的情况见于用 file:// 直接打开本地 HTML，
 # 必须原样回显 "null" 才能让本地管理页正常工作。
+#
+# ★ 这是**有意的设计决定**：本项目支持直接用 file:// 双击打开管理页
+#   （本地单机运维场景，免起 http 服务）。因此不对 "null" 做拒绝处理 ——
+#   它带来的风险（本地任意 HTML 可跨域调用本 API）由部署方通过
+#   API_BIND_HOST / API_KEYS 自行控制，不属于代码层面的缺陷。
 CORS_ALLOW_ORIGIN = "*"
 
 # 预检响应中允许的请求头（覆盖管理页用到的全部自定义头）
@@ -411,7 +479,7 @@ CORS_MAX_AGE = "86400"
 def _cors_origin(request: web.Request) -> Optional[str]:
     """
     计算应当回显的 Access-Control-Allow-Origin 值。
-    - 配置为 "*"：回显请求的 Origin（含 "null"）；无 Origin 时返回 "*"
+    - 配置为 "*"：回显请求的 Origin（含 "null"，支持 file:// 本地管理页）；无 Origin 时返回 "*"
     - 配置为具体域名列表：命中则回显，否则返回 None（不加 CORS 头）
     """
     origin = request.headers.get("Origin")
@@ -489,8 +557,21 @@ async def auth_middleware(request: web.Request, handler):
     if request.method == "OPTIONS":
         return web.Response(status=204)
 
-    # 健康检查/服务信息不需要鉴权
-    if request.path in ("/", "/health", "/info"):
+    # 健康检查/根路径不需要鉴权
+    if request.path in ("/", "/health"):
+        return await handler(request)
+
+    # /info：**尝试**鉴权但即使失败也放行（LOW 修复）。
+    #   它既要能被未鉴权的前端探活，又要在带了有效密钥时返回完整信息
+    #   （见 h_info：无 auth 时只回 {alive:true}，不泄露机器人清单与绑定地址）。
+    #   因此这里不能像其它接口那样在鉴权失败时 401，只能把结果放进 request。
+    if request.path == "/info":
+        try:
+            auth_opt, _err = authenticate(request)
+        except Exception:
+            auth_opt = None
+        if auth_opt is not None:
+            request["auth"] = auth_opt
         return await handler(request)
 
     # 先读取 body（供 app_id 解析），GET 请求无 body
@@ -708,6 +789,10 @@ async def h_bots(request: web.Request) -> web.Response:
     """可用机器人列表：/api/bots[?search=] （全局密钥或机器人密钥均可看自己的）
 
     search 可按 APP_ID 或描述（desc）关键词过滤，与工具 get_targets 的 search 行为一致。
+
+    额外返回 role / can_manage_all：调用方（管理面板）据此决定要不要提供
+    「全局」选项 —— 全局密钥可以不带 app_id 直接查（此时由后端按各接口规则
+    自行解析或聚合），机器人密钥则必须锁定在自己身上。
     """
     auth = request["auth"]
     if (e := _reject_unknown_params(request, "/api/bots", {})):
@@ -730,7 +815,15 @@ async def h_bots(request: web.Request) -> web.Response:
             "api_enabled": get_bot_api_enabled(aid),
             "desc": desc,
         })
-    return ok({"total": len(out), "bots": out})
+    return ok({
+        "total": len(out),
+        "bots": out,
+        # 当前密钥的角色：管理面板用它决定是否显示「全局」选项
+        "role": auth["role"],
+        "can_manage_all": bool(auth.get("can_manage_all")),
+        # 本密钥被限定的 app_id（机器人密钥才有；全局密钥为 None）
+        "scope_app_id": auth.get("app_id") or None,
+    })
 
 
 # ==================== 2. 消息查看 ====================
@@ -952,6 +1045,17 @@ async def h_send(request: web.Request) -> web.Response:
     if not target_id:
         return fail("缺少 target_id")
 
+    # ---------- 目标会话归属校验（M16）----------
+    # _check_cross_allowed 只校验「URL 上的 app_id 是否等于本密钥的 app_id」，
+    # 它管的是「能不能操作这个机器人」，**管不到 target_id**。而 target_id
+    # 完全由调用方给出且此前从不校验 —— 于是任何机器人密钥都能以自己的身份
+    # 往别人名下的群/私聊发消息（甚至借媒体 URL 触发远端抓取）。
+    # 这里补上会话级归属：目标必须确实登记在该机器人名下。
+    if not _target_owned_by(app_id, target_type, target_id):
+        return fail(
+            f"权限不足：{'群' if target_type == 'group' else '用户'} {target_id} "
+            f"不属于机器人 {app_id}（无本地记录，请先同步）", 403)
+
     thread_key = f"{target_type}_{target_id}"
     ctx = LogCtx(app_id=app_id, thread_key=thread_key)
 
@@ -995,7 +1099,7 @@ async def h_send(request: web.Request) -> web.Response:
         sent = await client.send_message(**send_kwargs)
     except Exception as e:
         error(f"[API] 发送异常: {e}", ctx=ctx)
-        return fail(f"发送异常: {e}", 500)
+        return _safe_error(e, "发送")
 
     if not sent:
         return fail("发送失败（请检查目标ID、权限或媒体URL）", 502)
@@ -1575,7 +1679,7 @@ async def h_bot_state(request: web.Request) -> web.Response:
     try:
         state = await client.get_bot_state(group_id)
     except Exception as e:
-        return fail(f"查询异常: {e}", 500)
+        return _safe_error(e, "查询")
 
     if state is None:
         return fail("查询失败（可能机器人不在该群，或接口无权限）", 502)
@@ -1638,7 +1742,7 @@ async def h_mute_status(request: web.Request) -> web.Response:
     try:
         status = await client.get_group_mute_status(group_id)
     except Exception as e:
-        return fail(f"查询异常: {e}", 500)
+        return _safe_error(e, "查询")
 
     if status is None:
         return fail("查询失败（可能机器人不是群管理员，或群不存在）", 502)
@@ -1758,7 +1862,7 @@ async def h_push_create(request: web.Request) -> web.Response:
         return fail(str(e))
     except Exception as e:
         error(f"[API] 创建推送异常: {e}", ctx=ctx)
-        return fail(f"创建推送异常: {e}", 500)
+        return _safe_error(e, "创建推送")
 
     info(f"[API] 创建定时推送 {task_id} app={app_id}", ctx=ctx)
     return ok({"task_id": task_id, "app_id": app_id, "schedule_type": schedule_type})
@@ -1795,9 +1899,16 @@ async def h_push_list(request: web.Request) -> web.Response:
         return fail(e, 403)
 
     try:
-        tasks = sched.list_tasks(app_id)
+        # 用「调用方身份」而不是 URL 上的 app_id 决定可见范围：
+        #   · 全局密钥（ROLE_GLOBAL）→ 传空串，取运维全量视图；
+        #   · 机器人密钥 → 传自己的 app_id，只拿自己的任务。
+        # 若这里传 app_id，全局密钥显式指定 app_id 时会被列表逻辑误判成
+        # 机器人密钥而收窄结果；反之若恒传空串，机器人密钥就会拿到全量 ——
+        # 两个方向都会错，必须按角色区分（F4：跨机器人任务列表泄露）。
+        caller = "" if auth["role"] == ROLE_GLOBAL else auth["app_id"]
+        tasks = sched.list_tasks(caller)
     except Exception as e:
-        return fail(f"读取推送列表异常: {e}", 500)
+        return _safe_error(e, "读取推送列表")
 
     # 先统计全量状态分布（在过滤前），便于前端展示筛选标签
     all_counts = _task_counts(tasks)
@@ -1805,7 +1916,7 @@ async def h_push_list(request: web.Request) -> web.Response:
     try:
         tasks, fmeta = _filter_tasks(tasks, request)
     except Exception as e:
-        return fail(f"过滤推送列表异常: {e}", 400)
+        return _safe_error(e, "过滤推送列表")
 
     resp: Dict[str, Any] = {
         "app_id": app_id,
@@ -1838,7 +1949,7 @@ async def h_push_delete(request: web.Request) -> web.Response:
     try:
         success, msg = sched.delete_task(task_id, app_id)
     except Exception as e:
-        return fail(f"删除推送异常: {e}", 500)
+        return _safe_error(e, "删除推送")
     if success:
         return ok({"task_id": task_id, "message": msg})
     return fail(msg, 404)
@@ -1876,7 +1987,7 @@ async def h_push_update(request: web.Request) -> web.Response:
     try:
         success, msg = sched.update_task(task_id, app_id, updates)
     except Exception as e:
-        return fail(f"更新推送异常: {e}", 500)
+        return _safe_error(e, "更新推送")
     if success:
         return ok({"task_id": task_id, "message": msg, "updated": sorted(updates.keys())})
     return fail(msg, 404)
@@ -1960,7 +2071,7 @@ async def h_wakeup_create(request: web.Request) -> web.Response:
         return fail(str(e))
     except Exception as e:
         error(f"[API] 创建唤醒异常: {e}", ctx=ctx)
-        return fail(f"创建唤醒异常: {e}", 500)
+        return _safe_error(e, "创建唤醒")
 
     info(f"[API] 创建定时唤醒 {task_id} app={app_id}", ctx=ctx)
     return ok({"task_id": task_id, "app_id": app_id, "schedule_type": schedule_type})
@@ -1985,16 +2096,18 @@ async def h_wakeup_list(request: web.Request) -> web.Response:
         return fail(e, 403)
 
     try:
-        tasks = ws.list_wakeups(app_id)
+        # 同 /api/push/list：按调用方角色决定可见范围（F4）
+        caller = "" if auth["role"] == ROLE_GLOBAL else auth["app_id"]
+        tasks = ws.list_wakeups(caller)
     except Exception as e:
-        return fail(f"读取唤醒列表异常: {e}", 500)
+        return _safe_error(e, "读取唤醒列表")
 
     all_counts = _task_counts(tasks)
 
     try:
         tasks, fmeta = _filter_tasks(tasks, request)
     except Exception as e:
-        return fail(f"过滤唤醒列表异常: {e}", 400)
+        return _safe_error(e, "过滤唤醒列表")
 
     resp: Dict[str, Any] = {
         "app_id": app_id,
@@ -2027,7 +2140,7 @@ async def h_wakeup_delete(request: web.Request) -> web.Response:
     try:
         success, msg = ws.delete_wakeup(task_id, app_id)
     except Exception as e:
-        return fail(f"删除唤醒异常: {e}", 500)
+        return _safe_error(e, "删除唤醒")
     if success:
         return ok({"task_id": task_id, "message": msg})
     return fail(msg, 404)
@@ -2064,7 +2177,7 @@ async def h_wakeup_update(request: web.Request) -> web.Response:
     try:
         success, msg = ws.update_wakeup(task_id, app_id, updates)
     except Exception as e:
-        return fail(f"更新唤醒异常: {e}", 500)
+        return _safe_error(e, "更新唤醒")
     if success:
         return ok({"task_id": task_id, "message": msg, "updated": sorted(updates.keys())})
     return fail(msg, 404)
@@ -2112,6 +2225,16 @@ async def h_wakeup_trigger(request: web.Request) -> web.Response:
         return fail("target_type 必须为 group 或 c2c")
     if not target_id:
         return fail("缺少 target_id")
+
+    # ---------- 目标会话归属校验（M16）----------
+    # 与 /api/send 同理：_check_cross_allowed 只看 URL 上的 app_id，管不到
+    # target_id。缺了这一步，任何机器人密钥都能向别人名下的会话注入提示词、
+    # 触发一轮 AI 回复 —— 后果比单纯发消息更大（会消耗对方额度并写入对方历史）。
+    if not _target_owned_by(app_id, target_type, target_id):
+        return fail(
+            f"权限不足：{'群' if target_type == 'group' else '用户'} {target_id} "
+            f"不属于机器人 {app_id}（无本地记录，请先同步）", 403)
+
     if not prompt:
         return fail("缺少 description（要注入的提示词内容）")
     try:
@@ -2156,7 +2279,7 @@ async def h_wakeup_trigger(request: web.Request) -> web.Response:
         result = await ws.run_wakeup_on_target(task_data, target, bot_cache, tag="API唤醒")
     except Exception as e:
         error(f"[API] 立即唤醒异常: {e}", ctx=ctx)
-        return fail(f"立即唤醒异常: {e}", 500)
+        return _safe_error(e, "立即唤醒")
 
     result = result or {}
     thread_key = f"{target_type}_{target_id}"
@@ -2270,6 +2393,122 @@ def _memory_level_app_id(level: str, identifier: str) -> str:
     return identifier if level in ("global", "bot") else ""
 
 
+def _group_owned_by(app_id: str, group_id: str) -> bool:
+    """该群是否属于这个机器人（依据 user_map[app_id].group）。
+
+    与 /api/groups 同源，保证「列表里看得到」和「记忆里读得到」口径一致。
+    """
+    try:
+        raw = load_user_map().get(app_id, {}).get("group", {})
+    except Exception:
+        return False
+    if isinstance(raw, list):
+        return group_id in raw
+    if isinstance(raw, dict):
+        return group_id in raw
+    return False
+
+
+def _user_owned_by(app_id: str, user_id: str) -> bool:
+    """该私聊用户是否属于这个机器人（依据 user_map[app_id].user）。
+
+    兼容 user 为 dict（键即 openid）的旧结构，避免历史数据格式差异导致误判。
+    """
+    try:
+        raw = load_user_map().get(app_id, {}).get("user", [])
+    except Exception:
+        return False
+    if isinstance(raw, dict):
+        return user_id in raw
+    if isinstance(raw, list):
+        return user_id in raw
+    return False
+
+
+def _target_owned_by(app_id: str, target_type: str, target_id: str) -> bool:
+    """目标会话是否属于该机器人（按类型分派）。
+
+    与 tool.py 中同名函数同源同义：记忆接口与发送/唤醒接口共用同一套
+    归属口径，避免「记忆里看不到、却能往里发消息」这种不一致。
+    """
+    if not app_id or not target_id:
+        return False
+    if target_type == "c2c":
+        return _user_owned_by(app_id, target_id)
+    return _group_owned_by(app_id, target_id)
+
+
+def _memory_owner_app_id(request: web.Request, body: Optional[Dict] = None) -> str:
+    """取本次记忆操作归属的 app_id（用于 group/c2c 归属校验）。
+
+    _memory_precheck 已经解析并校验过 app_id，这里直接复用它的结果，
+    避免各处重新解析导致口径不一致（例如有的地方看 body、有的看 query）。
+    """
+    auth = request["auth"]
+    app_id = auth.get("app_id") or ""
+    if app_id:
+        return app_id
+    # 无密钥模式下 auth 不带 app_id，此时以请求参数为准（已被 precheck 校验过）
+    try:
+        body = body or request.get("json_body") or {}
+    except Exception:
+        body = {}
+    return str(body.get("app_id") or request.query.get("app_id") or "").strip()
+
+
+def _memory_check_ownership(app_id: str, level: str, identifier: str) -> Optional[web.Response]:
+    """校验记忆目标是否属于当前机器人（group / c2c / global / bot 四级全覆盖）。
+
+    为什么必须校验：group / c2c 记忆文件是**按 openid 全局存放**的
+    （qun_memory/<gid>.json、c2c_memory/<uid>.json），文件本身不记 app_id。
+    若不校验，任何一个机器人（或持有该机器人密钥的调用方）只要知道 openid，
+    就能读写别的机器人的群/私聊记忆 —— 越权且会串数据。
+
+    global / bot 级同样要校验，且**必须按 identifier 而不是按 URL 上的 app_id**：
+    bot_memory/<app_id>.json 与 memory_<app_id>.json 都以 app_id 为文件名，
+    调用方完全可以传 app_id=<自己> 通过 _check_cross_allowed，
+    再用 identifier=<他人 app_id> 把读取目标指向别人的记忆文件。
+    因此这里比对的是 identifier 本身。
+    """
+    if level == "group":
+        if not _group_owned_by(app_id, identifier):
+            return fail(f"群 {identifier} 不属于机器人 {app_id}（无本地记录，请先同步该群）", 403)
+    elif level == "c2c":
+        if not _user_owned_by(app_id, identifier):
+            return fail(f"用户 {identifier} 不属于机器人 {app_id}（无本地记录，请先与该用户私聊）", 403)
+    elif level in ("global", "bot"):
+        # identifier 即目标 app_id。global 记忆还受 ISOLATE_GLOBAL_MEMORY 影响，
+        # 这里只做「不得指向其它机器人」的归属判定，不改变隔离语义。
+        if identifier and identifier != app_id:
+            # 目标机器人必须存在，避免把「写错 app_id」与「越权」混为一谈
+            known = any(b.get("APP_ID") == identifier for b in get_bots())
+            if known:
+                return fail(
+                    f"权限不足：identifier（{identifier}）指向其它机器人的 {level} 记忆，"
+                    f"本请求的 app_id 为 {app_id}", 403)
+            return fail(f"未知的机器人 app_id：{identifier}", 400)
+    return None
+
+
+def _memory_check_item_ownership(app_id: str, item: Any) -> Optional[str]:
+    """批量操作用：校验单个 item 的归属，越权时返回错误文案，正常返回 None。
+
+    批量条目的 level/identifier 是调用方逐条给的，所以必须逐条校验 ——
+    否则「批量」就成了绕过单条校验的后门。
+    """
+    if not isinstance(item, dict):
+        return None                      # 结构错误交给底层统一报
+    lv = str(item.get("level") or "").strip().lower()
+    if lv not in ("group", "c2c"):
+        return None
+    ident = str(item.get("identifier") or item.get("group_id")
+                or item.get("c2c_user_id") or "").strip()
+    if not ident:
+        return None                      # 缺 identifier 由底层报「缺少」
+    e = _memory_check_ownership(app_id, lv, ident)
+    return None if e is None else f"{lv}({ident}) 不属于机器人 {app_id}"
+
+
 async def h_memory_list(request: web.Request) -> web.Response:
     """读取某级记忆：GET /api/memory/list?level=&identifier=[&app_id=]
 
@@ -2291,6 +2530,8 @@ async def h_memory_list(request: web.Request) -> web.Response:
     identifier = _memory_pick_identifier(body, request, level)
     if not identifier:
         return fail(f"缺少 identifier（{level} 级记忆需填{_memory_ident_hint(level)}）")
+    if (e := _memory_check_ownership(_memory_owner_app_id(request, body), level, identifier)):
+        return e
 
     try:
         mem_list, enabled = _memory_get(level, identifier)
@@ -2327,6 +2568,11 @@ async def h_memory_add(request: web.Request) -> web.Response:
 
     items = body.get("items")
     if isinstance(items, list):
+        owner = _memory_owner_app_id(request, body)
+        # 逐条校验归属：「批量」不能成为绕过单条校验的后门
+        unauthorized = [x for x in (_memory_check_item_ownership(owner, it) for it in items) if x]
+        if unauthorized:
+            return fail("批量中存在不属于当前机器人的目标：" + "；".join(unauthorized[:5]), 403)
         res = _memory_batch("add", items)
         return ok({
             "mode": "batch",
@@ -2346,6 +2592,8 @@ async def h_memory_add(request: web.Request) -> web.Response:
         return fail(f"缺少 identifier（{level} 级记忆需填{_memory_ident_hint(level)}）")
     if not content.strip():
         return fail("缺少 content")
+    if (e := _memory_check_ownership(_memory_owner_app_id(request, body), level, identifier)):
+        return e
 
     try:
         _memory_add(level, identifier, content)
@@ -2373,6 +2621,10 @@ async def h_memory_update(request: web.Request) -> web.Response:
 
     items = body.get("items")
     if isinstance(items, list):
+        owner = _memory_owner_app_id(request, body)
+        unauthorized = [x for x in (_memory_check_item_ownership(owner, it) for it in items) if x]
+        if unauthorized:
+            return fail("批量中存在不属于当前机器人的目标：" + "；".join(unauthorized[:5]), 403)
         res = _memory_batch("update", items)
         return ok({
             "mode": "batch",
@@ -2395,6 +2647,8 @@ async def h_memory_update(request: web.Request) -> web.Response:
     content = str(body.get("content") or "")
     if not content.strip():
         return fail("缺少 content")
+    if (e := _memory_check_ownership(_memory_owner_app_id(request, body), level, identifier)):
+        return e
 
     try:
         done = _memory_replace(level, identifier, index, content)
@@ -2423,6 +2677,10 @@ async def h_memory_delete(request: web.Request) -> web.Response:
 
     items = body.get("items")
     if isinstance(items, list):
+        owner = _memory_owner_app_id(request, body)
+        unauthorized = [x for x in (_memory_check_item_ownership(owner, it) for it in items) if x]
+        if unauthorized:
+            return fail("批量中存在不属于当前机器人的目标：" + "；".join(unauthorized[:5]), 403)
         res = _memory_batch("delete", items)
         return ok({
             "mode": "batch",
@@ -2442,6 +2700,8 @@ async def h_memory_delete(request: web.Request) -> web.Response:
     index = body.get("index")
     if index is None:
         return fail("缺少 index")
+    if (e := _memory_check_ownership(_memory_owner_app_id(request, body), level, identifier)):
+        return e
 
     try:
         done = _memory_remove(level, identifier, index)
@@ -2473,6 +2733,8 @@ async def h_memory_toggle(request: web.Request) -> web.Response:
     identifier = _memory_pick_identifier(body, request, level)
     if not identifier:
         return fail(f"缺少 identifier（{level} 级记忆需填{_memory_ident_hint(level)}）")
+    if (e := _memory_check_ownership(_memory_owner_app_id(request, body), level, identifier)):
+        return e
 
     raw = body.get("enabled")
     if raw is None:
@@ -2545,6 +2807,19 @@ async def h_memory_search(request: web.Request) -> web.Response:
     search_group_id = group_id or (identifier if level == "group" else "") or None
     search_c2c_id = c2c_id or (identifier if level == "c2c" else "") or None
 
+    # 归属校验：搜索同样能读出记忆内容，不校验就等于用搜索绕过 list 的限制
+    if search_group_id and level in ("group", "all"):
+        if (e := _memory_check_ownership(app_id, "group", search_group_id)):
+            return e
+    if search_c2c_id and level in ("c2c", "all"):
+        if (e := _memory_check_ownership(app_id, "c2c", search_c2c_id)):
+            return e
+    # global / bot 级：identifier 可能被用来指向别的机器人的记忆文件
+    # （search_app_id 在 2672 行取自 identifier），必须一并校验。
+    if level in ("global", "bot", "all"):
+        if (e := _memory_check_ownership(app_id, "global", search_app_id)):
+            return e
+
     try:
         text = search_memory(
             keywords=keywords,
@@ -2592,7 +2867,137 @@ async def h_memory_search(request: web.Request) -> web.Response:
     })
 
 
-# ==================== 10. 服务信息 ====================
+# ==================== 10. 日志读取 ====================
+async def h_logs(request: web.Request) -> web.Response:
+    """读取日志：GET /api/logs[?lines=200][&keyword=][&level=][&app_id=][&reverse=1]
+
+    对应日志文件（config 的 log_file，默认 log.txt），由 log.py 的
+    LineRotatingFileSink 单文件滚动写入，超过 max_log_length 行会裁掉头部旧行。
+
+    参数：
+      lines    返回末尾多少**条**日志（默认 200，上限 5000）。日志文件可能几十万条，
+               一次全返会撑爆响应，所以默认只给尾部。
+               注意单位是「条」而不是物理行：一条日志的正文里可能含换行
+               （多行堆栈等），按行返回会把一条拆成好几项。
+      keyword  子串过滤（不区分大小写）。先过滤再取尾部 —— 与 /api/history 的
+               keyword 语义一致：过滤结果里取最后 N 行，而不是"最后 N 行里再过滤"
+               （后者在关键词稀疏时会频繁返回空）。
+      level    按日志等级过滤（INFO / WARNING / ERROR 等，不区分大小写）。
+      reverse  1=按时间倒序（最新在前），便于直接看最近发生了什么。
+      app_id   日志是全机器人共写的单文件，可用它筛出某个机器人相关的行
+               （按 [appid=xxx 前缀匹配）。不传则返回全部。
+               权限：全局密钥可读全部；机器人密钥**只能读自己** —— 传别人的
+               app_id 会被 403 拒绝，不传也会被强制收窄到自己。
+
+    响应里的 unlimited=true 表示 config 的 max_log_length <= 0（不限制文件大小，
+    只追加不裁剪）；此时 total 会随运行持续增长。
+
+    响应只返回日志的**文件名**（file_name），不返回完整路径 ——
+    路径会暴露服务端的目录结构，而调用方通常只需要知道"日志在哪个文件"。
+    """
+    if (e := _reject_unknown_params(request, "/api/logs", {})):
+        return e
+
+    try:
+        lines = int(request.query.get("lines") or 200)
+    except (TypeError, ValueError):
+        return fail("lines 必须是整数")
+    if lines <= 0:
+        return fail("lines 必须大于 0")
+    lines = min(lines, 5000)             # 上限，避免一次拉爆响应体
+
+    keyword = (request.query.get("keyword") or "").strip().lower()
+    level = (request.query.get("level") or "").strip().upper()
+    app_id = (request.query.get("app_id") or "").strip()
+    reverse = (request.query.get("reverse") or "").strip().lower() in ("1", "true", "yes", "on")
+
+    # ---------- 权限：日志是「全体机器人共写一个文件」，必须显式收口 ----------
+    # 本接口没有一个天然的 app_id 归属（不像 /api/history 有 target_id），
+    # 所以不能套用 _resolve_app_id 那套「机器人只看自己」的逻辑，
+    # 而要按角色区分：
+    #   全局密钥：日志本来就是给它做运维排查的，可读全部，并可用 app_id 过滤
+    #   机器人密钥：只能读自己相关的行。若允许读全量，等于任何一个机器人
+    #               都能看到别的机器人的群 openid、私聊内容、用户昵称 —— 越权。
+    auth = request["auth"]
+    if auth["role"] == ROLE_BOT:
+        own = auth["app_id"] or ""
+        if app_id and app_id != own:
+            return fail(f"权限不足：本密钥只能查看机器人 {own} 的日志", 403)
+        # 即使不传 app_id，也强制只看自己的行（而不是返回全量）
+        app_id = own
+
+    log_file = get_log_file()
+    # 只对外暴露文件名，不返回完整路径：
+    # 路径会泄露服务端的目录结构（如 D:\dsh-workspace\...），
+    # 调用方真正需要的只是"日志存在哪个文件"，文件名就够了。
+    log_name = os.path.basename(log_file)
+    _max_len = get_max_log_length()
+    # max_log_length <= 0 表示不限制文件大小：显式给出布尔值，
+    # 免得调用方看到 max_log_length=0 误以为"一行都不留"
+    _unlimited = _max_len <= 0
+    if not os.path.exists(log_file):
+        # 文件不存在不算错误：可能是 enable_log=0（只输出控制台）或还没写过日志
+        return ok({
+            "file_name": log_name,
+            "exists": False,
+            "enabled": bool(get_enable_log()),
+            "app_id": app_id or None,
+            "total": 0, "matched": 0, "returned": 0,
+            "max_log_length": _max_len,
+            "unlimited": _unlimited,
+            "lines": [],
+            "hint": "日志文件不存在：请检查配置 enable_log 是否为 1（为 0 时只输出控制台，不写文件）",
+        })
+
+    try:
+        with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except Exception as ex:
+        return fail(f"读取日志失败: {ex}", 500)
+
+    # 按「日志条」而不是物理行处理：一条日志的正文里可能含换行
+    # （多行堆栈、模型返回的整段文本），按行切会把它拆成好几条，
+    # 前端无法还原，lines 的语义也会和 max_log_length 对不上。
+    # 复用 log.py 的切分器，保证「写入端怎么算一条」和「读取端怎么算一条」一致。
+    entries = _split_log_entries(content)
+    total = len(entries)
+
+    def _keep(entry: str) -> bool:
+        low = entry.lower()
+        if keyword and keyword not in low:
+            return False
+        # 等级匹配：只看该条日志的头部（"时间 | LEVEL | ..."），
+        # 避免正文里恰好出现 "ERROR" 字样被误命中
+        head = entry.split("\n", 1)[0].upper()
+        if level and f"| {level}" not in head:
+            return False
+        if app_id and f"[appid={app_id}" not in entry:
+            return False
+        return True
+
+    matched = [e.rstrip("\n") for e in entries if _keep(e)]
+    tail = matched[-lines:]
+    if reverse:
+        tail = list(reversed(tail))
+
+    return ok({
+        "file_name": log_name,
+        "exists": True,
+        "enabled": bool(get_enable_log()),
+        "level": get_log_level(),
+        # 实际生效的 app_id 过滤：机器人密钥通道下它会被强制收窄为自己，
+        # 回显出来调用方才能确认「我到底看的是谁的日志」
+        "app_id": app_id or None,
+        "total": total,                  # 文件总条数
+        "matched": len(matched),         # 过滤后条数
+        "returned": len(tail),           # 实际返回条数
+        "max_log_length": _max_len,
+        "unlimited": _unlimited,         # true = 不限制文件大小（max_log_length <= 0）
+        "lines": tail,
+    })
+
+
+# ==================== 11. 服务信息 ====================
 async def h_root(request: web.Request) -> web.Response:
     """根路径：无需鉴权的服务信息"""
     return ok({
@@ -2628,7 +3033,21 @@ async def h_root(request: web.Request) -> web.Response:
             "POST /api/memory/delete",
             "POST /api/memory/toggle",
             "GET  /api/memory/search",
+            "GET  /api/logs",
         ],
+        "logs_api": {
+            "note": "读取日志文件（config 的 log_file，与 log.py 写入端同源）",
+            "params": {
+                "lines": "返回末尾多少条日志，默认 200，上限 5000（按「条」不按物理行）",
+                "keyword": "子串过滤（不区分大小写）；先过滤再取尾部",
+                "level": "按等级过滤，如 INFO / WARNING / ERROR",
+                "app_id": "只看某个机器人相关的行（匹配 [appid=xxx 前缀）",
+                "reverse": "1=最新在前",
+            },
+            "permission": "全局密钥可读全部；机器人密钥只能读自己的日志",
+            "unlimited": "config 的 max_log_length <= 0 时不限制文件大小，响应里 unlimited=true",
+            "file_name": "只返回日志文件名，不返回完整路径（不暴露服务端目录结构）",
+        },
         "memory_api": {
             "note": "记忆管理接口，与机器人工具 view_memory / add_memory / modify_memory / "
                     "delete_memory / enable_memory / disable_memory / search_memory 共用同一套底层函数",
@@ -2691,7 +3110,29 @@ async def h_health(request: web.Request) -> web.Response:
 
 
 async def h_info(request: web.Request) -> web.Response:
-    """服务与开关状态（无需鉴权，但不泄露密钥内容）"""
+    """服务与开关状态。
+
+    ★ LOW 修复：本接口在中间件里被列为免鉴权路径（原意是给前端探活），
+      但它返回了**全部机器人的 app_id、绑定地址、以及各密钥有无**。
+      在无密钥模式下等于对任何人开放一份完整的资产清单 ——
+      app_id 本身不是秘密，但「有哪些机器人、哪个开了 API」是攻击者
+      最想要的第一步侦察信息（配合 C1 的无鉴权状态可直接逐个调用）。
+
+      现在按调用方身份分级返回：
+        - 已通过鉴权：维持原样（运维/管理页需要这些信息）
+        - 未鉴权：只给「服务是否存活 + 版本」，不含任何机器人标识与绑定地址
+      前端探活只需 ok=true，不受影响。
+    """
+    auth = request.get("auth")
+
+    if not auth:
+        # 未鉴权：最小可用信息
+        return ok({
+            "service": "dsh-qqbot-api",
+            "alive": True,
+            "authenticated": False,
+        })
+
     bots = []
     for b in get_bots():
         aid = b.get("APP_ID", "")
@@ -2701,6 +3142,9 @@ async def h_info(request: web.Request) -> web.Response:
             "has_keys": len(get_bot_api_keys(aid)) > 0,
         })
     return ok({
+        "service": "dsh-qqbot-api",
+        "alive": True,
+        "authenticated": True,
         "global_api_enabled": get_global_api_enabled(),
         "global_has_keys": len(get_global_api_keys()) > 0,
         "bind": f"{get_api_bind_host()}:{get_api_bind_port()}",
@@ -2961,7 +3405,7 @@ async def h_config_list(request: web.Request) -> web.Response:
        · APP_SECRET 等凭证字段：值以 **** 返回，且二次标记 sensitive（禁止写入）
        · APP_ID：正常显示真实值（它是标识符不是密钥），仅禁止改写
        · API_KEYS 等密钥数组：脱敏为 ["****", ...]，保留元素个数
-       · GROUP_MANAGE_WHITELIST 等普通数组：完整返回真实内容
+       · 其余普通数组：完整返回真实内容
 
     scope=global（默认）—— 列出顶层配置项
        · 跳过 bots 数组（用 scope=bot&app_id=... 单独查看，避免把全部凭证铺开）
@@ -3102,6 +3546,9 @@ def create_app() -> web.Application:
         web.post("/api/memory/delete", h_memory_delete),
         web.post("/api/memory/toggle", h_memory_toggle),
         web.get("/api/memory/search", h_memory_search),
+
+        # 日志读取（读 config 的 log_file，与 log.py 写入端同源）
+        web.get("/api/logs", h_logs),
     ])
     return app
 

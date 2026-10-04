@@ -18,6 +18,49 @@ from utils import infer_file_type, needs_dual_send
 # 见 ws 接收循环：消息处理改为 create_task 派发，不再阻塞收包。
 _message_tasks: set = set()
 
+# 长期后台任务（心跳等）的强引用集合。
+# create_task 的返回值若不持有，任务可能在运行中被 GC 回收 —— 心跳一旦
+# 被回收，连接就不会再发 op=1，服务端会在心跳超时后判定掉线并断开。
+_background_tasks: set = set()
+
+
+def _spawn_background(coro, name: str, ctx=None):
+    """把协程派发为长期后台任务，并持有强引用直到它结束。
+
+    与 _message_tasks 分开管理：那些是短命的消息处理任务，这些是随连接
+    存活的常驻任务。两者都用 add_done_callback 在结束时移除引用，
+    同时**读取一次异常** —— 只 discard 而不取异常，任务内的报错会以
+    "Task exception was never retrieved" 的形式丢到 stderr，
+    既不进日志也不易排查。
+    """
+    task = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
+
+    def _done(t: asyncio.Task):
+        _background_tasks.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            error(f"[后台任务 {name}] 异常退出: {type(exc).__name__}: {exc}", ctx=ctx)
+
+    task.add_done_callback(_done)
+    return task
+
+
+def _log_message_task_result(t: asyncio.Task):
+    """消息处理任务结束时的回调：释放引用 + 取出异常写进日志。
+
+    取消（CancelledError）是正常路径 —— 同会话新消息到达时会取消上一条的
+    处理任务，因此不算错误、不记 error。
+    """
+    _message_tasks.discard(t)
+    if t.cancelled():
+        return
+    exc = t.exception()
+    if exc is not None:
+        error(f"[处理消息错误] 任务异常退出: {type(exc).__name__}: {exc}", ctx=None)
+
 
 # ==================== BotClient：Token 管理 & QQ API 调用 ====================
 class BotClient:
@@ -71,6 +114,23 @@ class BotClient:
         resp.raise_for_status()
         return resp.json()["url"]
 
+    # ========== 异步包装（避免阻塞事件循环） ==========
+    # get_access_token / get_websocket_url 内部用的是**同步 requests**，
+    # 直接从协程里调用会把整个事件循环卡住（本项目所有机器人在同一个
+    # 循环上跑）：取 token 与取网关地址都是跨公网请求，一旦网络抖动，
+    # 期间所有机器人的收包、定时任务、API 请求全部停摆。
+    # 因此协程路径一律改用下面两个包装 —— 把阻塞调用丢进
+    # config._executor 线程池，与项目里其它 requests 调用保持一致。
+    async def get_access_token_async(self, force_refresh: bool = False) -> str:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            get_executor(), lambda: self.get_access_token(force_refresh)
+        )
+
+    async def get_websocket_url_async(self) -> str:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(get_executor(), self.get_websocket_url)
+
     # ========== 媒体上传（仅支持 URL 直接上传） ==========
     async def upload_media_by_url(self, msg_type: str, recipient_id: str,
                                   source: str, file_type: Optional[int] = None,
@@ -91,7 +151,7 @@ class BotClient:
         if file_type is None:
             file_type = infer_file_type(file_name, source)
 
-        token = self.get_access_token()
+        token = await self.get_access_token_async()
         endpoint = "users" if msg_type == "c2c" else "groups"
         url = f"https://api.sgroup.qq.com/v2/{endpoint}/{recipient_id}/files"
         headers = {
@@ -228,7 +288,7 @@ class BotClient:
         media_obj = {"file_info": file_info} if is_media_msg else None
 
         for attempt in range(max_retries):
-            token = self.get_access_token()
+            token = await self.get_access_token_async()
             if msg_type == "c2c":
                 url = f"https://api.sgroup.qq.com/v2/users/{recipient_id}/messages"
             else:
@@ -293,7 +353,9 @@ class BotClient:
                     error(f"[Reply Error] 尝试 {attempt+1}/{max_retries} 失败，状态码 {resp.status_code}, 响应: {resp.text[:200]}", ctx=ctx)
                     if resp.status_code in (401, 500):
                         warn("[Reply] 强制刷新 Token", ctx=ctx)
-                        self.get_access_token(force_refresh=True)
+                        # 必须用 async 包装：这是跨公网请求，同步调用会
+                        # 在重试路径上卡住整个事件循环（所有机器人共用）
+                        await self.get_access_token_async(force_refresh=True)
                         continue
                     if attempt < max_retries - 1:
                         await asyncio.sleep(2 ** attempt)
@@ -344,7 +406,7 @@ class BotClient:
         # 日志标识：app_id + 会话（msg_type=group_xxx / c2c_xxx）
         ctx = LogCtx(app_id=self.app_id,
                      thread_key=f"{'c2c' if msg_type == 'c2c' else 'group'}_{recipient_id}")
-        token = self.get_access_token()
+        token = await self.get_access_token_async()
         if msg_type == "c2c":
             url = f"https://api.sgroup.qq.com/v2/users/{recipient_id}/messages/{message_id}"
         else:
@@ -371,7 +433,7 @@ class BotClient:
     # ========== 群禁言相关 API ==========
     async def get_group_mute_status(self, group_openid: str) -> Optional[Dict]:
         ctx = LogCtx(app_id=self.app_id, thread_key=f"group_{group_openid}")
-        token = self.get_access_token()
+        token = await self.get_access_token_async()
         url = f"https://api.sgroup.qq.com/v2/groups/{group_openid}/restrict_chat_setting"
         headers = {"Authorization": f"QQBot {token}"}
         loop = asyncio.get_event_loop()
@@ -396,7 +458,7 @@ class BotClient:
         返回: {"group_openid": "...", "group_name": "...", ...} 或 None
         """
         ctx = LogCtx(app_id=self.app_id, thread_key=f"group_{group_openid}")
-        token = self.get_access_token()
+        token = await self.get_access_token_async()
         url = f"https://api.sgroup.qq.com/v2/groups/{group_openid}/info"
         headers = {"Authorization": f"QQBot {token}"}
         loop = asyncio.get_event_loop()
@@ -423,7 +485,7 @@ class BotClient:
         返回: 包含 member_role, allow_proactive_msg, recv_msg_setting 等
         """
         ctx = LogCtx(app_id=self.app_id, thread_key=f"group_{group_openid}")
-        token = self.get_access_token()
+        token = await self.get_access_token_async()
         url = f"https://api.sgroup.qq.com/v2/groups/{group_openid}/bot_state"
         headers = {"Authorization": f"QQBot {token}"}
         loop = asyncio.get_event_loop()
@@ -446,7 +508,7 @@ class BotClient:
     async def set_group_mute(self, group_openid: str, op: str, member_openid: str,
                              mute_expire_at: str = "") -> Tuple[bool, int]:
         ctx = LogCtx(app_id=self.app_id, thread_key=f"group_{group_openid}")
-        token = self.get_access_token()
+        token = await self.get_access_token_async()
         url = f"https://api.sgroup.qq.com/v2/groups/{group_openid}/restrict_chat_setting"
         headers = {
             "Authorization": f"QQBot {token}",
@@ -493,7 +555,9 @@ async def main_connection(bot_client: BotClient):
     ctx = LogCtx(app_id=bot_client.app_id)
 
     info(f"[启动] 机器人 {bot_client.app_id} 开始连接...", ctx=ctx)
-    ws_url = bot_client.get_websocket_url()
+    # 用 async 包装：内部是同步 requests 的跨公网请求，直接调用会卡住
+    # 整个事件循环（所有机器人在同一个循环上）
+    ws_url = await bot_client.get_websocket_url_async()
     info(f"[启动] 地址: {ws_url}", ctx=ctx)
 
     async with websockets.connect(ws_url) as ws:
@@ -502,7 +566,7 @@ async def main_connection(bot_client: BotClient):
         debug(f"[收到 Hello] {hello}", ctx=ctx)
         heartbeat_interval = hello_data.get("d", {}).get("heartbeat_interval", 30000) / 1000.0
 
-        token = bot_client.get_access_token()
+        token = await bot_client.get_access_token_async()
         identify = {
             "op": 2,
             "d": {
@@ -555,7 +619,7 @@ async def main_connection(bot_client: BotClient):
                     await ws.close()
                     break
 
-        asyncio.create_task(heartbeat())
+        _spawn_background(heartbeat(), f"heartbeat-{bot_client.app_id}", ctx=ctx)
         info("[监听] 开始接收消息...", ctx=ctx)
 
         async for raw in ws:
@@ -583,7 +647,11 @@ async def main_connection(bot_client: BotClient):
                             #     负责同一会话的串行与合并，不同会话互不影响。
                             task = asyncio.create_task(handle_message(data, bot_client))
                             _message_tasks.add(task)
-                            task.add_done_callback(_message_tasks.discard)
+                            # 结束时移除引用，并读一次异常：
+                            # 只 discard 不取异常的话，handle_message 里的报错
+                            # 只会以 "Task exception was never retrieved" 落到
+                            # stderr，不进日志，事后无从排查。
+                            task.add_done_callback(_log_message_task_result)
                     elif t in ("GROUP_JOIN_REQUEST", "GROUP_MEMBER_ADD", "GROUP_MEMBER_REMOVE"):
                         await handle_event(data, bot_client)
                     else:

@@ -3,11 +3,12 @@
 import json
 import uuid
 import asyncio
+from utils import atomic_write_json
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 
-from log import info, warn, error, LogCtx
+from log import info, warn, error, debug, LogCtx
 from config import BASE_DIR, get_bots, get_bot_allow_manage_all_push, \
     get_bot_allow_cross_wakeup, get_bot_allow_cross_wakeup_incoming, \
     get_bot_disable_ai_reply
@@ -23,7 +24,7 @@ CHECK_INTERVAL = 5  # 秒，后台检查周期
 from task_core import (  # noqa: E402
     VALID_SCHEDULE_TYPES, WAKEUP_UPDATE_FIELDS,
     norm_schedule_type, apply_wakeup_updates,
-    TASK_STATUSES, task_status_of,
+    TASK_STATUSES, task_status_of, task_status_of_raw,
 )
 
 # ==================== 存储 ====================
@@ -42,7 +43,9 @@ def load_wakeups() -> List[Dict]:
                 t["targets"] = [t.pop("target")]
                 needs_save = True
             # 迁移旧版状态拼写（active -> pending 等）到规范值，一次性写回
-            norm = task_status_of(t)
+            # 必须用 task_status_of_raw：task_status_of 对周期任务会返回
+            # last_run_status，拿它回写会把 status 覆盖成上次的执行结果。
+            norm = task_status_of_raw(t)
             if t.get("status") != norm and norm in TASK_STATUSES:
                 t["status"] = norm
                 needs_save = True
@@ -56,13 +59,67 @@ def load_wakeups() -> List[Dict]:
 
 
 def save_wakeups(tasks: List[Dict]):
-    """保存所有定时唤醒任务"""
+    """保存所有定时唤醒任务（整表覆盖）。
+
+    ★ 仅供「同一次同步读改写内」的调用方使用（add_wakeup / update_wakeup /
+      delete_wakeup 等）：它们 load 后立刻改、立刻 save，中间无 await，
+      不存在覆盖他人写入的窗口。
+
+      调度器的执行循环**不能**用这个函数 —— 它跨越 await 持有分钟级旧快照
+      （execute_wakeup 内部会调 AI 并发送消息），整表写回会抹掉期间新建/修改
+      的唤醒任务，请改用 merge_wakeup_updates。
+    """
     try:
-        WAKEUP_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(WAKEUP_FILE, "w", encoding="utf-8") as f:
-            json.dump(tasks, f, ensure_ascii=False, indent=2)
+        # 原子写：理由同 scheduler.save_tasks（截断式写入会毁掉整个文件）
+        atomic_write_json(WAKEUP_FILE, tasks)
+        return True
     except Exception as e:
         error(f"[唤醒调度] 保存定时唤醒文件失败: {e}", ctx=None)
+        return False
+
+
+def merge_wakeup_updates(updates: Dict[str, Dict], removed_ids=None):
+    """把执行结果**定点合并**回磁盘，而不是整表覆盖。
+
+    与 scheduler.merge_task_updates 同构，原因见那里的说明：调度循环在开头
+    load_wakeups() 读快照，随后 await execute_wakeup(...)（内含整轮 AI 生成
+    与发送，可达数十秒）。窗口期内 API/AI 工具新建或修改的唤醒任务，若被
+    结束时的旧快照整表覆盖就会**静默消失**（接口却已返回 200 和 task_id）。
+
+    这里以磁盘现状为基准，只覆盖本次实际执行的 task_id 的指定字段：
+    磁盘新增的保留、已删除的不复活、用户刚改的其它字段不回滚。
+
+    updates:     {task_id: {字段: 新值}}
+    removed_ids: 本次执行后应移除的 task_id 集合
+    """
+    try:
+        fresh = load_wakeups()
+    except Exception as e:
+        error(f"[唤醒调度] 合并唤醒状态前读取失败，放弃本次写入: {e}", ctx=None)
+        return False
+
+    if removed_ids:
+        removed_ids = set(removed_ids)
+        fresh = [t for t in fresh if t.get("task_id") not in removed_ids]
+
+    changed = 0
+    for t in fresh:
+        upd = updates.get(t.get("task_id"))
+        if not upd:
+            continue
+        for k, v in upd.items():
+            if t.get(k) != v:
+                t[k] = v
+                changed += 1
+
+    try:
+        atomic_write_json(WAKEUP_FILE, fresh)
+        debug(f"[唤醒调度] 已合并 {len(updates)} 个任务的执行状态（{changed} 处变更）",
+              ctx=None)
+        return True
+    except Exception as e:
+        error(f"[唤醒调度] 合并写入定时唤醒文件失败: {e}", ctx=None)
+        return False
 
 
 # ==================== 工具函数 ====================
@@ -177,24 +234,25 @@ def update_wakeup(task_id: str, caller_app_id: str, updates: Dict) -> Tuple[bool
 
 def list_wakeups(caller_app_id: str) -> List[Dict]:
     """列出当前机器人可见的定时唤醒任务。
-    可见规则：
-    - 自己的任务始终可见
-    - 其他机器人的任务：需要同时满足 caller 的 ALLOW_CROSS_BOT_WAKEUP=1 和对方的 ALLOW_CROSS_BOT_WAKEUP_INCOMING=1
-    - ALLOW_MANAGE_ALL_PUSH=1 可见所有
+
+    可见规则与 scheduler.list_tasks 完全一致（两处必须同步维护）：
+
+    · 全局密钥调用方用空 caller_app_id 表达 → 运维全量视图；
+    · 机器人密钥**一律只回自己的任务**，即使开了 ALLOW_MANAGE_ALL_PUSH=1
+      也不并入他人任务 —— 该开关管的是「能否对别人的任务执行管理动作」，
+      不是「能否读取别人的任务内容」。唤醒任务体含 targets（他人群/用户
+      openid）与 description，并入即泄露他人会话标识与内容；
+    · 对方 ALLOW_CROSS_BOT_WAKEUP_INCOMING=1 只表示「允许被唤醒」，
+      **不表示允许读取它的任务列表**，原先据此并入会在默认配置下泄露。
     """
     tasks = load_wakeups()
-    can_manage_all = get_bot_allow_manage_all_push(caller_app_id)
-    if can_manage_all:
+
+    # 全局密钥（无以归属的 caller）→ 运维全量视图
+    if not caller_app_id:
         return tasks
-    caller_can_wakeup = get_bot_allow_cross_wakeup(caller_app_id)
-    result = []
-    for t in tasks:
-        t_app_id = t.get("app_id", "")
-        if t_app_id == caller_app_id:
-            result.append(t)
-        elif caller_can_wakeup and get_bot_allow_cross_wakeup_incoming(t_app_id):
-            result.append(t)
-    return result
+
+    # 机器人密钥：只回自己的任务
+    return [t for t in tasks if t.get("app_id", "") == caller_app_id]
 
 
 # ==================== 唤醒执行 ====================
@@ -383,12 +441,15 @@ async def check_and_execute_wakeups():
     bot_cache: Dict[str, BotClient] = {}
 
     due = []
-    remaining = []
+
+    # 本循环只负责挑出「到期该执行」的任务（due）。
+    # 不再构建 remaining 列表 —— 它是旧版 save_wakeups(remaining) 整表覆盖的
+    # 残留：自从改为 merge_wakeup_updates 定点合并后，未到期任务的落盘状态一律
+    # 以磁盘现状为准，磁盘上的条目既不会被丢弃也不会被复活，无需再收集副本。
 
     for t in tasks:
         status = t.get("status", "pending")
         if status != "pending":
-            remaining.append(t)
             continue
 
         schedule_type = t.get("schedule_type", "one_time")
@@ -402,10 +463,6 @@ async def check_and_execute_wakeups():
             if sched and now >= sched:
                 info(f"[唤醒调度] 一次性任务 {task_id} 到期，准备执行", ctx=ctx)
                 due.append(t)
-                # 最终状态由下面的执行循环按实际结果写成 completed / failed
-                remaining.append(t)
-            else:
-                remaining.append(t)
 
         elif schedule_type == "daily":
             # 每天：首次按完整 schedule_time（含日期）触发，之后每天同一时分
@@ -425,11 +482,9 @@ async def check_and_execute_wakeups():
                     if not executed_today and now >= today_sched:
                         info(f"[唤醒调度] 每日任务 {task_id} 到期（每天 {today_sched.time()}），准备执行", ctx=ctx)
                         due.append(t)
-                remaining.append(t)
             else:
                 # schedule_time 无效，跳过
                 warn(f"[唤醒调度] 每日任务 {task_id} schedule_time 无效: {t.get('schedule_time')}", ctx=ctx)
-                remaining.append(t)
 
         elif schedule_type == "interval":
             # 间隔执行：检查距离上次执行是否已达到 interval_seconds
@@ -453,37 +508,47 @@ async def check_and_execute_wakeups():
                 elif now >= start_time:
                     info(f"[唤醒调度] 间隔任务 {task_id} 首次到期（{start_time}），准备执行", ctx=ctx)
                     due.append(t)
-                remaining.append(t)
             else:
                 next_time = last_time + timedelta(seconds=interval)
                 if now >= next_time:
                     info(f"[唤醒调度] 间隔任务 {task_id} 到期（上次 {last_time.isoformat()}，间隔 {interval}s），准备执行", ctx=ctx)
                     due.append(t)
-                remaining.append(t)
         else:
             warn(f"[唤醒调度] 任务 {task_id} 未知类型: {schedule_type}", ctx=ctx)
-            remaining.append(t)
 
     if not due:
         return
 
     info(f"[唤醒调度] 发现 {len(due)} 个待执行唤醒任务", ctx=None)
 
-    # 执行到期任务
+    # 执行到期任务。
+    # ★ 这里**不**写回开头读到的快照 —— execute_wakeup 内部会调 AI 并发送
+    #   消息（可达数十秒），期间 API/AI 工具可能已新建或修改唤醒任务。改为
+    #   把本次真正改动的字段收集起来，最后 merge_wakeup_updates 定点合并。
+    task_updates: Dict[str, Dict] = {}
     for t in due:
         now_iso = _now_bj_iso()
+        task_id = t.get("task_id")
+        schedule_type = t.get("schedule_type", "one_time")
         # 每个待执行任务的标识可能不同，循环内重新构造 ctx
         ctx = LogCtx(app_id=t.get("app_id", ""))
+        updates: Dict[str, Any] = {}
         try:
             target_results = await execute_wakeup(t, bot_cache)
             # 记录执行历史（含每个目标的成功/失败信息）
             history = t.setdefault("execution_history", [])
             success_count = sum(1 for r in target_results if r.get("ok"))
             fail_count = len(target_results) - success_count
-            # 只写规范状态：全部成功 = completed，其余一律 failed。
+            # 只写规范状态。三态判定（M10）：
+            #   全成功 → completed；有成功也有失败 → partial；全失败 → failed
             # 唤醒是直接拿返回值判定，不存在陈旧 result 问题；
             # 但仍要求至少有一个成功目标，避免「无目标」被算成完成。
-            overall = "completed" if (success_count > 0 and fail_count == 0) else "failed"
+            if success_count > 0 and fail_count == 0:
+                overall = "completed"
+            elif success_count > 0 and fail_count > 0:
+                overall = "partial"
+            else:
+                overall = "failed"
             history.append({
                 "time": now_iso,
                 "status": overall,
@@ -492,20 +557,43 @@ async def check_and_execute_wakeups():
                 "total": len(target_results),
                 "target_results": target_results,
             })
-            if len(history) > 3:
-                t["execution_history"] = history[-3:]
-            # 任务级状态跟随实际结果，否则失败任务永远停在初始值
-            t["status"] = overall
-            t["finished_at"] = now_iso
+            updates["execution_history"] = history[-3:]
+            # 周期性任务（daily/interval）执行后必须把 status 复位为 pending，
+            # 否则会永久停摆：上方 390 行的到期判定要求 status=="pending"，
+            # 一旦写成 completed/failed 就在下一轮被直接跳过，再也不唤醒 ——
+            # 表现为「每日唤醒跑了一次就没了」。
+            # 一次性任务（one_time）保持 overall，因为它本就只跑一次。
+            if schedule_type in ("daily", "interval"):
+                updates["status"] = "pending"
+            else:
+                updates["status"] = overall
+            # 最近一次执行结果单独留档，供列表展示与「执行失败」筛选使用
+            # （status 复位后不能再承载这个信息，故必须有独立字段）
+            updates["last_run_status"] = overall
+            updates["finished_at"] = now_iso
         except Exception as e:
-            error(f"[唤醒调度] 任务 {t.get('task_id')} 执行异常: {e}", ctx=ctx)
-            t.setdefault("execution_history", []).append({
+            error(f"[唤醒调度] 任务 {task_id} 执行异常: {e}", ctx=ctx)
+            hist = t.setdefault("execution_history", [])
+            hist.append({
                 "time": now_iso, "status": "failed", "error": str(e)[:100]
             })
-            t["status"] = "failed"
-            t["finished_at"] = now_iso
+            updates["execution_history"] = hist[-3:]
+            # 同成功路径：周期任务即便本轮异常也要复位，否则一次失败
+            # 就会让该唤醒任务此后永久不再执行
+            if schedule_type in ("daily", "interval"):
+                updates["status"] = "pending"
+            else:
+                updates["status"] = "failed"
+            updates["last_run_status"] = "failed"
+            updates["finished_at"] = now_iso
 
-    save_wakeups(remaining)
+        if task_id:
+            task_updates[task_id] = updates
+        else:
+            warn("[唤醒调度] 到期任务缺少 task_id，其执行结果无法回写", ctx=ctx)
+
+    # 定点合并回磁盘（磁盘上新增的任务保留，已删除的不复活）
+    merge_wakeup_updates(task_updates)
 
 
 async def wakeup_scheduler_loop():

@@ -25,6 +25,7 @@
 #     info("[发送] 完成", ctx=ctx, thread_display="某群")   # 临时覆盖显示名
 import sys
 import os
+import re
 import threading
 from dataclasses import dataclass, replace
 from typing import Optional
@@ -141,6 +142,27 @@ def _get_logger():
     return logger
 
 
+# 日志每条以「YYYY-MM-DD HH:mm:ss | LEVEL |」开头（见 setup_logger 的 fmt）。
+# 用它把文件内容切成「条」，而不是按 "\n" 切 —— 一条日志的 message 里
+# 可能含换行（多行堆栈、模型返回的整段文本），按行切会把它算成很多条。
+_LOG_ENTRY_START = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \|")
+
+
+def _split_log_entries(content: str) -> list:
+    """把日志文件内容切成一条条日志（每项含自己的换行）。
+
+    不属于任何「条」开头的零散行（例如手工写入的、或格式不符的旧行）
+    会挂到上一条后面，不会被丢弃。
+    """
+    entries = []
+    for line in content.splitlines(keepends=True):
+        if _LOG_ENTRY_START.match(line) or not entries:
+            entries.append(line)
+        else:
+            entries[-1] += line
+    return entries
+
+
 def _get_config_mtime() -> float:
     """获取 config.json 文件的最后修改时间，若文件不存在返回 0.0"""
     try:
@@ -208,29 +230,55 @@ def setup_logger():
 
         # 自定义 sink：单文件滚动，超过行数删除头顶旧行
         class LineRotatingFileSink:
+            """单文件滚动写入：超过 max_lines 行就裁掉头顶旧行。
+
+            max_lines <= 0 表示**不限制文件大小**（0 或负数都算）：
+            此时只追加、永不裁剪，日志会一直增长，请自行留意磁盘占用。
+            """
+
             def __init__(self, path: str, max_lines: int):
                 self.path = path
-                self.max_lines = max_lines
+                self.max_lines = int(max_lines or 0)
+
+            @property
+            def unlimited(self) -> bool:
+                """是否不限制大小（max_log_length <= 0）。"""
+                return self.max_lines <= 0
 
             def write(self, message):
                 # 追加写入
                 with open(self.path, "a", encoding="utf-8") as f:
                     f.write(message)
-                # 超出行数 → 裁掉头顶
-                if self.max_lines > 0:
+                # 超出行数 → 裁掉头顶；max_lines <= 0 时跳过（不限制大小）
+                if not self.unlimited:
                     self._trim()
 
             def _trim(self):
+                """按日志条数裁剪，保留最近的 max_lines 条。
+
+                按「条」而不是「物理行」计算：一条日志可能因为 message 里
+                自带换行而占多个物理行（多行堆栈、模型返回的文本等）。
+                若按物理行裁，含多行内容的日志会被严重低估 ——
+                配 100 条可能只留下十几条真实记录。
+                """
                 try:
                     with open(self.path, "r", encoding="utf-8") as f:
-                        lines = f.readlines()
-                    if len(lines) > self.max_lines:
+                        content = f.read()
+                    if not content:
+                        return
+                    # 每条日志以「时间戳 | 等级 |」开头，据此切分（不依赖 message 内容）
+                    entries = _split_log_entries(content)
+                    if len(entries) > self.max_lines:
                         with open(self.path, "w", encoding="utf-8") as f:
-                            f.writelines(lines[-self.max_lines:])
+                            f.write("".join(entries[-self.max_lines:]))
                 except Exception:
                     pass
 
-        fmt = "{time:YYYY-MM-DD HH:mm:ss} | {level:<5} | {name}:{function}:{line} - {message}\n"
+        # 格式串**不要**自带换行：loguru 给每个 sink 的 message 末尾已经补了 "\n"，
+        # 再写一个 "\n" 会让每条日志变成「正文 + 空行」两行。
+        # 后果（实测）：max_log_length 是按物理行裁剪的，于是上限实际被砍半 ——
+        # 配 100 只能留 50 条，配 10 只能留 5 条。
+        fmt = "{time:YYYY-MM-DD HH:mm:ss} | {level:<5} | {name}:{function}:{line} - {message}"
 
         _logger.add(
             LineRotatingFileSink(log_file, max_lines),
@@ -305,3 +353,40 @@ def error(msg, ctx=None, *args, **kwargs):
 def debug(msg, ctx=None, *args, **kwargs):
     """输出 DEBUG 级别日志（用法同 info）。"""
     _emit("debug", msg, ctx, *args, **kwargs)
+
+
+# ==================== 后台任务派发 ====================
+# 为什么放在 log.py：本模块被所有业务模块导入，且不反向依赖任何业务代码，
+# 因此可以安全地提供这个通用工具（utils.py 刻意零项目依赖、也无法写日志）。
+#
+# 解决两个隐患：
+#   1) `asyncio.create_task(...)` 的返回值不持有 → 任务可能在运行中被 GC
+#      回收，表现为「偶发地什么都没发生」，极难排查；
+#   2) 只靠 add_done_callback(set.discard) 释放引用 → 任务内的异常无人读取，
+#      只以 "Task exception was never retrieved" 落到 stderr，不进日志。
+_background_tasks = set()
+
+
+def spawn_background(coro, name: str = "bg", ctx=None):
+    """把协程派发为后台任务：持有强引用，并在结束时把异常写进日志。
+
+    用法：spawn_background(auto_manage_memory(tk, bot), "auto_manage_memory", ctx)
+
+    取消（CancelledError）视为正常结束，不记 error —— 同会话新消息到达时
+    取消上一条的后台处理是预期行为。
+    """
+    import asyncio
+
+    task = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
+
+    def _done(t):
+        _background_tasks.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            error(f"[后台任务 {name}] 异常退出: {type(exc).__name__}: {exc}", ctx=ctx)
+
+    task.add_done_callback(_done)
+    return task

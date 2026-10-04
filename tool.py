@@ -10,7 +10,7 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta, timezone
 
 from log import info, warn, error, debug, LogCtx
-from config import get_executor, is_group_manage_enabled, \
+from config import get_executor, \
     get_bot_allow_cross_push, get_bot_allow_cross_push_incoming, \
     get_bot_allow_manage_all_push, get_bots, \
     get_bot_allow_cross_wakeup, get_bot_allow_cross_wakeup_incoming, \
@@ -45,7 +45,15 @@ from memory import (
 )
 from scheduler import add_task, delete_task, update_task, list_tasks, load_tasks
 from wakeup_scheduler import add_wakeup, delete_wakeup, update_wakeup, list_wakeups
-from utils import infer_file_type, file_type_name, parse_message_type
+from utils import infer_file_type, file_type_name, parse_message_type, safe_exc_text
+
+# M9：timeout=0（模型请求"不限超时"）时实际使用的上限。
+# 见 execute_http_request 内说明：真正的无限等待会永久占用全局线程池的 worker。
+_HTTP_MAX_UNLIMITED_TIMEOUT = 120
+# M9：单次响应最大读取字节数。超出即停止读取，避免一个超大响应把内存吃光
+# （原先无条件 resp.text 全量读入，max_body_length 只截断**展示**，
+#  内存里已经完整放下了整个响应体）。
+_HTTP_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 # 两个「查看任务列表」工具支持的筛选参数（与下方 _filter_tasks 对应）
 _LIST_FILTER_KEYS = {
     "status", "keywords", "keyword", "q", "search", "match_all",
@@ -67,7 +75,45 @@ _LIST_FILTER_KEYS = {
 from task_core import (  # noqa: E402
     TASK_STATUSES, _TASK_STATUS_LABELS, _STATUS_CN, _LEGACY_STATUS,
     norm_task_status as _norm_task_status, task_status_of,
+    status_matches_filter as _status_matches_filter,
 )
+
+
+def _safe_int(value, default: int = 0) -> int:
+    """把模型给的参数安全转成 int（LOW：int() 转换未捕获）。
+
+    模型经常把布尔语义的开关传成字符串（"yes" / "true" / "是"），
+    直接 int("yes") 会抛 ValueError。此前只有 query_history 一处包了
+    try/except，confirm / dry_run 等同类转换没有 —— 模型传个 "yes"
+    就让整个工具调用以异常收场。
+
+    语义约定（对开关类参数尤其重要）：
+      - 数字字符串、int、float → 取整数值
+      - 真值词（yes/true/on/是/开/1）→ 1
+      - 假值词（no/false/off/否/关/0/空）→ 0
+      - 其它无法识别 → default（默认 0，即"最保守"的那一侧：
+        confirm 传错时不会误触发真删除）
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if isinstance(value, (int, float)):
+        try:
+            return int(value)
+        except (ValueError, OverflowError):
+            return default
+    s = str(value).strip().lower()
+    if not s:
+        return default
+    if s in ("yes", "true", "on", "是", "开", "y", "t"):
+        return 1
+    if s in ("no", "false", "off", "否", "关", "n", "f"):
+        return 0
+    try:
+        return int(float(s))     # 兼容 "1.0" / "3.7"
+    except (ValueError, TypeError, OverflowError):
+        return default
 
 
 def _split_multi(raw: Any) -> List[str]:
@@ -282,7 +328,11 @@ def _filter_tasks(tasks: List[Dict[str, Any]], params: Any,
         want_status = [s for s in want_status if not (s in seen_s or seen_s.add(s))]
         unknown = [s for s in want_status if s not in _TASK_STATUS_LABELS]
         valid = [s for s in want_status if s in _TASK_STATUS_LABELS]
-        out = [t for t in out if task_status_of(t) in valid] if valid else []
+        # 用 status_matches_filter 而不是 `in valid`：筛 failed 时要连
+        # partial（部分失败）一起带出来，否则「3 成功 7 失败」的批次
+        # 会从「执行失败」筛选里整个消失（M10）。
+        out = [t for t in out
+               if any(_status_matches_filter(task_status_of(t), w) for w in valid)] if valid else []
         meta["filters"]["status"] = valid
         if unknown:
             meta["filters"]["status_ignored"] = unknown
@@ -509,8 +559,13 @@ NETEASE_SEARCH_HEADERS = {
 }
 
 # ==================== 工具描述生成 ====================
-def get_tools_description(enable_group_manage: bool = False) -> str:
-    """返回工具描述文本，用于系统提示词，与工具定义保持一致。"""
+def get_tools_description() -> str:
+    """返回工具描述文本，用于系统提示词，与工具定义保持一致。
+
+    群管理工具始终下发（见 get_tools_definition 末尾的 tools.extend），
+    不再有过往的白名单开关 —— 原先的 enable_group_manage 形参从未被用于
+    任何判断，已在清理旧代码时一并移除。
+    """
     base_desc = (
         "你可以使用工具来完成任务：通过 http_request 发起任意网络请求获取信息；"
         "使用 send_media 发送图片、视频或文件（支持 HTTP/HTTPS URL ，系统会自动处理上传）。调用 send_media 时必须明确传入 file_type 与 file_name，不得省略；file_type 取值：1=图片（jpg/jpeg/png/gif/webp/bmp 等），2=视频（mp4/mov/mkv 等），3=语音（通用音频如 mp3/wav/ogg 填 3 或 4 都可以），4=文件（文档、压缩包等其余类型）；"
@@ -567,8 +622,8 @@ def get_tools_description(enable_group_manage: bool = False) -> str:
     return base_desc
 
 # ==================== 工具定义 ====================
-def get_tools_definition(enable_group_manage: bool = False) -> List[Dict]:
-    """返回可用工具定义，群管理工具仅在白名单群内启用"""
+def get_tools_definition() -> List[Dict]:
+    """返回可用工具定义。群管理工具始终包含（末尾 tools.extend）。"""
     tools = [
         {
             "type": "function",
@@ -1961,8 +2016,16 @@ async def execute_http_request(method: str, url: str, headers: Dict = None,
             "allow_redirects": allow_redirects,
         }
         # 超时：0 表示不限制，传 None 给 requests
+        #
+        # ★ M9：不再真的传 None。requests 在 timeout=None 时会**无限等待**，
+        #   而这个调用跑在全局唯一的 20 线程池里（config._executor，所有机器人
+        #   与所有网络调用共用）。只要有几个请求卡死，线程池被占满，此后
+        #   全项目所有 run_in_executor 调用（取 token、发消息、上传媒体、
+        #   其它 HTTP 工具）都会排队等待 → 机器人整体失去响应。
+        #   这里把「不限制」改为一个足够大的上限：语义上仍是"愿意等很久"，
+        #   但保证线程最终会归还。
         if timeout == 0:
-            kwargs["timeout"] = None
+            kwargs["timeout"] = _HTTP_MAX_UNLIMITED_TIMEOUT
         else:
             kwargs["timeout"] = timeout
 
@@ -1977,6 +2040,10 @@ async def execute_http_request(method: str, url: str, headers: Dict = None,
                 "http": proxy,
                 "https": proxy,
             }
+        # stream=True 配合下面的 iter_content 分块读取（M9）：
+        # 不设它时 requests 会在返回前就把整个响应体读进内存，
+        # 字节上限就形同虚设。
+        kwargs["stream"] = True
         resp = requests.request(method.upper(), url, **kwargs)
         return resp
 
@@ -1987,7 +2054,30 @@ async def execute_http_request(method: str, url: str, headers: Dict = None,
         status = resp.status_code
         resp_headers = dict(resp.headers)
 
-        content = resp.text
+        # 分块读取并限制总字节数（M9）：
+        # 之前直接 resp.text 会把整个响应体读进内存，max_body_length 只影响
+        # **展示**长度，内存里早已放下全部内容 —— 一个几百 MB 的响应足以
+        # 把进程撑爆。改用流式读取，超过上限即中断，同时保留已读部分。
+        content = ""
+        body_truncated = False
+        try:
+            chunks = []
+            total = 0
+            for chunk in resp.iter_content(chunk_size=65536, decode_unicode=False):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                chunks.append(chunk)
+                if total >= _HTTP_MAX_RESPONSE_BYTES:
+                    body_truncated = True
+                    break
+            raw = b"".join(chunks)
+            # 编码推断交给 requests（resp.encoding 通常由响应头给出）
+            content = raw.decode(resp.encoding or "utf-8", errors="replace")
+        except Exception:
+            # 流式读取失败（压缩流损坏等）→ 退回一次性读取
+            content = resp.text
+
         truncated = False
         if max_body_length != 0 and len(content) > max_body_length:
             content = content[:max_body_length]
@@ -2003,6 +2093,9 @@ async def execute_http_request(method: str, url: str, headers: Dict = None,
         result += f"响应体:\n{content}"
         if truncated:
             result += f"\n...（响应过长，已截断至{max_body_length}字符）"
+        if body_truncated:
+            result += (f"\n...（响应体超过 {_HTTP_MAX_RESPONSE_BYTES} 字节上限，"
+                       f"已停止读取）")
 
         info(f"[HTTP工具] 完成，状态码 {status}，响应长度 {len(content)}", ctx=ctx)
         return result
@@ -2010,9 +2103,9 @@ async def execute_http_request(method: str, url: str, headers: Dict = None,
         timeout_msg = f"HTTP请求超时（{timeout}秒）" if timeout != 0 else "HTTP请求超时（无限制超时仍有系统级超时）"
         return f"{timeout_msg}: {method} {url}"
     except requests.exceptions.ConnectionError as e:
-        return f"HTTP连接失败: {method} {url}\n错误: {e}"
+        return f"HTTP连接失败: {method} {url}\n错误: {safe_exc_text(e)}"
     except Exception as e:
-        return f"HTTP请求异常: {method} {url}\n错误: {type(e).__name__}: {e}"
+        return f"HTTP请求异常: {method} {url}\n错误: {safe_exc_text(e)}"
 
 # ==================== 跨机器人工具辅助函数 ====================
 def _ensure_bot_client(target_app_id: str, caller_client) -> tuple:
@@ -2054,6 +2147,91 @@ def _resolve_thread_and_target(target_type: str, target_id: str,
         raise ValueError("无法确定目标会话ID，请指定 target_id 或在当前会话中使用")
     thread_key = f"{'c2c' if t_type == 'c2c' else 'group'}_{t_id}"
     return thread_key, t_type, t_id
+
+
+# ==================== 目标会话归属校验 ====================
+# 为什么需要：跨机器人开关（ALLOW_CROSS_BOT_*）是**按机器人**的全局开关，
+# 不是按会话的。一旦开启，模型就能为任意 app_id 构造 BotClient，而
+# target_id 完全由模型给出、从不校验是否真属于那个机器人 —— 等于任何人
+# 都能借一个开启了跨机器人权限的「姐妹机器人」去操作别人名下的群和用户。
+#
+# history/*.json 的文件名只有 thread_key、不含 app_id（见 memory.save_history），
+# 因此不同机器人的同名会话还会共用同一份记录文件，越权读取后果尤其直接。
+#
+# 这里统一按 user_map[app_id] 的 group/user 名单判定归属，
+# 与 api_server._group_owned_by / _user_owned_by 同源，保证「列表里看得到」
+# 与「工具里操作得到」口径一致。
+
+def _group_owned_by(app_id: str, group_id: str) -> bool:
+    """该群是否属于这个机器人（依据 user_map[app_id].group）。"""
+    try:
+        raw = load_user_map().get(app_id, {}).get("group", {})
+    except Exception:
+        return False
+    if isinstance(raw, (list, dict)):
+        return group_id in raw
+    return False
+
+
+def _user_owned_by(app_id: str, user_id: str) -> bool:
+    """该私聊用户是否属于这个机器人（依据 user_map[app_id].user）。"""
+    try:
+        raw = load_user_map().get(app_id, {}).get("user", [])
+    except Exception:
+        return False
+    if isinstance(raw, (list, dict)):
+        return user_id in raw
+    return False
+
+
+def _target_owned_by(app_id: str, target_type: str, target_id: str) -> bool:
+    """目标会话是否属于该机器人（按类型分派）。"""
+    if not app_id or not target_id:
+        return False
+    if target_type == "c2c":
+        return _user_owned_by(app_id, target_id)
+    return _group_owned_by(app_id, target_id)
+
+
+def _check_cross_target_owned(target_app_id: str, target_type: str, target_id: str,
+                              op_name: str) -> Optional[str]:
+    """跨机器人操作前校验目标会话确实属于目标机器人。
+
+    返回错误文案（调用方应中止并回给模型），通过则返回 None。
+
+    为什么需要：ALLOW_CROSS_BOT_* 是**按机器人**的全局开关，一旦开启，
+    _ensure_bot_client 就会为任意 app_id 建出 BotClient，而 target_id 完全
+    由模型给出、原先从不校验归属 —— 等于借一个开启了跨机器人权限的机器人
+    去操作别人名下的任意群/用户，绕过了单机会话边界。
+    目标不存在于该机器人名下时一律拒绝。
+    """
+    if _target_owned_by(target_app_id, target_type, target_id):
+        return None
+    return (f"错误：{op_name} 的目标会话（{target_id}）不属于机器人 "
+            f"{target_app_id}，已拒绝跨会话操作")
+
+
+def _find_owner_app_id(target_type: str, target_id: str) -> Optional[str]:
+    """反查某个会话归属哪个机器人（谁名下有它）。
+
+    多机器人理论上可能记录过同一会话；这里按 user_map 的插入顺序返回
+    第一个命中的 app_id。查不到返回 None（调用方按「不属于本机器人」处理，
+    即从严，而不是放行）。
+    """
+    if not target_id:
+        return None
+    try:
+        um = load_user_map()
+    except Exception:
+        return None
+    for app_id, entry in (um or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        key = "user" if target_type == "c2c" else "group"
+        raw = entry.get(key)
+        if isinstance(raw, (list, dict)) and target_id in raw:
+            return app_id
+    return None
 
 
 # ==================== 工具调用执行（不含媒体识别，动态导入 ai） ====================
@@ -2292,7 +2470,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
             except _json.JSONDecodeError as e:
                 result_content = f"搜索音乐响应解析失败：{e}，请检查接口返回格式。"
             except Exception as e:
-                result_content = f"搜索音乐异常：{e}"
+                result_content = f"搜索音乐异常：{safe_exc_text(e)}"
 
     # ==================== 播放音乐（支持 use_file 参数） ====================
     elif function_name == "play_music":
@@ -2370,7 +2548,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                         if not success:
                             result_content = "音乐发送失败（所有尝试均失败）。"
             except Exception as e:
-                result_content = f"播放音乐异常：{e}"
+                result_content = f"播放音乐异常：{safe_exc_text(e)}"
 
     elif function_name == "mute_member":
         # 成员一律用数组：传一个即单个、传多个即批量
@@ -2394,7 +2572,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
             for m in members:
                 mid = m["member_id"]
                 valid_time = ensure_rfc3339_time(m.get("mute_expire_at") or fallback_expire,
-                                                 default_seconds=3600)
+                                                 default_seconds=3600, ctx=ctx)
                 success, error_code = await bot_client.set_group_mute(group_id, "add", mid, valid_time)
                 if success:
                     results.append({"member_id": mid, "ok": True, "mute_expire_at": valid_time})
@@ -2483,7 +2661,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                 else:
                     result_content = f"获取机器人在群 {target_id} 的状态失败（可能接口无权限）"
             except Exception as e:
-                result_content = f"获取机器人状态异常：{e}"
+                result_content = f"获取机器人状态异常：{safe_exc_text(e)}"
 
     elif function_name == "get_group_mute_status":
         target_id = arguments.get("target_id", "")
@@ -2528,13 +2706,12 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                 else:
                     result_content = f"获取群 {target_id} 禁言状态失败（可能机器人不是群管理员）"
             except Exception as e:
-                result_content = f"获取群禁言状态异常：{e}"
+                result_content = f"获取群禁言状态异常：{safe_exc_text(e)}"
 
     elif function_name == "query_history":
-        try:
-            range_count = int(arguments.get("range", 0))
-        except (ValueError, TypeError):
-            range_count = 0
+        # 用 _safe_int：range 传 "yes" 这类值时不再抛异常，而是落到 0
+        # 并由下面的校验给出「必须为正整数」的明确提示
+        range_count = _safe_int(arguments.get("range", 0))
         if range_count <= 0:
             result_content = "错误：range 必须为正整数"
         else:
@@ -2543,17 +2720,6 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                 query_app_id = arguments.get("app_id", "").strip()
                 query_target_type = arguments.get("target_type", "")
                 query_target_id = arguments.get("target_id", "")
-
-                # 如果指定了 app_id 且不同于当前机器人，需要在跨机器人目标上操作
-                # 但查询历史只是本地读取 history/*.json，无需 BotClient
-                if query_app_id and query_app_id != bot_client.app_id:
-                    # 跨机器人读取需要权限检查
-                    if not get_bot_allow_cross_history(bot_client.app_id):
-                        result_content = f"错误：本机器人（{bot_client.app_id}）禁止跨机器人聊天记录读取（ALLOW_CROSS_BOT_HISTORY=0）"
-                        return {"role": "tool", "tool_call_id": tool_call_id, "content": result_content}
-                    if not get_bot_allow_cross_history_incoming(query_app_id):
-                        result_content = f"错误：目标机器人（{query_app_id}）禁止被跨机器人聊天记录读取（ALLOW_CROSS_BOT_HISTORY_INCOMING=0）"
-                        return {"role": "tool", "tool_call_id": tool_call_id, "content": result_content}
 
                 # 解析目标会话
                 try:
@@ -2564,6 +2730,38 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                 except ValueError as e:
                     result_content = f"错误：{e}"
                     return {"role": "tool", "tool_call_id": tool_call_id, "content": result_content}
+
+                # --- 归属判定：目标会话是否属于本机器人 ---
+                #
+                # ★ 权限检查必须在解析出**真实目标会话**之后做，不能只看 app_id 参数：
+                #   原实现写成 `if query_app_id and query_app_id != bot_client.app_id`，
+                #   于是「不传 app_id、只传 target_id」就整段跳过 ALLOW_CROSS_BOT_*
+                #   检查。而 history 文件名只有 thread_key、不含 app_id，不同机器人
+                #   的同名会话共用同一份文件 —— 不传 app_id 反而能直接读到别人的记录，
+                #   使 ALLOW_CROSS_BOT_HISTORY=0 完全失效。
+                #
+                # 判定口径（从严但不误伤本机自己的会话）：
+                #   - 显式传了 app_id：必须等于本机器人，否则按跨机器人流程校验；
+                #   - 没传 app_id：先看目标是否登记在本机器人名下（放行）；
+                #     不在名下时，若能被别的机器人认领（_find_owner_app_id 命中）
+                #     则按跨机器人校验；谁都不认领的（如刚入群、尚未登记的会话）
+                #     视为本机器人自己的新会话，不要求跨机器人权限。
+                owner_candidate = None
+                if query_app_id:
+                    cross = query_app_id != bot_client.app_id
+                    owner_candidate = query_app_id
+                elif _target_owned_by(bot_client.app_id, q_type, q_id):
+                    cross = False
+                else:
+                    owner_candidate = _find_owner_app_id(q_type, q_id)
+                    cross = bool(owner_candidate)
+                if cross:
+                    if not get_bot_allow_cross_history(bot_client.app_id):
+                        result_content = f"错误：本机器人（{bot_client.app_id}）禁止跨机器人聊天记录读取（ALLOW_CROSS_BOT_HISTORY=0）"
+                        return {"role": "tool", "tool_call_id": tool_call_id, "content": result_content}
+                    if not get_bot_allow_cross_history_incoming(owner_candidate):
+                        result_content = f"错误：目标机器人（{owner_candidate}）禁止被跨机器人聊天记录读取（ALLOW_CROSS_BOT_HISTORY_INCOMING=0）"
+                        return {"role": "tool", "tool_call_id": tool_call_id, "content": result_content}
 
                 # 读取历史
                 hist = load_history(q_thread_key)
@@ -2678,7 +2876,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                         result_content = header + "\n" + "\n".join(lines)
 
             except Exception as e:
-                result_content = f"查询历史记录异常：{e}"
+                result_content = f"查询历史记录异常：{safe_exc_text(e)}"
 
     elif function_name == "revoke_message":
         # 统一为数组：只接受 message_ids 数组形式
@@ -2710,6 +2908,14 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                     result_content = f"错误：{e}"
                     return {"role": "tool", "tool_call_id": tool_call_id, "content": result_content}
 
+                # 跨机器人时校验目标会话确实归目标机器人所有
+                if is_cross:
+                    _own_err = _check_cross_target_owned(
+                        sender.app_id, t_type, t_id, "撤回消息")
+                    if _own_err:
+                        return {"role": "tool", "tool_call_id": tool_call_id,
+                                "content": _own_err}
+
                 # 构建线程key（用于本地标记已撤回）
                 revoke_thread_key = f"{'c2c' if t_type == 'c2c' else 'group'}_{t_id}"
 
@@ -2728,7 +2934,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                         else:
                             results.append(f"  ✗ {mid[:40]}... 撤回失败（可能超时或无权限）")
                     except Exception as e:
-                        results.append(f"  ✗ {mid[:40]}... 撤回异常: {e}")
+                        results.append(f"  ✗ {mid[:40]}... 撤回异常: {safe_exc_text(e)}")
                 result_content = f"撤回结果（共 {len(message_ids)} 条）：\n" + "\n".join(results)
 
     # ==================== 按关键词和时间范围批量撤回 ====================
@@ -2738,8 +2944,8 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
         end_time_str = arguments.get("end_time", "")
         # 安全默认：只有显式传 confirm=1 才真正执行，否则一律预览。
         # 兼容旧参数 dry_run=1（显式传 1 时同样只预览）。
-        confirm = int(arguments.get("confirm", 0) or 0)
-        legacy_dry = int(arguments.get("dry_run", 0) or 0)
+        confirm = _safe_int(arguments.get("confirm", 0))
+        legacy_dry = _safe_int(arguments.get("dry_run", 0))
         dry_run = 1 if (confirm != 1 or legacy_dry == 1) else 0
         # keywords 与时间范围至少要有一个，否则等于"无条件撤整个会话历史"
         raw_keywords = [k.strip() for k in keywords if k and str(k).strip()] if isinstance(keywords, list) else []
@@ -2767,6 +2973,14 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                 except (PermissionError, ValueError) as e:
                     result_content = f"错误：{e}"
                     return {"role": "tool", "tool_call_id": tool_call_id, "content": result_content}
+
+                # 跨机器人时校验目标会话确实归目标机器人所有
+                if is_cross:
+                    _own_err = _check_cross_target_owned(
+                        sender.app_id, t_type, t_id, "批量撤回")
+                    if _own_err:
+                        return {"role": "tool", "tool_call_id": tool_call_id,
+                                "content": _own_err}
 
                 # 构建线程key
                 thread_key_target = f"{'c2c' if t_type == 'c2c' else 'group'}_{t_id}"
@@ -2852,13 +3066,49 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
 
                         if not matched_messages:
                             result_content = f"未找到匹配的消息（{cond_desc}）"
+                        else:
+                            # ★ LOW 修复：撤回有服务端时间窗（QQ 侧规则），
+                            #   超出窗口的消息**必然失败**，但此前一律先尝试再
+                            #   报「撤回失败（可能超时或无权限）」。后果有两个：
+                            #     1. 预览里看不出哪些其实撤不了，用户以为
+                            #        confirm=1 能把 10 条全清掉，实际只清掉 2 条；
+                            #     2. 每条超窗消息都白发一次 API 请求。
+                            #   这里在**预览阶段**就把超窗标出来，让用户在
+                            #   确认前就知道真实可撤回数量。
+                            #   窗口规则（与官方一致，故只做提示不做硬拦截）：
+                            #     群聊：管理员可撤回任意成员消息（不限时）；
+                            #           普通成员只能撤自己 2 分钟内的。
+                            #     私聊：只能撤机器人自己 2 分钟内的。
+                            #   由于本工具拿不到调用者角色，无法精确判断，
+                            #   因此只对「确定超窗」的情况给提示，不阻止执行。
+                            _now = datetime.now(timezone(timedelta(hours=8)))
+                            n_out_of_window = 0
+                            for m in matched_messages:
+                                _ts = m.get("timestamp")
+                                if _ts is None:
+                                    continue
+                                if (_now - _ts).total_seconds() > 120:
+                                    m["_oow"] = True
+                                    n_out_of_window += 1
+                                else:
+                                    m["_oow"] = False
+
+                        if not matched_messages:
+                            pass   # 上面已给过文案
                         elif dry_run:
                             lines = [f"【预览模式】找到 {len(matched_messages)} 条匹配的消息（不会实际撤回）："]
                             for i, m in enumerate(matched_messages, 1):
                                 ts_str = m["timestamp"].strftime("%Y-%m-%d %H:%M") if m["timestamp"] else "未知时间"
                                 hit_desc = f"匹配关键词「{m['keyword']}」" if m["keyword"] else "时间范围内"
-                                lines.append(f"  {i}. [{m['role']}] {ts_str} {hit_desc} msg_id={m['msg_id']}")
+                                # 超过 2 分钟窗口的标注出来（群管理员仍可能撤成功）
+                                warn_tag = " ⚠️超2分钟" if m.get("_oow") else ""
+                                lines.append(f"  {i}. [{m['role']}] {ts_str} {hit_desc}{warn_tag} msg_id={m['msg_id']}")
                                 lines.append(f"     内容: {m['content_preview']}")
+                            if n_out_of_window:
+                                lines.append(
+                                    f"\n⚠️ 其中 {n_out_of_window} 条距发送已超过 2 分钟。"
+                                    f"群聊中管理员仍可撤回，但普通成员/私聊必然失败"
+                                    f"（服务端 2 分钟限制）。")
                             lines.append("\n这是预览结果，尚未撤回任何消息。"
                                          "确认无误后，请带 confirm=1 再次调用以真正执行撤回。")
                             result_content = "\n".join(lines)
@@ -2880,13 +3130,13 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                                         results.append(f"  ✗ {mid[:30]}... 撤回失败（可能超时或无权限）")
                                         fail_count += 1
                                 except Exception as e:
-                                    results.append(f"  ✗ {mid[:30]}... 撤回异常: {e}")
+                                    results.append(f"  ✗ {mid[:30]}... 撤回异常: {safe_exc_text(e)}")
                                     fail_count += 1
 
                             result_content = f"批量撤回完成：成功 {success_count}，失败 {fail_count}（共 {len(matched_messages)} 条匹配）\n" + "\n".join(results)
 
                 except Exception as e:
-                    result_content = f"批量撤回异常：{e}"
+                    result_content = f"批量撤回异常：{safe_exc_text(e)}"
 
     # ==================== 获取目标列表（合并推送/唤醒） ====================
     elif function_name == "get_targets":
@@ -3074,7 +3324,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                 lines.append('或 {"type": "group", "id": "...", "app_id": "..."}')
             result_content = "\n".join(lines)
         except Exception as e:
-            result_content = f"获取目标列表异常：{e}"
+            result_content = f"获取目标列表异常：{safe_exc_text(e)}"
 
     # ==================== 获取联系人列表（不含权限标注） ====================
     elif function_name == "get_contact_list":
@@ -3198,7 +3448,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
 
             result_content = "\n".join(lines)
         except Exception as e:
-            result_content = f"获取联系人列表异常：{e}"
+            result_content = f"获取联系人列表异常：{safe_exc_text(e)}"
 
     # ==================== 主动推送消息（含跨机器人支持 + 多媒体） ====================
     elif function_name == "push_message":
@@ -3277,6 +3527,15 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                                 continue
                             cross_clients[t_app_id] = BotClient(t_app_id, secret)
                         sender = cross_clients[t_app_id]
+                        # 目标会话必须确实属于目标机器人 —— 跨机器人开关是按
+                        # 机器人而非按会话生效的，不校验归属就等于可向其名下
+                        # 任意群/用户推送（见 _check_cross_target_owned 说明）。
+                        if not _target_owned_by(
+                                t_app_id, "c2c" if t_type == "user" else "group", t_id):
+                            detail_msgs.append(
+                                f"  跳过 {t_id}：该会话不属于机器人 {t_app_id}")
+                            fail_count += 1
+                            continue
 
                     api_msg_type = "c2c" if t_type == "user" else t_type
                     hist_key = f"{'c2c' if t_type == 'user' else 'group'}_{t_id}"
@@ -3399,7 +3658,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                     result_content = result_msg
 
             except Exception as e:
-                result_content = f"推送消息异常：{e}"
+                result_content = f"推送消息异常：{safe_exc_text(e)}"
 
     # ==================== 定时推送 ====================
     elif function_name == "schedule_push":
@@ -3420,6 +3679,31 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
             result_content = "错误：schedule_push 的 schedule_type 为 one_time 或 daily 时缺少 schedule_time 参数"
         else:
             try:
+                # 创建时就校验跨机器人目标的归属与权限，而不是拖到执行期：
+                # 执行期失败只会在日志里留一条错误，创建者却已收到「创建成功」，
+                # 等于埋一个永远失败的定时任务（见 _check_cross_target_owned）。
+                _bad_targets = []
+                for _t in targets:
+                    if not isinstance(_t, dict):
+                        continue
+                    _tid = _t.get("id", "")
+                    _tapp = _t.get("app_id", "")
+                    _ttype = "c2c" if _t.get("type") == "user" else "group"
+                    if not _tid or not _tapp or _tapp == bot_client.app_id:
+                        continue
+                    if not get_bot_allow_cross_push(bot_client.app_id):
+                        _bad_targets.append(
+                            f"{_tid}：本机器人（{bot_client.app_id}）禁止跨机器人推送")
+                    elif not get_bot_allow_cross_push_incoming(_tapp):
+                        _bad_targets.append(f"{_tid}：目标机器人（{_tapp}）禁止接收跨机器人推送")
+                    elif not _target_owned_by(_tapp, _ttype, _tid):
+                        _bad_targets.append(f"{_tid}：该会话不属于机器人 {_tapp}")
+                if _bad_targets:
+                    result_content = ("错误：定时推送目标未通过校验，未创建任务：\n  - "
+                                      + "\n  - ".join(_bad_targets))
+                    return {"role": "tool", "tool_call_id": tool_call_id,
+                            "content": result_content}
+
                 # 记录发起者信息，定时执行时用其构建 footer
                 initiator_info = {"app_id": bot_client.app_id, "created_at": None}
                 if msg_type == "c2c":
@@ -3469,7 +3753,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                     schedule_desc = f"每 {iv} 秒执行一次"
                 result_content = f"定时推送已创建，任务 ID: {task_id}，类型: {schedule_type}，{schedule_desc}，共 {len(targets)} 个目标"
             except Exception as e:
-                result_content = f"创建定时推送异常：{e}"
+                result_content = f"创建定时推送异常：{safe_exc_text(e)}"
 
     # ==================== 查看定时推送列表（含全部状态、调度类型、执行记录和消息ID） ====================
     elif function_name == "list_scheduled_push":
@@ -3654,7 +3938,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
 
                 result_content = "\n".join(lines)
         except Exception as e:
-            result_content = f"查询定时推送异常：{e}"
+            result_content = f"查询定时推送异常：{safe_exc_text(e)}"
 
     # ==================== 删除定时推送 ====================
     elif function_name == "delete_scheduled_push":
@@ -3666,7 +3950,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                 ok, msg = delete_task(task_id, bot_client.app_id)
                 result_content = msg
             except Exception as e:
-                result_content = f"删除定时推送异常：{e}"
+                result_content = f"删除定时推送异常：{safe_exc_text(e)}"
 
     # ==================== 修改定时推送 ====================
     elif function_name == "update_scheduled_push":
@@ -3742,7 +4026,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                     ok, msg = update_task(task_id, bot_client.app_id, updates)
                     result_content = msg
             except Exception as e:
-                result_content = f"修改定时推送异常：{e}"
+                result_content = f"修改定时推送异常：{safe_exc_text(e)}"
 
     # ==================== 撤回推送消息 ====================
     elif function_name == "revoke_push":
@@ -3833,7 +4117,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                             save_tasks(tasks)
                             info(f"[撤回记录] 任务 {task_id} 已保存撤回状态到消息ID记录", ctx=ctx)
             except Exception as e:
-                result_content = f"撤回推送异常：{e}"
+                result_content = f"撤回推送异常：{safe_exc_text(e)}"
 
     # ==================== 创建定时唤醒 ====================
     elif function_name == "create_scheduled_wakeup":
@@ -3899,7 +4183,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                 target_names = ", ".join([f"{t.get('type')}({t.get('name', t.get('id'))})" for t in targets])
                 result_content = f"定时唤醒已创建，任务 ID: {task_id}，类型: {schedule_type}，{schedule_desc}，目标({len(targets)}个): {target_names}{isolation_tag}"
             except Exception as e:
-                result_content = f"创建定时唤醒异常：{e}"
+                result_content = f"创建定时唤醒异常：{safe_exc_text(e)}"
 
     # ==================== 查看定时唤醒列表 ====================
     elif function_name == "list_scheduled_wakeup":
@@ -4055,7 +4339,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
 
                 result_content = "\n".join(lines)
         except Exception as e:
-            result_content = f"查询定时唤醒异常：{e}"
+            result_content = f"查询定时唤醒异常：{safe_exc_text(e)}"
 
     # ==================== 删除定时唤醒 ====================
     elif function_name == "delete_scheduled_wakeup":
@@ -4067,7 +4351,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                 ok, msg = delete_wakeup(task_id, bot_client.app_id)
                 result_content = msg
             except Exception as e:
-                result_content = f"删除定时唤醒异常：{e}"
+                result_content = f"删除定时唤醒异常：{safe_exc_text(e)}"
 
     # ==================== 修改定时唤醒 ====================
     elif function_name == "update_scheduled_wakeup":
@@ -4107,7 +4391,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                     ok, msg = update_wakeup(task_id, bot_client.app_id, updates)
                     result_content = msg
             except Exception as e:
-                result_content = f"修改定时唤醒异常：{e}"
+                result_content = f"修改定时唤醒异常：{safe_exc_text(e)}"
 
     # ==================== 新增 skip_reply 工具 ====================
     elif function_name == "skip_reply":
@@ -4134,7 +4418,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
             except MemoryLevelError as e:
                 result_content = f"错误：未知记忆级别 {e.level}"
             except Exception as e:
-                result_content = f"查看记忆异常：{e}"
+                result_content = f"查看记忆异常：{safe_exc_text(e)}"
 
     elif function_name == "add_memory":
         items = arguments.get("items")
@@ -4152,7 +4436,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                 result_content = "添加记忆完成：" + "，".join(parts)
                 info(f"[记忆工具] add_memory 批量: 成功 {len(success_list)}, 失败 {len(fail_list)}", ctx=ctx)
             except Exception as e:
-                result_content = f"添加记忆异常：{e}"
+                result_content = f"添加记忆异常：{safe_exc_text(e)}"
         else:
             # 单条模式
             level = arguments.get("level", "")
@@ -4174,7 +4458,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                     result_content = f"错误：未知记忆级别 {e.level}"
                     return {"role": "tool", "tool_call_id": tool_call_id, "content": result_content}
                 except Exception as e:
-                    result_content = f"添加记忆异常：{e}"
+                    result_content = f"添加记忆异常：{safe_exc_text(e)}"
 
     elif function_name == "modify_memory":
         items = arguments.get("items")
@@ -4192,7 +4476,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                 result_content = "修改记忆完成：" + "，".join(parts)
                 info(f"[记忆工具] modify_memory 批量: 成功 {len(success_list)}, 失败 {len(fail_list)}", ctx=ctx)
             except Exception as e:
-                result_content = f"修改记忆异常：{e}"
+                result_content = f"修改记忆异常：{safe_exc_text(e)}"
         else:
             # 单条模式
             level = arguments.get("level", "")
@@ -4213,7 +4497,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                     result_content = f"错误：未知记忆级别 {e.level}"
                     return {"role": "tool", "tool_call_id": tool_call_id, "content": result_content}
                 except Exception as e:
-                    result_content = f"修改记忆异常：{e}"
+                    result_content = f"修改记忆异常：{safe_exc_text(e)}"
 
     elif function_name == "delete_memory":
         items = arguments.get("items")
@@ -4231,7 +4515,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                 result_content = "删除记忆完成：" + "，".join(parts)
                 info(f"[记忆工具] delete_memory 批量: 成功 {len(success_list)}, 失败 {len(fail_list)}", ctx=ctx)
             except Exception as e:
-                result_content = f"删除记忆异常：{e}"
+                result_content = f"删除记忆异常：{safe_exc_text(e)}"
         else:
             # 单条模式
             level = arguments.get("level", "")
@@ -4251,7 +4535,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                     result_content = f"错误：未知记忆级别 {e.level}"
                     return {"role": "tool", "tool_call_id": tool_call_id, "content": result_content}
                 except Exception as e:
-                    result_content = f"删除记忆异常：{e}"
+                    result_content = f"删除记忆异常：{safe_exc_text(e)}"
 
     elif function_name == "enable_memory":
         level = arguments.get("level", "")
@@ -4267,7 +4551,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                 result_content = f"错误：未知记忆级别 {e.level}"
                 return {"role": "tool", "tool_call_id": tool_call_id, "content": result_content}
             except Exception as e:
-                result_content = f"启用记忆异常：{e}"
+                result_content = f"启用记忆异常：{safe_exc_text(e)}"
 
     elif function_name == "disable_memory":
         level = arguments.get("level", "")
@@ -4283,7 +4567,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                 result_content = f"错误：未知记忆级别 {e.level}"
                 return {"role": "tool", "tool_call_id": tool_call_id, "content": result_content}
             except Exception as e:
-                result_content = f"禁用记忆异常：{e}"
+                result_content = f"禁用记忆异常：{safe_exc_text(e)}"
 
     # ==================== 记忆搜索工具 ====================
     elif function_name == "search_memory":
@@ -4319,7 +4603,7 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                 )
                 info(f"[记忆搜索] 关键词: {keywords}, 层级: {level}, 结果长度: {len(result_content)}", ctx=ctx)
             except Exception as e:
-                result_content = f"搜索记忆异常：{e}"
+                result_content = f"搜索记忆异常：{safe_exc_text(e)}"
 
     # ==================== 批量添加记忆 ====================
     else:

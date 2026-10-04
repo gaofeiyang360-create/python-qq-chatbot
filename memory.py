@@ -9,26 +9,33 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timedelta, timezone
 
-from log import info, warn, error, debug, LogCtx
+from log import info, warn, error, debug, LogCtx, spawn_background
 from config import (
     safe_load_json, BASE_DIR, MEMORY_FILE, MIRROR_FILE, USER_MAP_FILE,
     HISTORY_DIR, MEDIA_CACHE_DIR, QUN_MEMORY_DIR, C2C_MEMORY_DIR, BOT_MEMORY_DIR,
     get_bot_isolate_flag, get_compress_threshold, get_context_limit,
 )
+from utils import atomic_write_json
 
 
 # ==================== 全局记忆 ====================
 def get_global_memory_file(app_id: Optional[str] = None) -> Path:
     if app_id:
-        isolate = get_bot_isolate_flag(app_id)
+        # app_id 会拼进文件名（memory_{app_id}.json），同样必须净化，
+        # 否则 identifier="../../config" 之类的值可越出 BASE_DIR。
+        # 详见 _validate_memory_identifier 处的说明。
+        safe_app_id = _validate_memory_identifier(app_id)
+        isolate = get_bot_isolate_flag(safe_app_id)
         if isolate:
-            return BASE_DIR / f"memory_{app_id}.json"
+            return BASE_DIR / f"memory_{safe_app_id}.json"
     return MEMORY_FILE
 
 
 def load_memory(app_id: Optional[str] = None) -> Dict:
     file_path = get_global_memory_file(app_id)
-    return safe_load_json(file_path, {"global_memory": [], "enabled": 1})
+    # 全局记忆按 app_id 分文件，归属明确；未指定 app_id 时才是真正的全局
+    return safe_load_json(file_path, {"global_memory": [], "enabled": 1},
+                          ctx=LogCtx(app_id=app_id) if app_id else None)
 
 
 def save_memory(data: Dict, app_id: Optional[str] = None):
@@ -104,9 +111,147 @@ def load_user_map() -> dict:
 
 
 def save_user_map(data: dict):
-    """保存 user_map.json"""
-    with open(USER_MAP_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    """保存 user_map.json（原子写）。
+
+    ★ M6：原先是 open(...,"w") 直接覆盖。该项目里 mirror/user_map 的更新
+      都是「读全表 → 改一条 → 写回全表」，而调用方（msg.py）在读写之间
+      存在 await 窗口。两个协程交错时，后写的那个拿的是旧快照，会把对方
+      刚加的用户/群整片抹掉。
+      这里做两件事：
+        1. 原子写（utils.atomic_write_json）—— 进程被杀不会留下半个文件；
+        2. 写前把磁盘现状并回内存副本（_merge_map_tables）—— 消除丢失更新。
+    """
+    _write_map_table(USER_MAP_FILE, data, "user_map.json")
+
+
+def _merge_map_tables(disk: dict, mem: dict) -> dict:
+    """把磁盘上的现状并回内存副本，避免「读-改-写」丢更新（M6）。
+
+    合并规则（按结构层级，不做过度推断）：
+      - 顶层键：两边取并集；同一个 app_id 下递归合并。
+      - 值为 list：取并集（保持磁盘顺序在前，内存新增项追加在后）。
+      - 值为 dict：递归合并（如 group → {群id: [成员]}）。
+      - 其它标量：以内存（本次要写的值）为准 —— 它代表调用方的明确意图。
+    这样「另一个协程刚加进去的条目」不会被本次写回抹掉。
+    """
+    if not isinstance(disk, dict) or not isinstance(mem, dict):
+        return mem
+    out = dict(disk)
+    for k, mv in mem.items():
+        dv = out.get(k)
+        if isinstance(dv, list) and isinstance(mv, list):
+            merged = list(dv)
+            for item in mv:
+                if item not in merged:
+                    merged.append(item)
+            out[k] = merged
+        elif isinstance(dv, dict) and isinstance(mv, dict):
+            out[k] = _merge_map_tables(dv, mv)
+        else:
+            out[k] = mv
+    return out
+
+
+def _write_map_table(path, data: dict, label: str):
+    """带合并与原子写的表写入（mirror.json / user_map.json 共用）。"""
+    try:
+        disk = safe_load_json(path, {})
+    except Exception:
+        disk = {}
+    merged = _merge_map_tables(disk if isinstance(disk, dict) else {}, data)
+    atomic_write_json(path, merged)
+
+
+# ==================== openid → app_id 反查（仅供日志归属使用） ====================
+# 为什么需要它：qun_memory / c2c_memory / history 的文件名只有 openid，
+# 文件内容里也不存 app_id（这是既有的存储格式，不改）。于是这些模块内部
+# 打日志时手头只有 openid，只能打出 appid=? 的无主记录 —— 排查时看不出
+# 是哪个机器人的数据出了问题。
+#
+# 关键在于 openid 与 app_id 是 1:1 的：QQ 的 openid 由平台按「应用」签发，
+# 同一个群/用户在不同机器人下拿到的 openid **完全不同**，因此
+#   · 不存在两个机器人共用同一个 openid 的情况
+#   · 同一个 openid 也绝不会对应多个 app_id
+# 所以反查的结果是唯一且确定的，不存在"归属有歧义"的场景。
+# （实测：本工作区 17 个机器人、25 个群 openid、16 个用户 openid，
+#   全部互不重复，跨机器人重合数为 0。）
+#
+# user_map.json 是"哪个机器人拥有哪些群/用户"的权威来源
+# （api_server 的归属校验也用同一份数据，口径一致）。纯只读，不改存储格式。
+
+def find_app_id_by_group(group_id: str) -> str:
+    """反查拥有该群的 app_id；查不到返回空串。
+
+    由于 openid 与 app_id 是 1:1 的，一旦命中就是唯一答案。
+    理论上的"多个机器人共有同一 openid"不会发生；真出现了说明 user_map
+    被手工改坏，此时返回空串（不猜归属）比随便挑一个更安全。
+    """
+    if not group_id:
+        return ""
+    try:
+        data = load_user_map()
+    except Exception:
+        return ""
+    owners = []
+    for app_id, v in data.items():
+        if not isinstance(v, dict):
+            continue
+        raw = v.get("group")
+        if isinstance(raw, (list, dict)) and group_id in raw:
+            owners.append(app_id)
+    return owners[0] if len(owners) == 1 else ""
+
+
+def find_app_id_by_user(user_id: str) -> str:
+    """反查拥有该私聊用户的 app_id；查不到返回空串（同样 1:1，命中即唯一）。"""
+    if not user_id:
+        return ""
+    try:
+        data = load_user_map()
+    except Exception:
+        return ""
+    owners = []
+    for app_id, v in data.items():
+        if not isinstance(v, dict):
+            continue
+        raw = v.get("user")
+        if isinstance(raw, (list, dict)) and user_id in raw:
+            owners.append(app_id)
+    return owners[0] if len(owners) == 1 else ""
+
+
+def find_app_id_by_thread(thread_key: str) -> str:
+    """按 thread_key（group_xxx / c2c_xxx）反查 app_id。
+
+    history 的键是 thread_key，这里拆出 openid 后复用上面的反查逻辑。
+    """
+    if not thread_key:
+        return ""
+    if thread_key.startswith("group_"):
+        return find_app_id_by_group(thread_key[len("group_"):])
+    if thread_key.startswith("c2c_"):
+        return find_app_id_by_user(thread_key[len("c2c_"):])
+    return ""
+
+
+def ctx_for_thread(thread_key: str) -> Optional[LogCtx]:
+    """为 thread_key 构造带归属的 LogCtx（查不到 app_id 时至少保留 thread）。"""
+    app_id = find_app_id_by_thread(thread_key)
+    return LogCtx(app_id=app_id, thread_key=thread_key) if thread_key else None
+
+
+def ctx_for_group(group_id: str) -> Optional[LogCtx]:
+    """为群 openid 构造带归属的 LogCtx。"""
+    if not group_id:
+        return None
+    return LogCtx(app_id=find_app_id_by_group(group_id), thread_key=f"group_{group_id}")
+
+
+def ctx_for_user(user_id: str) -> Optional[LogCtx]:
+    """为私聊用户 openid 构造带归属的 LogCtx。"""
+    if not user_id:
+        return None
+    return LogCtx(app_id=find_app_id_by_user(user_id), thread_key=f"c2c_{user_id}")
 
 
 def _ensure_user_map_app_entry(app_id: str) -> dict:
@@ -262,8 +407,11 @@ def load_mirror() -> Dict:
 
 
 def save_mirror(data: Dict):
-    with open(MIRROR_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    """保存 mirror.json（原子写 + 写前合并，见 _write_map_table 说明）。
+
+    ★ M6：与 save_user_map 同因同治 —— 全表重写 + 调用方存在 await 窗口。
+    """
+    _write_map_table(MIRROR_FILE, data, "mirror.json")
 
 
 def _ensure_bot_entry(bot_appid: str) -> Dict:
@@ -283,12 +431,21 @@ def get_user_mapping(bot_appid: str) -> dict:
 
 
 def set_user_mapping(bot_appid: str, mapping_dict: dict):
-    """设置指定机器人的用户映射 dict"""
+    """设置指定机器人的用户映射 dict（整表覆盖）。
+
+    注意：全项目无调用点，属遗留接口，保留仅为兼容。日志按与
+    update_user_mapping 相同的口径补上，避免将来被启用时又是静默写盘。
+    """
     data = load_mirror()
     if "users" not in data:
         data["users"] = {}
+    old_map = data["users"].get(bot_appid) or {}
     data["users"][bot_appid] = mapping_dict
     save_mirror(data)
+    old_n = len(old_map)
+    new_n = len(mapping_dict or {})
+    info(f"[Mirror] 用户映射已覆盖写入: {old_n} -> {new_n} 条 (app={bot_appid})",
+         ctx=bot_appid)
 
 
 def get_user_name(qq_id: str, bot_appid: str) -> Optional[str]:
@@ -298,13 +455,27 @@ def get_user_name(qq_id: str, bot_appid: str) -> Optional[str]:
 
 
 def update_user_mapping(qq_id: str, username: str, bot_appid: str):
-    """更新指定机器人的用户映射，不存在则添加"""
+    """更新指定机器人的用户映射，不存在则添加。
+
+    ★ 日志区分「首次记录」与「昵称变更」两种情况 —— 与群名的
+      save_group_to_mirror 保持一致，否则用户改名是完全静默的，
+      排查时只能去比对 mirror.json 才能发现改过。
+      用户名依赖 QQ 每次消息随包下发的 author.username，因此用户改名后
+      会在其下一次发言时自动刷新。
+    """
     if not qq_id or not username:
         return
     data = _ensure_bot_entry(bot_appid)
-    if data["users"][bot_appid].get(qq_id) != username:
+    old_name = data["users"][bot_appid].get(qq_id)
+    if old_name != username:
         data["users"][bot_appid][qq_id] = username
         save_mirror(data)
+        if old_name:
+            info(f"[Mirror] 用户昵称已更新: {old_name} -> {username} "
+                 f"({qq_id}) (app={bot_appid})", ctx=bot_appid)
+        else:
+            info(f"[Mirror] 记录用户: {username} ({qq_id}) (app={bot_appid})",
+                 ctx=bot_appid)
 
 
 # ==================== mirror.json 群记录 ====================
@@ -319,14 +490,24 @@ def _ensure_mirror_groups_entry(app_id: str) -> Dict:
 
 
 def save_group_to_mirror(app_id: str, group_openid: str, group_name: str):
-    """记录群ID和群名称到 mirror.json groups 字段"""
+    """记录群ID和群名称到 mirror.json groups 字段。
+
+    日志与 update_user_mapping 保持同一风格：区分「首次记录」与「群名称已更新」，
+    否则改名前后的日志长得一样，翻日志分不出到底改没改。
+    """
     if not app_id or not group_openid or not group_name:
         return
     data = _ensure_mirror_groups_entry(app_id)
-    if data["groups"][app_id].get(group_openid) != group_name:
+    old_name = data["groups"][app_id].get(group_openid)
+    if old_name != group_name:
         data["groups"][app_id][group_openid] = group_name
         save_mirror(data)
-        info(f"[Mirror] 记录群信息: {group_name} ({group_openid}) (app={app_id})", ctx=app_id)
+        if old_name:
+            info(f"[Mirror] 群名称已更新: {old_name} -> {group_name} "
+                 f"({group_openid}) (app={app_id})", ctx=app_id)
+        else:
+            info(f"[Mirror] 记录群: {group_name} ({group_openid}) (app={app_id})",
+                 ctx=app_id)
 
 
 def get_group_name_from_mirror(app_id: str, group_openid: str) -> Optional[str]:
@@ -335,14 +516,130 @@ def get_group_name_from_mirror(app_id: str, group_openid: str) -> Optional[str]:
     return data.get("groups", {}).get(app_id, {}).get(group_openid)
 
 
+# ==================== 记忆 identifier 净化 ====================
+# 记忆标识符（app_id / group_openid / user_openid）最终会被拼成文件名：
+#   QUN_MEMORY_DIR / f"{group_id}.json"   等
+# 因此它必须是**纯标识符**，绝不能含路径分隔符或 ".."。
+#
+# 为什么必须在这里拦：模型可以直接调 view_memory/add_memory 等工具，
+# identifier 完全由模型（或 HTTP 调用方）控制。若不净化，传
+# identifier="../config" 就会离开 qun_memory/ 目录、命中项目根目录的
+# config.json（该文件含各机器人 APP_SECRET 与 LLM api_key 明文）；
+# 写入方向（add/modify/delete/enable/disable）更会以 open(...,"w")
+# 覆盖该文件。这是一条「一个字符串参数即可窃取或破坏全部凭证」的链路。
+#
+# 采用白名单而非黑名单：只放行字母/数字/下划线/连字符/点。
+# QQ 的 openid 为十六进制大写串，APP_ID 为纯数字，均在此集合内；
+# 同时禁止 "." 与 ".." 作为整体，避免目录自引用。
+_MEMORY_IDENT_RE = re.compile(r'^[A-Za-z0-9_.-]{1,128}$')
+
+
+class MemoryIdentifierError(ValueError):
+    """identifier 不是合法标识符（含路径分隔符/穿越片段/超长等）。
+
+    直接继承 ValueError（而非文件后部的 MemoryError_）——本类定义在模块
+    前部、早于 MemoryError_ 的声明，继承它会在 import 时直接 NameError。
+    而 ValueError 也能让工具/API 层现有的 except 分支照常捕获。
+    """
+
+
+def _validate_memory_identifier(identifier: str) -> str:
+    """校验并归一 identifier，非法则抛 MemoryIdentifierError。
+
+    返回 str(identifier).strip()，供调用方直接使用，避免各处重复 strip。
+    """
+    ident = str(identifier or "").strip()
+    if not ident:
+        raise MemoryIdentifierError("identifier 不能为空")
+    if not _MEMORY_IDENT_RE.match(ident) or ident in (".", ".."):
+        raise MemoryIdentifierError(
+            f"identifier 非法：{ident!r}（只允许字母、数字、下划线、连字符和点）")
+    return ident
+
+
+# ==================== thread_key 净化 ====================
+# thread_key 形如 "group_<openid>" / "c2c_<openid>"，最终被拼成
+#   HISTORY_DIR / f"{thread_key}.json"
+# 与记忆 identifier 是**两条独立**的拼接链路，因此必须各自校验 —— 早先只给
+# identifier 加校验时，history 这条路仍是敞开的。
+#
+# 危险来源：API 的 /api/history 直接把 query 里的 target_id 交给
+# append_message/save_history（只做过 .strip()），构造
+# target_id="x/../../config" 会让路径解析到项目根目录的 config.json ——
+# 该文件含全部机器人 APP_SECRET 与 LLM api_key 明文；写方向更会直接覆盖它。
+#
+# 这里同样用白名单：只放行字母/数字/下划线/连字符/点，并额外要求必须先有
+# "group_" 或 "c2c_" 前缀，保证 key 的语义不会被伪造。
+_THREAD_KEY_RE = re.compile(r'^(?:group|c2c)_[A-Za-z0-9_.-]{1,128}$')
+
+
+def _validate_thread_key(thread_key: str) -> str:
+    """校验并归一 thread_key，非法则抛 MemoryIdentifierError。
+
+    合法形式：group_<id> / c2c_<id>，id 只含字母数字下划线连字符点。
+    返回值可直接用于拼接文件名。
+    """
+    key = str(thread_key or "").strip()
+    if not key:
+        raise MemoryIdentifierError("thread_key 不能为空")
+    if not _THREAD_KEY_RE.match(key):
+        raise MemoryIdentifierError(
+            f"thread_key 非法：{key!r}（应形如 group_<id> 或 c2c_<id>）")
+    # 前缀已由正则保证，但仍排除 "group_." / "group_.." 这类目录自引用
+    if key.split("_", 1)[1] in (".", ".."):
+        raise MemoryIdentifierError(f"thread_key 非法：{key!r}")
+    return key
+
+
+# ==================== 整理结果的并发安全写回（M5） ====================
+# 四个整理函数（群/私聊/机器人/全局）都是这个形状：
+#     1. 读出 old_list
+#     2. await call_ai_with_tools(...)      ← LLM 往返，可达数秒到数十秒
+#     3. set_xxx_memory_list(new_list)      ← 整表覆盖
+#
+# 第 2 步是个长 await 窗口。期间若有人 add_memory（AI 工具或 API），
+# 新条目会落盘；第 3 步却拿「整理前的快照 + LLM 结果」整表盖回去 ——
+# 新增的记忆**静默消失**，而调用方早已收到「添加成功」。
+#
+# 这里不改「整理」的语义（整理本来就是要重写整个列表），只做一件事：
+# 把「窗口期内新出现、且不在 old_list 里」的条目补回到结果末尾。
+# 这样既不丢新记忆，也不影响 LLM 的精简效果。
+def _merge_organized_result(old_list: List[str], new_list: List[str],
+                            current_list: List[str]) -> List[str]:
+    """把 await 窗口内新增的条目并回整理结果。
+
+    old_list     : 整理开始时的快照（发给 LLM 的基准）
+    new_list     : LLM 返回的整理结果
+    current_list : 此刻磁盘上的真实内容
+
+    返回：new_list + 窗口内新增项（按原顺序、去重）。
+    """
+    if not isinstance(new_list, list):
+        return new_list
+    old_set = set(old_list or [])
+    new_set = set(new_list)
+    added = []
+    for c in (current_list or []):
+        # 只收「窗口期内新出现」且「LLM 结果里没有」的条目，
+        # 并按首次出现去重（current_list 自身可能含重复项）
+        if c not in old_set and c not in new_set and c not in added:
+            added.append(c)
+    if not added:
+        return new_list
+    info(f"[记忆整理] await 窗口内新增 {len(added)} 条记忆，已并回整理结果", ctx=None)
+    return list(new_list) + added
+
+
 # ==================== 群记忆 ====================
 def get_qun_memory(group_id: str) -> Dict:
-    file_path = QUN_MEMORY_DIR / f"{group_id}.json"
-    return safe_load_json(file_path, {"enabled": 1, "memory": []})
+    file_path = QUN_MEMORY_DIR / f"{_validate_memory_identifier(group_id)}.json"
+    # 群记忆文件名只有群 openid，不含 app_id —— 反查一次，让日志能看出归属
+    return safe_load_json(file_path, {"enabled": 1, "memory": []},
+                          ctx=ctx_for_group(group_id))
 
 
 def set_qun_memory(group_id: str, data: Dict):
-    file_path = QUN_MEMORY_DIR / f"{group_id}.json"
+    file_path = QUN_MEMORY_DIR / f"{_validate_memory_identifier(group_id)}.json"
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -417,12 +714,14 @@ def transfer_memory_to_qun(group_id: str, index: int, app_id: Optional[str] = No
 
 # ==================== 私聊记忆 ====================
 def get_c2c_memory(user_id: str) -> Dict:
-    file_path = C2C_MEMORY_DIR / f"{user_id}.json"
-    return safe_load_json(file_path, {"enabled": 1, "memory": []})
+    file_path = C2C_MEMORY_DIR / f"{_validate_memory_identifier(user_id)}.json"
+    # 同群记忆：文件名只有用户 openid，反查 app_id 补上归属
+    return safe_load_json(file_path, {"enabled": 1, "memory": []},
+                          ctx=ctx_for_user(user_id))
 
 
 def set_c2c_memory(user_id: str, data: Dict):
-    file_path = C2C_MEMORY_DIR / f"{user_id}.json"
+    file_path = C2C_MEMORY_DIR / f"{_validate_memory_identifier(user_id)}.json"
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -477,12 +776,13 @@ def set_c2c_memory_enabled(user_id: str, enabled: bool):
 
 # ==================== 机器人记忆 ====================
 def get_bot_memory(app_id: str) -> Dict:
-    file_path = BOT_MEMORY_DIR / f"{app_id}.json"
-    return safe_load_json(file_path, {"enabled": 1, "memory": []})
+    file_path = BOT_MEMORY_DIR / f"{_validate_memory_identifier(app_id)}.json"
+    return safe_load_json(file_path, {"enabled": 1, "memory": []},
+                          ctx=LogCtx(app_id=app_id) if app_id else None)
 
 
 def set_bot_memory(app_id: str, data: Dict):
-    file_path = BOT_MEMORY_DIR / f"{app_id}.json"
+    file_path = BOT_MEMORY_DIR / f"{_validate_memory_identifier(app_id)}.json"
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -685,8 +985,10 @@ def render_history_for_ai(msg: Dict) -> Dict:
 
 
 def load_history(thread_key: str) -> List[Dict]:
-    hist_file = HISTORY_DIR / f"{thread_key}.json"
-    raw = safe_load_json(hist_file, [])
+    hist_file = HISTORY_DIR / f"{_validate_thread_key(thread_key)}.json"
+    # history 文件名是 thread_key（c2c_xxx / group_xxx），本身不含 app_id，
+    # 反查一次补上归属，避免历史上出问题时看日志不知道是谁的会话
+    raw = safe_load_json(hist_file, [], ctx=ctx_for_thread(thread_key))
     if not isinstance(raw, list):
         return []
     # 读取即归一：旧格式记录在此拆出 ts/username/user_id，上层只见一种结构
@@ -694,7 +996,7 @@ def load_history(thread_key: str) -> List[Dict]:
 
 
 def save_history(thread_key: str, hist: List[Dict]):
-    hist_file = HISTORY_DIR / f"{thread_key}.json"
+    hist_file = HISTORY_DIR / f"{_validate_thread_key(thread_key)}.json"
     with open(hist_file, "w", encoding="utf-8") as f:
         json.dump(hist, f, ensure_ascii=False, indent=2)
 
@@ -746,9 +1048,19 @@ def append_message(thread_key: str, role: str, content: str, is_summary: bool = 
             if loop.is_running():
                 # 延迟导入避免循环依赖
                 from ai import generate_and_insert_summary
-                asyncio.create_task(generate_and_insert_summary(thread_key))
-        except Exception:
-            pass
+                # 用 spawn_background 而不是裸 create_task：
+                #   1) 裸调用不持有返回值，任务可能被 GC 回收；
+                #   2) 失败时异常只落 stderr，不进日志。
+                # 摘要生成失败会表现为「记忆压缩永远不发生」，正是需要
+                # 在日志里一眼看到的那类问题（参见 group 记忆整理曾 100% 静默失效）。
+                spawn_background(generate_and_insert_summary(thread_key),
+                                 f"summary-{thread_key}", ctx_for_thread(thread_key))
+        except Exception as e:
+            # 原先这里是裸 `except Exception: pass` —— 全项目唯一的静默 pass。
+            # 事件循环不可用 / 延迟导入失败都属于「摘要不会生成」的确定性故障，
+            # 必须留下痕迹，否则无从判断记忆为何不再压缩。
+            warn(f"[摘要] 无法派发摘要生成任务（{thread_key}）：{type(e).__name__}: {e}",
+                 ctx=ctx_for_thread(thread_key))
 
 
 def strip_message_meta(msg: Dict) -> Dict:
@@ -908,6 +1220,108 @@ def get_recent_history(thread_key: str, limit: int) -> List[Dict]:
     non_summary = [msg for msg in hist
                    if not msg.get("is_summary") and not is_message_hidden(msg)]
     return non_summary[-limit:]
+
+
+def history_len(thread_key: str) -> int:
+    """当前历史条数，用作「本轮任务起点」的标记（见 get_sent_messages_since）。
+
+    用条数而不是时间戳：同一秒内可能写入多条，时间戳无法定位边界；
+    条数天然单调递增，只要期间没有裁剪历史就足够可靠。
+
+    ★ 读取失败时**不能返回 0**：0 是合法且极小的一条数，会被下游当作
+      「本轮起点在第 0 条」，于是 get_sent_messages_since(thread_key, 0)
+      把整段历史里所有带 msg_id 的助手消息都当成「本轮已发送」灌进系统提示，
+      模型会以为自己已经说过大量内容而不再回复。
+      这里改为记一条 error 并返回当前已知的最大安全值（历史读不出时用 0
+      仍有同样风险，故退化为「不注入已发送清单」——由调用方按 None 处理）。
+      返回 None 表示「未知」，调用方 generate_reply 会跳过该清单。
+    """
+    try:
+        return len(load_history(thread_key))
+    except Exception as e:
+        error(f"[历史长度] 读取 {thread_key} 失败，本轮不注入「已发送消息」清单: {e}",
+              ctx=ctx_for_thread(thread_key) if thread_key else None)
+        return None
+
+
+def get_sent_messages_since(thread_key: str, since: int) -> List[Dict]:
+    """取 since 之后**真正发出去过**的机器人消息（供打断恢复时告知模型）。
+
+    只认 msg_id 非空的 assistant 记录 —— 这是「已发送」的唯一可靠凭证：
+      - 工具循环里模型产出的 content 只是「打算说的话」，本轮结束时才真正发送
+        （见 ai.py 的发送段），所以打断时那些文本根本没发出去；
+      - 只有经 send_message / 发送工具 发出去的消息才会带 msg_id 写入历史。
+    因此按 msg_id 判断，才能避免把「没发出去的话」错报成已发送，
+    否则模型会以为自己已经说过，反而漏掉该说的内容。
+
+    ★ M11：since 是**历史下标**，而下标会被「摘要插入」改变 ——
+      ai.py 生成摘要时会在历史中间 insert 一条 is_summary 消息，其后所有
+      消息下标 +1。若本轮的 task_start 是在摘要插入前记下的，摘要一插入，
+      这个下标就指向了**更早**的位置，于是 get_sent_messages_since 会把
+      上一轮甚至更早的机器人消息也算进「本轮已发送」→ 模型误以为说过，
+      从而漏回复。
+      这里加一层锚点校正：若 since 处（或其紧邻）正好是摘要消息，说明
+      下标已因插入而偏移，向下跳过摘要带来的位移，取到真正的边界。
+    """
+    out: List[Dict] = []
+    try:
+        hist = load_history(thread_key)
+    except Exception:
+        return out
+    idx = _adjust_index_after_summary_insert(hist, int(since))
+    for m in hist[max(0, idx):]:
+        if m.get("role") != "assistant":
+            continue
+        if not m.get("msg_id"):
+            continue                      # 没发出去的（含工具循环中间产物）
+        if m.get("is_hide"):
+            continue                      # 已隐藏的：模型本来就不该看到
+        content = str(m.get("content") or "").strip()
+        if not content:
+            continue
+        out.append({"content": content, "ts": m.get("ts") or ""})
+    return out
+
+
+def _adjust_index_after_summary_insert(hist: List[Dict], idx: int) -> int:
+    """校正因「摘要插入到中间」而偏移的历史下标（M11）。
+
+    摘要生成会把一条 is_summary 消息 insert 到历史中部（ai.py 的
+    insert_pos = len(hist) - 10 附近），导致其后的消息下标整体 +1。
+    而 task_start 是在摘要出现**之前**记下的旧下标，插入后它指向的位置
+    会往前偏，把更早的消息纳入范围。
+
+    校正方法：统计 [0, idx) 区间内、且位于「当前最后一个摘要之后」的
+    摘要条数 —— 这些都是插入点在本轮起点之前、把起点往后推的位移量，
+    补偿回去即可。
+
+    这是保守估计：宁可比真实起点略早（多带出几条旧消息）也不漏掉
+    本轮真正发过的消息吗？—— 不，反过来。多带出旧消息会让模型误以为
+    已经说过（漏回复），所以这里选择**对齐到最近的摘要边界之后**，
+    确保不会把摘要之前的内容算进本轮。
+    """
+    if idx <= 0:
+        return idx
+    n = len(hist)
+    if n == 0:
+        return 0
+    if idx >= n:
+        return n
+    # 摘要插入位移的检测要**双向**看：
+    #   - 向后看（idx 本身及紧邻之前）：起点正好落在摘要上，或摘要就在
+    #     起点前一条 —— 这是「插入点刚好压在起点上」的形态。
+    #   - 向前看（idx 紧邻之后）：摘要就在起点后一条 —— 摘要被 insert 到
+    #     起点的位置，把原来的起点内容往后挤了一位（ai.py 的 insert_pos
+    #     常取 len(hist)-10，很容易正好等于本轮 task_start）。
+    # 两种形态都会让起点相对真实边界前移，统一推到该摘要之后。
+    summary_idx = -1
+    for i in (idx, idx - 1, idx + 1):
+        if 0 <= i < n and hist[i].get("is_summary"):
+            summary_idx = i
+            break
+    if summary_idx != -1:
+        return min(summary_idx + 1, n)
+    return idx
 
 
 # ==================== 媒体缓存 ====================
@@ -1100,6 +1514,9 @@ async def organize_global_memory(app_id: Optional[str] = None, retries: int = 3)
             old_file = BASE_DIR / f"old_memory{suffix}_{timestamp}.json"
             with open(old_file, "w", encoding="utf-8") as f:
                 json.dump(old_list, f, ensure_ascii=False, indent=2)
+            # 并回 await 窗口内新增的记忆（M5）
+            new_list = _merge_organized_result(
+                old_list, new_list, get_global_memory(app_id))
             set_global_memory(new_list, app_id)
             info(f"[记忆整理] 完成（工具调用），原{len(old_list)}条精简为{len(new_list)}条，旧记忆保存至 {old_file}", ctx=app_id)
             return
@@ -1137,9 +1554,11 @@ async def organize_qun_memory(group_id: str, retries: int = 3,
     """整理（压缩）群记忆。
 
     app_id: 所属机器人 APP_ID，由调用链显式传入，用于日志标识。
+            不传时按群 openid 反查（查不到就留空，至少 thread 仍可定位）。
     """
     # 本函数所有日志统一使用的标识（thread_key = 群会话）
-    ctx = LogCtx(app_id=app_id or "", thread_key=f"group_{group_id}")
+    ctx = LogCtx(app_id=app_id or find_app_id_by_group(group_id),
+                 thread_key=f"group_{group_id}")
     from ai import call_ai_with_tools  # 延迟导入避免循环依赖
     organize_tool = {
         "type": "function",
@@ -1186,8 +1605,15 @@ async def organize_qun_memory(group_id: str, retries: int = 3,
             backup_dir = BASE_DIR / "qun_memory_backup"
             backup_dir.mkdir(exist_ok=True)
             old_file = backup_dir / f"{group_id}_{timestamp}.json"
+            # 备份的是「整理前的记忆列表」——与全局/机器人/私聊三条同级路径
+            # （本文件内另外三处 json.dump(old_list) 调用）保持一致。
+            # 原先此处误写 current_data（本函数内根本不存在的变量），NameError
+            # 被下方 except 吞掉并重试 3 次后放弃，导致群记忆整理 100% 静默失效。
             with open(old_file, "w", encoding="utf-8") as f:
-                json.dump(current_data, f, ensure_ascii=False, indent=2)
+                json.dump(old_list, f, ensure_ascii=False, indent=2)
+            # 写回前并回 await 窗口内新增的记忆（M5），否则会被整表覆盖丢掉
+            new_list = _merge_organized_result(
+                old_list, new_list, get_qun_memory_list(group_id))
             set_qun_memory_list(group_id, new_list)
             info(f"[群记忆整理] 群 {group_id} 整理完成（工具调用），原{len(old_list)}条精简为{len(new_list)}条，旧记忆保存至 {old_file}", ctx=ctx)
             return
@@ -1261,6 +1687,9 @@ async def organize_bot_memory(app_id: str, retries: int = 3):
             old_file = BASE_DIR / f"bot_memory_backup_{app_id}_{timestamp}.json"
             with open(old_file, "w", encoding="utf-8") as f:
                 json.dump(old_list, f, ensure_ascii=False, indent=2)
+            # 并回 await 窗口内新增的记忆（M5）
+            new_list = _merge_organized_result(
+                old_list, new_list, get_bot_memory_list(app_id))
             set_bot_memory_list(app_id, new_list)
             info(f"[机器人记忆整理] 完成（工具调用），原{len(old_list)}条精简为{len(new_list)}条，旧记忆保存至 {old_file}", ctx=app_id)
             return
@@ -1298,9 +1727,11 @@ async def organize_c2c_memory(user_id: str, retries: int = 3,
     """整理（压缩）私聊记忆。
 
     app_id: 所属机器人 APP_ID，由调用链显式传入，用于日志标识。
+            不传时按用户 openid 反查（查不到就留空，至少 thread 仍可定位）。
     """
     # 本函数所有日志统一使用的标识（thread_key = 私聊会话）
-    ctx = LogCtx(app_id=app_id or "", thread_key=f"c2c_{user_id}")
+    ctx = LogCtx(app_id=app_id or find_app_id_by_user(user_id),
+                 thread_key=f"c2c_{user_id}")
     from ai import call_ai_with_tools
     organize_tool = {
         "type": "function",
@@ -1346,6 +1777,9 @@ async def organize_c2c_memory(user_id: str, retries: int = 3,
             old_file = BASE_DIR / f"c2c_memory_backup_{user_id}_{timestamp}.json"
             with open(old_file, "w", encoding="utf-8") as f:
                 json.dump(old_list, f, ensure_ascii=False, indent=2)
+            # 并回 await 窗口内新增的记忆（M5）
+            new_list = _merge_organized_result(
+                old_list, new_list, get_c2c_memory_list(user_id))
             set_c2c_memory_list(user_id, new_list)
             info(f"[私聊记忆整理] 完成（工具调用），原{len(old_list)}条精简为{len(new_list)}条，旧记忆保存至 {old_file}", ctx=ctx)
             return

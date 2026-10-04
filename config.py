@@ -22,7 +22,8 @@ DEFAULT_CONFIG = {
     # ==================== 日志配置 ====================
     "enable_log": 0,                 # 0=禁用文件日志（仅控制台输出），1=启用文件日志
     "log_file": "log.txt",           # 日志文件路径
-    "max_log_length": 800,           # 日志文件最大行数，达到后自动轮转
+    "max_log_length": 800,           # 日志文件最大行数，达到后自动轮转裁掉旧行；
+                                     # 0（或负数）= 不限制文件大小，只追加不裁剪（自行留意磁盘占用）
     "disable_print_in_console": 0,   # 0=控制台输出，1=关闭控制台显示（文件日志仍可启用）
     "log_level": "DEBUG",            # 文件日志记录等级：DEBUG/INFO/WARNING/ERROR/CRITICAL
     "log_console_level": "DEBUG",    # 控制台输出等级：默认 DEBUG（全部显示），可设为 INFO 过滤调试噪音
@@ -36,7 +37,6 @@ DEFAULT_CONFIG = {
             "ISOLATE_GLOBAL_MEMORY": 0,                 # 0 表示共享全局记忆，1 表示隔离
             "ENABLED": 1,                               # 1 启用，0 禁用
             "AUTO_WELCOME": 1,                          # 1 自动发送欢迎语
-            "GROUP_MANAGE_WHITELIST": [],               # 群管理白名单（群ID列表）
             "ENABLE_TOOLS": 1,                          # 是否启用工具调用
             "MAX_TOOL_ROUNDS": 6,                       # 工具调用最大轮数
             "ALLOW_CROSS_BOT_PUSH": 1,                  # 1=允许本机器人跨机器人推送（向其他机器人的用户/群发消息），0=禁止
@@ -106,10 +106,14 @@ BOT_NAME = "蓝狼"
 
 
 # ==================== 安全 JSON 读取（自动修复损坏文件） ====================
-def safe_load_json(file_path: Path, default_data):
+def safe_load_json(file_path: Path, default_data, ctx=None):
     """
     尝试读取 JSON 文件，若文件不存在或格式损坏，则备份损坏文件并创建新文件写入 default_data，
     然后返回 default_data。
+
+    ctx 可选：本函数是通用工具，但调用方往往知道这份数据属于哪个机器人
+    （例如 bot_memory/<app_id>.json 的 app_id 就在手上）。传进来日志里就能
+    直接定位到是哪个机器人的数据损坏了，而不是一行 appid=? 的无主记录。
     """
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
@@ -122,16 +126,16 @@ def safe_load_json(file_path: Path, default_data):
                 backup_name = file_path.with_name(f"[broken]{timestamp}_{file_path.name}")
             try:
                 file_path.rename(backup_name)
-                warn(f"文件 {file_path} 损坏，已备份为 {backup_name}", ctx=None)
+                warn(f"文件 {file_path} 损坏，已备份为 {backup_name}", ctx=ctx)
             except Exception as be:
-                error(f"备份文件失败: {be}", ctx=None)
+                error(f"备份文件失败: {be}", ctx=ctx)
         try:
             file_path.parent.mkdir(parents=True, exist_ok=True)
             with open(file_path, 'w', encoding='utf-8') as f:
                 json.dump(default_data, f, ensure_ascii=False, indent=2)
-            info(f"已创建新的 {file_path} 使用默认数据", ctx=None)
+            info(f"已创建新的 {file_path} 使用默认数据", ctx=ctx)
         except Exception as we:
-            error(f"创建新文件失败: {we}", ctx=None)
+            error(f"创建新文件失败: {we}", ctx=ctx)
         return default_data
 
 
@@ -281,13 +285,6 @@ def get_bot_auto_welcome(app_id: str) -> bool:
         if bot.get("APP_ID") == app_id:
             return bot.get("AUTO_WELCOME", 0) == 1
     return False
-
-
-def get_bot_group_manage_whitelist(app_id: str) -> List[str]:
-    for bot in get_bots():
-        if bot.get("APP_ID") == app_id:
-            return bot.get("GROUP_MANAGE_WHITELIST", [])
-    return []
 
 
 def get_bot_enable_tools(app_id: str) -> bool:
@@ -495,10 +492,6 @@ def get_api_bind_port() -> int:
         return 8148
 
 
-def is_group_manage_enabled(app_id: str, group_id: str) -> bool:
-    return True
-
-
 def get_ai_max_msg_len() -> int:
     return get_config().get("AI_MAX_MSG_LEN", 1500)
 
@@ -552,16 +545,40 @@ def get_enable_log() -> int:
 
 
 def get_log_file() -> str:
-    """获取日志文件路径（基于程序目录解析相对路径）"""
-    log_file = str(get_config().get("log_file", "log.txt"))
-    p = Path(log_file)
+    """获取日志文件路径（基于程序目录解析相对路径）。
+
+    ★ 这里必须做目录包含校验，不能只做「相对路径就拼 BASE_DIR」：
+      log_file 是**可经 /api/config/set 修改的配置项**，而 /api/logs
+      直接 open() 它并返回内容 —— 只看 basename 脱敏是不够的，那只改了
+      显示名，没有约束真正的读取目标。传入 "../../config.json" 或
+      "x/../../config" 都能逃出项目目录，把任意文件读回来。
+      所以解析后要求结果**必须位于 BASE_DIR 之内**，否则回退到默认值并告警。
+    """
+    raw = str(get_config().get("log_file", "log.txt"))
+    p = Path(raw)
     if not p.is_absolute():
         p = BASE_DIR / p
-    return str(p)
+
+    # 归一化（展开 .. 与 .），再做包含判定。
+    # 用 resolve() 而非 absolute()：只有前者会真正消解 ".."。
+    try:
+        resolved = p.resolve()
+        base = BASE_DIR.resolve()
+    except OSError:
+        return str(BASE_DIR / "log.txt")
+
+    if resolved != base and base not in resolved.parents:
+        warn(f"log_file 指向项目目录之外（{raw!r} -> {resolved}），已回退为 log.txt", ctx=None)
+        return str(base / "log.txt")
+    return str(resolved)
 
 
 def get_max_log_length() -> int:
-    """获取日志文件最大行数"""
+    """获取日志文件最大行数。
+
+    返回 0（或负数）表示**不限制文件大小** —— log.py 的滚动 sink 只在
+    max_lines > 0 时裁剪，因此 0 会一直追加、永不删旧行。
+    """
     return int(get_config().get("max_log_length", 800))
 
 

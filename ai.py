@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 
 from config import (
     get_model_config, get_global_system_prompt, get_bot_system_prompt,
-    get_executor, is_group_manage_enabled,
+    get_executor,
     get_bot_enable_tools, get_bot_max_tool_rounds, get_tool_choice,
     get_bot_disable_ai_reply,
 )
@@ -21,6 +21,7 @@ from memory import (
     get_c2c_memory_list, get_c2c_memory_enabled,
     get_bot_memory_list, get_bot_memory_enabled,
     get_history, load_history, save_history, get_compress_threshold,
+    history_len, get_sent_messages_since,   # 打断恢复：告知模型本轮已发过什么
     get_cached_media_summary, set_cached_media, get_media_cache_key, get_url_cache_key,
     compute_similarity,
     append_message,
@@ -904,7 +905,16 @@ async def generate_and_insert_summary(thread_key: str, retries: int = 3):
                 continue
 
             # 二次检查并插入
+            #
+            # ★ 必须重新 load_history，且插入位置要按「实时历史」重算：
+            #   上面 889 行的 await call_ai 会挂起数秒，期间同一会话完全可能
+            #   又追加了新消息（用户在等摘要时继续说话）。若沿用 852 行那份
+            #   旧快照做 insert + save_history，await 窗口内新到的消息会被
+            #   整段覆盖掉 —— 表现为「用户刚说的话凭空消失」。
+            #   因此这里以磁盘现状为基准，只把摘要插进去，绝不回写旧快照。
             hist = load_history(thread_key)
+            if not hist:
+                return
             last_summary_idx = -1
             for i, msg in enumerate(hist):
                 if msg.get("is_summary"):
@@ -918,6 +928,8 @@ async def generate_and_insert_summary(thread_key: str, retries: int = 3):
                 insert_pos = 0
             if last_summary_idx != -1 and insert_pos <= last_summary_idx:
                 insert_pos = last_summary_idx + 1
+            # 防越界：并发追加使 len(hist) 变化时，insert 位置仍须落在合法区间
+            insert_pos = max(0, min(insert_pos, len(hist)))
             summary_msg = {"role": "system", "content": summary_text, "is_summary": True}
             hist.insert(insert_pos, summary_msg)
             save_history(thread_key, hist)
@@ -932,10 +944,15 @@ async def generate_and_insert_summary(thread_key: str, retries: int = 3):
 def build_system_prompt(thread_key: str, user_message: str, username: str,
                         msg_type: str, raw_message_json: str, bot_client,
                         msg_id: Optional[str] = None,
-                        enable_group_manage: bool = False,
                         round_num: Optional[int] = None,
-                        max_rounds: Optional[int] = None) -> str:
-    """构造完整的系统提示，包含记忆、聊天上下文、工具轮次信息等。"""
+                        max_rounds: Optional[int] = None,
+                        task_start: Optional[int] = None) -> str:
+    """构造完整的系统提示，包含记忆、聊天上下文、工具轮次信息等。
+
+    task_start: 本轮任务开始时的历史条数（见 generate_reply）。
+      传入后会额外注入「本轮已发送的消息」清单 —— 用于消息打断后重新生成时，
+      让模型知道打断前自己已经发过哪些内容，避免重复回复。
+    """
     app_id = bot_client.app_id
     group_id = thread_key.replace("group_", "") if msg_type == "group" else None
     recipient_id = group_id if msg_type == "group" else thread_key.replace("c2c_", "")
@@ -1038,6 +1055,33 @@ def build_system_prompt(thread_key: str, user_message: str, username: str,
         memory_text += f"【机器人专属记忆】\n（禁用，旧记忆可通过工具查看找回）"
     memory_text = memory_text.strip()
 
+    # —— 本轮已经发出去的消息（打断恢复时用来防重复回复）——
+    # 只在确实发过东西时才注入：没发过就不该出现这一段，
+    # 否则模型会看到「已发送：无」这种无意义的占位，甚至误以为自己发过。
+    already_sent_text = ""
+    if task_start is not None:
+        try:
+            _sent = get_sent_messages_since(thread_key, task_start)
+        except Exception:
+            _sent = []
+        if _sent:
+            _lines = []
+            for _i, _m in enumerate(_sent, 1):
+                _body = _m["content"]
+                if len(_body) > 300:
+                    _body = _body[:300] + "…（已截断）"
+                _ts = f"[{_m['ts']}] " if _m.get("ts") else ""
+                _lines.append(f"{_i}. {_ts}{_body}")
+            already_sent_text = (
+                "【本轮你已经发送的消息】\n"
+                + "\n".join(_lines) + "\n"
+                "以上内容**已经真实发送给用户了**。你刚才的回复被新消息打断，"
+                "现在需要接着处理新消息。\n"
+                "请**不要**重复发送上面已经说过的内容，也不要换种说法把同样的意思再说一遍；"
+                "只需回应新消息中尚未回应的部分。"
+                "如果新消息只是补充或追问，就直接针对它作答。\n"
+            )
+
     # —— 聊天上下文信息 ——
     chat_type_name = "群聊" if msg_type == "group" else "私聊"
     if msg_type == "group":
@@ -1059,7 +1103,7 @@ def build_system_prompt(thread_key: str, user_message: str, username: str,
     now_rfc3339 = now_beijing.isoformat(timespec='seconds')
 
     # 从 tool 获取工具描述
-    tools_desc = get_tools_description(enable_group_manage)
+    tools_desc = get_tools_description()
 
     # 构建上下文摘要行
     context_line = f"【当前会话】类型：{chat_type_name} | {'群名称' if msg_type=='group' else '私聊对象'}：{chat_target} | 当前机器人：{bot_name} | APP_ID：{app_id}"
@@ -1072,6 +1116,7 @@ def build_system_prompt(thread_key: str, user_message: str, username: str,
         f"{memory_text}\n"
         f"{context_line}\n"
         f"当前时间（北京时间）：{now_rfc3339}\n"
+        f"{already_sent_text}"
         "在群聊中，如果需要提及某位用户，请直接使用markdown格式的 <@!user_id> 或者直接使用 @用户名 。\n"
         "重要：在回复内容中，严禁显示用户的ID和时间（即不用在回复前添加时间，不要在用户名后面添加括号和ID序列）。\n"
         "用户可能会发送语音消息、文本文件、图片、视频或包含网页链接的消息。语音消息已被自动转写成文字，并显示为 [语音：转文字内容]。文本文件内容会被自动读取并嵌入消息中，格式为 [文件：文件名] 后跟文件内容块。图片和视频会被自动识别并生成摘要，格式为 [收到图片：文件名] 或 [收到视频：文件名] 后跟摘要。你可以根据这些内容进行回复。\n"
@@ -1092,11 +1137,16 @@ async def generate_reply(
     msg_id: Optional[str] = None,
     initial_messages: Optional[List[Dict]] = None,
     recipient_id: Optional[str] = None,   # 新增：接收者ID
+    task_start: Optional[int] = None,     # 本轮对话最初的历史起点（打断续跑时沿用）
 ) -> tuple[str, bool, bool]:
     """
     生成回复。
     内部负责：AI生成 → （可选）发送消息 → 保存历史
     返回 (reply_text, sent_success, skip_reply_called)
+
+    task_start: 本轮对话「最初」开始时的历史条数。首次调用传 None（自动取当前值）；
+      被消息打断后重新调用时，由调用方把首次的值传回来 —— 否则反复打断会让
+      起点不断后移，「已发送消息」清单失效、模型重复回复。
     """
     ctx = LogCtx(app_id=bot_client.app_id, thread_key=thread_key, msg_id=msg_id or "")
 
@@ -1136,14 +1186,30 @@ async def generate_reply(
         else:  # c2c
             recipient_id = thread_key.replace("c2c_", "")
 
-    # 群消息始终启用群管理（不再自动注入禁言状态，由工具 get_group_mute_status 按需查询）
-    enable_group_manage = True if msg_type == "group" and group_id else False
+    # 群管理工具始终下发（不再自动注入禁言状态，由工具 get_group_mute_status 按需查询）
+
+    # 本轮任务的「历史起点」：记下处理开始时的历史条数。
+    # 之后凡是 msg_id 非空、又落在这个位置之后的 assistant 记录，
+    # 就是「本轮已经真正发出去的消息」（见 get_sent_messages_since）。
+    # 用途：被新消息打断后重新生成时，把这些消息写进系统提示，
+    # 让模型知道自己已经说过什么，避免把同样的话再回复一遍。
+    #
+    # 关键：被反复打断时**必须沿用最初的起点**，不能每次重新取。
+    # 一次对话可能被连续打断多次（每次都有新消息进来），而每次恢复都会
+    # 重新进入本函数；若这里重新取快照，上一轮已发出的消息就被越过去了，
+    # 提示会变空 —— 模型又开始重复回复，等于这个功能在多打断场景下失效。
+    # 因此调用方（msg.process_queue）会把首次的起点随中断上下文一起传递下来。
+    if task_start is None:
+        # history_len 读取失败时返回 None（表示「未知」）——
+        # 此时保持 None，build_system_prompt 会跳过「已发送消息」清单，
+        # 绝不能退化成 0，否则整段历史都会被当成「本轮已发送」。
+        task_start = history_len(thread_key)
 
     # 构建系统提示
     base_sys = build_system_prompt(
         thread_key, user_message, username,
         msg_type, raw_message_json, bot_client, msg_id,
-        enable_group_manage=enable_group_manage
+        task_start=task_start,
     )
     system_prompt = base_sys
 
@@ -1192,7 +1258,7 @@ async def generate_reply(
             warn(f"[AI Reply Error] {e}", ctx=ctx)
             final_reply = "抱歉，我暂时无法回复，请稍后再试。"
     else:
-        tools = get_tools_definition(enable_group_manage=enable_group_manage)
+        tools = get_tools_definition()
         MAX_TOOL_ROUNDS = max_tool_rounds
         canceled = False
 
@@ -1206,9 +1272,9 @@ async def generate_reply(
                 updated_sys = build_system_prompt(
                     thread_key, user_message, username,
                     msg_type, raw_message_json, bot_client, msg_id,
-                    enable_group_manage=enable_group_manage,
                     round_num=round_num,
-                    max_rounds=MAX_TOOL_ROUNDS
+                    max_rounds=MAX_TOOL_ROUNDS,
+                    task_start=task_start,
                 )
                 if messages and messages[0].get("role") == "system":
                     messages[0] = {"role": "system", "content": updated_sys}
