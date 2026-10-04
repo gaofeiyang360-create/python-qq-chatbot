@@ -814,6 +814,10 @@ async def h_bots(request: web.Request) -> web.Response:
             "enabled": get_bot_enabled(aid),
             "api_enabled": get_bot_api_enabled(aid),
             "desc": desc,
+            # 是否配了本机器人独立密钥。只给布尔值，不回显密钥本身。
+            # 管理面板的机器人视图据此显示「独立密钥 / 全局密钥」，
+            # 避免为了这一个字段去调 /info（后者未鉴权时不返回 bots）。
+            "has_keys": len(get_bot_api_keys(aid)) > 0,
         })
     return ok({
         "total": len(out),

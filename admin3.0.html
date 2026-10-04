@@ -1090,6 +1090,63 @@ select.inp{appearance:none; padding-right:30px;
 }
 .mem-badge.off{background:var(--stroke); color:var(--ink-3)}
 
+/* ============================================================
+   日志视图
+   ============================================================ */
+.log-stat{
+  display:flex; flex-wrap:wrap; gap:6px 16px; align-items:center;
+  font-size:12px; color:var(--ink-3); margin-bottom:10px;
+}
+.log-stat-i b{color:var(--ink); font-weight:600}
+.log-warn{color:var(--warn); font-weight:600}
+
+.log-bar{display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:11px}
+
+.log-list{
+  border:1px solid var(--stroke); border-radius:var(--r-m);
+  overflow:hidden; background:var(--glass-strong);
+}
+.log-row{
+  display:flex; gap:9px; align-items:baseline;
+  padding:7px 12px; border-bottom:1px solid var(--stroke);
+  font-size:12.5px; line-height:1.6;
+}
+.log-row:last-child{border-bottom:none}
+.log-row:hover{background:var(--stroke)}
+
+.log-ts{
+  color:var(--ink-4); font-size:11.5px; white-space:nowrap;
+  font-variant-numeric:tabular-nums; flex:0 0 auto;
+}
+.log-src{
+  color:var(--ink-4); font-size:11px; white-space:nowrap;
+  overflow:hidden; text-overflow:ellipsis; max-width:150px; flex:0 0 auto;
+}
+.log-body{
+  flex:1 1 auto; min-width:0; color:var(--ink-2);
+  white-space:pre-wrap; word-break:break-word;
+}
+/* 等级徽章：固定宽度，让右侧正文对齐 */
+.log-lv{
+  flex:0 0 auto; min-width:62px; text-align:center;
+  font-size:10.5px; font-weight:700; padding:1px 7px; border-radius:999px;
+  background:var(--stroke); color:var(--ink-3); letter-spacing:.2px;
+}
+.log-lv.lv-trace{background:var(--stroke); color:var(--ink-4)}
+.log-lv.lv-debug{background:var(--stroke); color:var(--ink-3)}
+.log-lv.lv-info{background:var(--brand-soft); color:var(--brand)}
+.log-lv.lv-ok{background:var(--ok-soft); color:var(--ok)}
+.log-lv.lv-warn{background:var(--warn-soft); color:var(--warn)}
+.log-lv.lv-err{background:var(--err-soft); color:var(--err)}
+.log-lv.lv-crit{background:var(--err); color:#fff}
+
+@media (max-width:900px){
+  .log-row{flex-wrap:wrap; gap:4px 8px; padding:9px 11px}
+  .log-ts{flex:0 0 auto; font-size:11px}
+  .log-src{max-width:100%; order:3}
+  .log-body{flex:1 1 100%; order:4; font-size:12px}
+}
+
 @media (max-width:900px){
   /* 触屏上操作按钮与输入框放大，避免误触 */
   .mem-item{padding:13px}
@@ -1413,7 +1470,7 @@ select.inp{appearance:none; padding-right:30px;
 
     <div class="field">
       <label class="label" for="lgBase">服务地址</label>
-      <input id="lgBase" class="inp mono" placeholder="http://127.0.0.1:8080" autocomplete="off">
+      <input id="lgBase" class="inp mono" placeholder="http://127.0.0.1:8148" autocomplete="off">
     </div>
     <div class="field">
       <label class="label" for="lgKey">
@@ -1423,11 +1480,18 @@ select.inp{appearance:none; padding-right:30px;
       <div class="field-hint">
         留空则直接以无密钥方式登录；若服务端配置了密钥，会提示「密钥无效或未授权」。
       </div>
+      <label class="chk-line" style="margin-top:8px;font-size:12.5px;color:var(--ink-3);display:flex;align-items:center;gap:7px;cursor:pointer">
+        <input type="checkbox" id="lgRemember">
+        在此浏览器记住密钥（下次免输入）
+      </label>
+      <div class="field-hint" style="margin-top:4px">
+        不勾选时密钥只留在当前标签页，关闭即失效 —— 不会以明文长期存在磁盘上。
+      </div>
     </div>
     <button id="lgBtn" class="btn btn-primary" style="width:100%;height:38px">登 录</button>
     <div id="lgErr" class="login-err"></div>
     <div class="login-foot">
-      密钥只保存在浏览器本地，不会上传到其他服务
+      密钥只保存在本浏览器，不会上传到其他服务
     </div>
   </div>
 </div>
@@ -1464,6 +1528,8 @@ select.inp{appearance:none; padding-right:30px;
         <span style="font-size:18px">⏰</span><span class="nb-label">唤醒</span></button>
       <button class="nav-btn" data-nav="memory" title="记忆管理">
         <span style="font-size:18px">🧠</span><span class="nb-label">记忆</span></button>
+      <button class="nav-btn" data-nav="logs" title="运行日志">
+        <span style="font-size:18px">📜</span><span class="nb-label">日志</span></button>
       <button class="nav-btn" data-nav="config" title="配置">
         <span style="font-size:18px">⚙️</span><span class="nb-label">配置</span></button>
     </nav>
@@ -1545,6 +1611,7 @@ select.inp{appearance:none; padding-right:30px;
     <button data-nav="push"><span class="ico">📢</span>推送</button>
     <button data-nav="wakeup"><span class="ico">⏰</span>唤醒</button>
     <button data-nav="memory"><span class="ico">🧠</span>记忆</button>
+    <button data-nav="logs"><span class="ico">📜</span>日志</button>
     <button data-nav="config"><span class="ico">⚙️</span>配置</button>
   </nav>
 </div>
@@ -1557,7 +1624,7 @@ select.inp{appearance:none; padding-right:30px;
   <div id="modal" class="modal">
     <div class="modal-hd">
       <h3 id="mTitle">标题</h3>
-      <button class="btn btn-icon btn-sm" onclick="closeModal()">✕</button>
+      <button id="mClose" class="btn btn-icon btn-sm" title="关闭">✕</button>
     </div>
     <div id="mBody" class="modal-bd"></div>
     <div id="mFoot" class="modal-ft"></div>
@@ -1582,11 +1649,41 @@ const $ = id => document.getElementById(id);
    adm_base / adm_key / adm_bot 作为「当前活动目标」保留，
    老版本升级上来的单目标配置会自动并入列表，不会丢。 */
 const SERVERS_KEY = "adm_servers";
+
+/* 密钥存储策略。
+   默认 false：密钥只进 sessionStorage（关掉标签页即失效），
+   不落 localStorage —— 后者是持久化明文，任何同源页面/扩展都能读到，
+   而这里的密钥常常是拥有全部权限的全局密钥。
+   置 true 才持久化（老用户的行为，跨会话免重输）。 */
+const REMEMBER_KEY = "adm_remember_key";
+function rememberKeysEnabled() { return localStorage.getItem(REMEMBER_KEY) === "1"; }
+function setRememberKeys(on) {
+  if (on) localStorage.setItem(REMEMBER_KEY, "1");
+  else localStorage.removeItem(REMEMBER_KEY);
+}
+
+/* 密钥读写统一走 SS/LS 两处：rememberKeys 开时以 localStorage 为准，
+   关时只认 sessionStorage，且会顺带清掉历史遗留的 localStorage 明文。 */
+function readStoredKey() {
+  const s = sessionStorage.getItem("adm_key");
+  if (s) return s;
+  if (rememberKeysEnabled()) return localStorage.getItem("adm_key") || "";
+  // 未开启持久化：不读 localStorage 的旧值，并清理它
+  if (localStorage.getItem("adm_key")) localStorage.removeItem("adm_key");
+  return "";
+}
+function writeStoredKey(v) {
+  const val = v || "";
+  if (rememberKeysEnabled()) localStorage.setItem("adm_key", val);
+  else localStorage.removeItem("adm_key");
+  sessionStorage.setItem("adm_key", val);
+}
+
 const LS = {
   get base() { return localStorage.getItem("adm_base") || ""; },
   set base(v) { localStorage.setItem("adm_base", v); },
-  get key() { return localStorage.getItem("adm_key") || ""; },
-  set key(v) { localStorage.setItem("adm_key", v); },
+  get key() { return readStoredKey(); },
+  set key(v) { writeStoredKey(v); },
   get bot() { return localStorage.getItem("adm_bot") || ""; },
   set bot(v) { localStorage.setItem("adm_bot", v); },
   get theme() { return localStorage.getItem("adm_theme") || "light"; },
@@ -1606,7 +1703,10 @@ function baseLabel(base) {
 function readServers() {
   let list = [];
   try {
-    const raw = localStorage.getItem(SERVERS_KEY);
+    // 未开启持久化时改读 sessionStorage：同一标签页内切换服务器照常可用，
+    // 关掉标签页即消失，不会在磁盘上留下明文密钥
+    const src = rememberKeysEnabled() ? localStorage : sessionStorage;
+    const raw = src.getItem(SERVERS_KEY);
     const arr = raw ? JSON.parse(raw) : [];
     if (Array.isArray(arr)) {
       list = arr.filter(x => x && typeof x === "object" && normBase(x.base))
@@ -1631,7 +1731,10 @@ function readServers() {
 
 function writeServers(list) {
   try {
-    localStorage.setItem(SERVERS_KEY, JSON.stringify(list));
+    const dst = rememberKeysEnabled() ? localStorage : sessionStorage;
+    dst.setItem(SERVERS_KEY, JSON.stringify(list));
+    // 未持久化时把另一处可能残留的旧副本清掉，避免明文长期留在磁盘
+    if (!rememberKeysEnabled()) localStorage.removeItem(SERVERS_KEY);
   } catch { /* 隐私模式等写不进去时静默降级，功能仍可用 */ }
 }
 
@@ -1661,15 +1764,6 @@ function forgetServer(base) {
   const b = normBase(base);
   writeServers(readServers().filter(s => s.base !== b));
   if (normBase(LS.base) === b) { LS.base = ""; LS.key = ""; LS.bot = ""; }
-}
-
-function renameServer(base, label) {
-  const b = normBase(base);
-  const list = readServers();
-  const it = list.find(s => s.base === b);
-  if (!it) return;
-  it.label = String(label || "").trim();
-  writeServers(list);
 }
 
 /* 是否处于无密钥登录（用于登录页提示与顶栏标记） */
@@ -1787,6 +1881,10 @@ const S = {
   base: "", key: "",
   botId: "",
   bots: [],
+  // 当前密钥的角色（/api/bots 返回）："global" 时机器人下拉多一个「全局」选项。
+  // 机器人密钥必须锁定在自己身上，不显示该选项。
+  role: "",
+  canManageAll: false,
   view: "chats",        // chats | bots | push | wakeup | memory | config
   // 记忆管理：当前查看的层级与标识符（identifier 随层级含义不同：
   // global/bot=app_id，group=群 openid，c2c=用户 openid）
@@ -1794,13 +1892,28 @@ const S = {
   memIdent: "",
   memMaps: null,        // 每个层级可选的目标列表缓存（群/用户等）
   memKeyword: "",
+  memItems: [],         // 当前层级的记忆条目（编辑/删除按 index 在此查找）
+  memEnabled: false,    // 当前层级记忆总开关（API 返回的 enabled）
   memBusy: false,
+  // 日志视图：查询条件与最近一次结果
+  logLines: 200,        // 取末尾多少行
+  logKeyword: "",
+  logLevel: "",         // 空=全部
+  logReverse: true,     // 默认最新在前，排查问题更顺手
+  // 日志视图自己的 app_id 筛选，与顶栏的当前机器人相互独立。
+  // 空串 = "全局"，即不带 app_id 请求，后端返回全部机器人的日志
+  // （日志是全体机器人共写的单文件，这是唯一真正支持"看全部"的接口）。
+  // 只有全局密钥能用"全局"；机器人密钥下后端会强制收窄到自己。
+  logAppId: "",
+  logSeq: 0,            // 防串台序号（同 taskSeq 的做法）
+  logMeta: null,        // 最近一次的 meta（文件、行数、是否不限制等）
   convs: [],
   conv: null,           // 当前打开的会话
   nameMap: {},
   hist: [],
   histCache: [],        // 上一次已渲染的消息快照，用于增量差分
   histLoading: false,   // 聊天记录请求在飞：轮询不叠加请求
+  histAbort: null,      // 上一次历史请求的 AbortController，新请求发起前取消它
   histFilter: { keyword: "", revoked: "", is_hide: "", markdown: "", tools: "", wakeup: "" },
   taskFilter: {
     push:   { status: "", keywords: "", matchAll: false, start: "", end: "", order: "" },
@@ -1824,9 +1937,15 @@ const S = {
    ============================================================ */
 function defaultBase() {
   const p = location.protocol;
-  if (p === "file:") return "http://127.0.0.1:8080";
+  if (p === "file:") return "http://127.0.0.1:8148";   // 与 config.json 的 API_BIND_PORT 一致
   return location.origin;
 }
+
+/* 请求超时（毫秒）。后端某个 handler 卡在慢速上游时，没有超时的 fetch
+   会一直挂着；而 S.busy / S.histLoading 的 finally 都在 await 之后才执行，
+   于是一次卡死就会让任务轮询和聊天自动刷新**永久停摆**且界面无任何提示。
+   25s 足以覆盖慢查询（历史/日志取 200 条），又远小于人的忍耐阈值。 */
+const API_TIMEOUT_MS = 25000;
 
 async function api(path, opts = {}) {
   const url = S.base.replace(/\/+$/, "") + path;
@@ -1836,17 +1955,34 @@ async function api(path, opts = {}) {
     headers["Content-Type"] = "application/json";
   }
 
+  // 超时与外部取消合流：任一触发都能中止本次请求
+  const ctl = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; ctl.abort(); }, API_TIMEOUT_MS);
+  if (opts.signal) {
+    if (opts.signal.aborted) ctl.abort();
+    else opts.signal.addEventListener("abort", () => ctl.abort(), { once: true });
+  }
+
   let res;
   try {
     res = await fetch(url, {
       method: opts.method || "GET",
       headers,
-      body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined
+      body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+      signal: ctl.signal
     });
   } catch (e) {
+    // 超时与主动取消要给出可区分的文案，别都说成"网络错误"
+    if (timedOut) {
+      throw new Error(`请求超时（${Math.round(API_TIMEOUT_MS / 1000)} 秒无响应）`);
+    }
+    if (e && e.name === "AbortError") throw new Error("请求已取消");
     const fromFile = location.protocol === "file:";
     throw new Error("无法连接 API 服务（" + (e.message || "网络错误") + "）" +
       (fromFile ? "。若通过 file:// 打开，请确认服务已启动且允许 CORS。" : ""));
+  } finally {
+    clearTimeout(timer);
   }
 
   const text = await res.text();
@@ -1898,7 +2034,16 @@ async function probeTarget(base, key) {
   try {
     await api("/info");
     const r = await api("/api/bots");
-    return { ok: true, bots: (r.data && r.data.bots) || [] };
+    const d = r.data || {};
+    // 必须把 role / can_manage_all 一起带出去：调用方拿到的 bots 会直接写进
+    // S.bots，而 enterApp 里"列表非空就不再拉取"的判断会让 role 永远没机会被
+    // 赋值 —— 结果就是全局密钥下也看不到「全部」选项。
+    return {
+      ok: true,
+      bots: d.bots || [],
+      role: d.role || "",
+      canManageAll: !!d.can_manage_all,
+    };
   } catch (e) {
     if (e.status === 401 || e.status === 403) {
       return { ok: false, needKey: true, msg: "密钥无效或未授权，请填写正确的 API 密钥" };
@@ -1954,6 +2099,10 @@ async function doLogin() {
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> 验证中…';
 
+  /* 存储策略要在写任何密钥之前定下来：writeStoredKey / writeServers
+     都按它决定落 localStorage 还是 sessionStorage。 */
+  setRememberKeys(!!($("lgRemember") && $("lgRemember").checked));
+
   const res = await probeTarget(base, key);
   if (!res.ok) {
     btn.disabled = false; btn.textContent = "登 录";
@@ -1963,6 +2112,9 @@ async function doLogin() {
 
   S.base = base; S.key = key;
   S.bots = res.bots;
+  // 角色一并落地：日志视图的「全部」选项靠它决定是否显示
+  S.role = res.role || "";
+  S.canManageAll = !!res.canManageAll;
   // 记住了目标：下次可在登录页直接点选，也支持同址多密钥覆盖
   rememberServer(base, key, LS.bot || "");
   renderSavedServers();
@@ -2006,8 +2158,13 @@ async function switchServer(base) {
   // 切换目标：清掉上一个服务器的会话/历史，避免串数据
   S.base = s.base; S.key = s.key || "";
   S.bots = res.bots;
+  // 角色随服务器切换而变（不同服务器可能配了不同的密钥类型）
+  S.role = res.role || "";
+  S.canManageAll = !!res.canManageAll;
   S.conv = null; S.convs = []; S.hist = []; S.histCache = [];
   S.botId = "";
+  // 日志视图的机器人范围也属于上一个服务器，跟着重置回「全部」
+  S.logAppId = "";
   // 记忆视图的选择状态同样属于上一个服务器/机器人，一并清掉
   resetMemSelection();
   // bot 传 undefined：保留目标服务器自己记住的机器人，不被上一个服务器覆盖
@@ -2026,9 +2183,12 @@ async function enterApp() {
     try {
       const r = await api("/api/bots");
       S.bots = (r.data && r.data.bots) || [];
+      S.role = (r.data && r.data.role) || "";
+      S.canManageAll = !!(r.data && r.data.can_manage_all);
     } catch (e) {
       toast("读取机器人列表失败：" + e.message, "err");
       S.bots = [];
+      S.role = ""; S.canManageAll = false;
     }
   }
   // 优先用「该服务器上次选中的机器人」，其次才是全局记录
@@ -2043,6 +2203,13 @@ async function enterApp() {
   applyTheme(LS.theme);
   setView("chats");
   setConn(true, isKeyless() ? "已连接 · 无密钥" : "已连接");
+  /* 轮询在这里启动，而不是在各自的调用方。
+     doLogin / switchServer / boot 三条路径都要进 enterApp，
+     之前只有 boot 在 enterApp 之后额外调了 startPolling —— 结果手动登录
+     和切换服务器后彻底不轮询（任务列表 30s 刷新、聊天 20s 刷新全失效），
+     界面看起来正常、数据却永远停在登录那一刻。
+     放在这里三条路径自动统一，且 stopPolling 幂等，重复调用无副作用。 */
+  startPolling();
 }
 
 /* ============================================================
@@ -2111,7 +2278,7 @@ function applyTheme(t) {
    5. 视图切换
    ============================================================ */
 const VIEW_TITLES = { chats: "会话", bots: "机器人", push: "推送", wakeup: "唤醒",
-                      memory: "记忆", config: "配置" };
+                      memory: "记忆", logs: "日志", config: "配置" };
 
 function setView(v) {
   S.view = v;
@@ -2139,9 +2306,9 @@ function setView(v) {
   closeChMenu();
   if (v === "chats") showComposer(!!S.conv);
 
-  // 推送 / 唤醒 是整屏任务列表，内容全在主区，不需要左侧列表
-  // （机器人、配置 才真正用侧栏：机器人列表 / 配置范围切换）
-  const noSide = v === "push" || v === "wakeup";
+  // 推送 / 唤醒 / 日志 是整屏任务列表，内容全在主区，不需要左侧列表
+  // （机器人、配置、记忆 才真正用侧栏）
+  const noSide = v === "push" || v === "wakeup" || v === "logs";
   document.body.classList.toggle("no-side", noSide && !S.mobile);
 
   /* 窄屏下侧栏不是「可选的列表」，而是某些视图的必要选择器：
@@ -2197,6 +2364,7 @@ async function refreshAll() {
     else if (S.view === "push") await loadPushPane();
     else if (S.view === "wakeup") await loadWakeupPane();
     else if (S.view === "memory") await loadMemoryPane();
+    else if (S.view === "logs") await loadLogsPane();
     else if (S.view === "config") await loadConfigPane();
     setConn(true, "已连接");
   } catch (e) {
@@ -2213,8 +2381,20 @@ async function loadChats() {
   const box = $("sideBody");
   box.innerHTML = '<div class="loading-row"><span class="spinner"></span>载入会话…</div>';
 
-  if (!ensureBot()) {
+  // 这里刻意不再调用 ensureBot()：它会在 botId 为空时自动跳到第一个机器人，
+  // 这里刻意不再调用 ensureBot()：它会在 botId 为空时自动跳到第一个机器人，
+  // 而「全局」正是"不指定机器人"的状态，一调用就会把用户的选择顶掉。
+  //
+  // 但会话列表本身是**必须指定机器人**的（后端 _resolve_app_id 见不到 app_id
+  // 就返回 400），所以「全局」下这里给一句明确提示，而不是抛一个光秃秃的 400。
+  if (!S.bots.length) {
     box.innerHTML = '<div class="empty"><div class="empty-ico">🤖</div>尚未配置机器人</div>';
+    return;
+  }
+  if (!S.botId) {
+    box.innerHTML = `<div class="empty"><div class="empty-ico">🌐</div>尚未选择机器人<br>
+      <span style="font-size:11.5px">会话列表需要指定具体机器人，请在顶栏选择一个</span></div>`;
+    S.convs = [];
     return;
   }
 
@@ -2418,10 +2598,17 @@ async function loadHistory(silent, quiet, opts) {
   let r;
   S.histLoading = true;
   setHistSpin(true);          // 请求期间在筛选条右侧显示「刷新中…」
+  /* 取消上一次尚未回来的历史请求：快速连点会话/筛选会并发发出多个
+     limit=200 的请求，各自拉 200 条再逐条渲染，弱网下明显卡顿。
+     只取消同类请求，不碰任务/日志视图。 */
+  if (S.histAbort) { try { S.histAbort.abort(); } catch { /* 已结束 */ } }
+  S.histAbort = new AbortController();
   try {
-    r = await api(withBot(path));
+    r = await api(withBot(path), { signal: S.histAbort.signal });
   } catch (e) {
     setHistSpin(false);
+    // 主动取消不是故障：静默退出，交给发起取消的那次请求收尾
+    if (String(e.message).includes("已取消")) return;
     // 失败时绝不清掉已有消息：有内容就只提示，没内容才显示错误占位
     if ($("msgList")) {
       body.querySelectorAll(".loading-row").forEach(el => el.remove());
@@ -2501,6 +2688,13 @@ function bindHistBar() {
 let histSpinTimer = null;
 let histSpinFlash = null;
 
+/* 聊天记录刷新的两个「进行中」标志，职责不同、不重复：
+     S.histLoading —— 逻辑闸门，供轮询判断「上次还没回来，不要叠加请求」，
+                      并决定回前台时是否补一次；不涉及外观。
+     setHistSpin   —— 纯外观指示器（筛选条右侧的「刷新中…」），
+                      由它自己的 flash/timer 控制高亮节奏。
+   两者生命周期一致（都在 loadHistory 的 try/finally 里配对），
+   但不合并：合成一个会让「请求在飞」和「正在显示转圈」互相绑架。 */
 function setHistSpin(on) {
   const el = $("histSpin");
   if (!el) return;
@@ -2783,10 +2977,6 @@ function renderHistory(silent) {
   return true;   // 整份重建属于变化
 }
 
-function isToolCallMsg(m) {
-  return !!(m.tool_calls || m.tool_call_id);
-}
-
 /* 思考消息：由后端下发的 is_thinking 字段判定（assistant 且未真正发出）。
    旧版本靠「assistant 且没有 msg_id」在前端猜，规则散落各版且易失配；
    现在以后端字段为准，缺失时（老接口）才回退到同样的判据。 */
@@ -2966,7 +3156,7 @@ function mediaHTML(url, text) {
   const u = String(url);
   if (/\.(png|jpe?g|gif|webp|bmp|svg)(\?|$)/i.test(u)) {
     return `<img class="media-thumb" src="${esc(u)}" loading="lazy" alt="媒体"
-      data-img="${attrEncode(u)}" onerror="this.style.display='none'">`;
+      data-img="${attrEncode(u)}">`;
   }
   if (/\.(mp4|mov|webm)(\?|$)/i.test(u)) {
     return `<video class="media-thumb" src="${esc(u)}" controls preload="metadata"></video>`;
@@ -3299,81 +3489,6 @@ function renderMarkdown(src) {
 }
 
 /* ============================================================
-   8. 发送
-   ============================================================ */
-function openSendBox() {
-  const c = S.conv;
-  if (!c) return;
-  openModal("发送消息", `
-    <div class="field">
-      <label class="label">消息类型</label>
-      <select id="sdType" class="inp">
-        <option value="text">文本</option>
-        <option value="markdown">Markdown</option>
-        <option value="media">媒体（图片/视频/文件）</option>
-      </select>
-    </div>
-    <div class="field">
-      <label class="label">内容</label>
-      <textarea id="sdContent" class="inp" rows="5" placeholder="输入要发送的内容…"></textarea>
-    </div>
-    <div id="sdMedia" style="display:none">
-      <div class="field">
-        <label class="label">媒体 URL</label>
-        <input id="sdUrl" class="inp mono" placeholder="https://example.com/a.png">
-      </div>
-      <div class="row">
-        <div class="field grow">
-          <label class="label">文件类型</label>
-          <select id="sdFileType" class="inp">
-            <option value="1">图片</option>
-            <option value="2">视频</option>
-            <option value="3">语音</option>
-            <option value="4">文件</option>
-          </select>
-        </div>
-        <div class="field grow">
-          <label class="label">文件名（文件类型必填）</label>
-          <input id="sdFileName" class="inp" placeholder="report.pdf">
-        </div>
-      </div>
-    </div>
-  `, async () => {
-    const type = $("sdType").value;
-    const content = $("sdContent").value;
-    const body = { app_id: S.botId, target_type: c.type, target_id: c.id };
-
-    if (type === "text") {
-      if (!content.trim()) { toast("请输入内容", "warn"); return false; }
-      body.content = content;
-    } else if (type === "markdown") {
-      if (!content.trim()) { toast("请输入内容", "warn"); return false; }
-      body.message_type = "markdown";
-      body.markdown = content;
-      body.content = content;
-    } else {
-      const url = $("sdUrl").value.trim();
-      if (!url) { toast("请填写媒体 URL", "warn"); return false; }
-      body.media_source = url;
-      body.file_type = Number($("sdFileType").value);
-      body.content = content;   // 允许作为配文
-      const fn = $("sdFileName").value.trim();
-      if (fn) body.file_name = fn;
-    }
-
-    try {
-      const r = await api("/api/send", { method: "POST", body });
-      const d = r.data || {};
-      toast("发送成功" + (d.msg_id ? "（" + shortId(d.msg_id, 16) + "）" : ""), "ok");
-      await loadHistory();
-    } catch (e) {
-      toast("发送失败：" + e.message, "err");
-    }
-    return true;
-  }, "发送");
-}
-
-/* ============================================================
    9. 群成员 / 禁言 / 权限
    ============================================================ */
 async function openMembersPanel() {
@@ -3648,16 +3763,23 @@ async function loadBotsPane() {
 
   let g = 0, u = 0, enabled = true, hasKeys = false;
   try {
-    const [rg, ru, ri] = await Promise.all([
+    /* 统计与 API 开关都取自 /api/bots —— 它每条都带 api_enabled / has_keys，
+       无需再调 /info。旧写法依赖 /info 的 bots 字段，而该字段在未鉴权时
+       不返回，一旦鉴权收紧或改用无密钥访问，这两格会静默变成「关 / 无」
+       且不报错（|| [] 把失败吞掉了）。 */
+    const [rg, ru, rb] = await Promise.all([
       api(withBot("/api/groups")).catch(() => null),
       api(withBot("/api/users")).catch(() => null),
-      api("/info").catch(() => null)
+      api("/api/bots").catch(() => null)
     ]);
     g = (rg && rg.data && rg.data.total) || 0;
     u = (ru && ru.data && ru.data.total) || 0;
-    const bs = (ri && ri.data && ri.data.bots) || [];
+    const bs = (rb && rb.data && rb.data.bots) || [];
     const me = bs.find(x => x.app_id === bot.app_id);
-    if (me) { enabled = me.api_enabled; hasKeys = me.has_keys; }
+    if (me) {
+      enabled = !!me.api_enabled;
+      hasKeys = !!me.has_keys;
+    }
   } catch { /* 忽略 */ }
 
   body.innerHTML = `
@@ -4137,7 +4259,254 @@ function bindScheduleToggle(selId, timeWrapId, intervalWrapId) {
 }
 
 /* ============================================================
-   12. 配置视图
+   12. 日志视图
+   ------------------------------------------------------------
+   对应后端 GET /api/logs（读 config 的 log_file，与写入端同源）。
+
+   权限：全局密钥看全部；机器人密钥只能看自己的 —— 后端会强制收窄，
+   所以这里照常带 app_id，越权时后端直接 403，前端只需如实展示错误。
+   ============================================================ */
+
+/* 日志等级 → 配色。等级是固定枚举，未知等级回退中性色。 */
+const LOG_LEVEL_META = {
+  TRACE:    { cls: "lv-trace", label: "TRACE" },
+  DEBUG:    { cls: "lv-debug", label: "DEBUG" },
+  INFO:     { cls: "lv-info",  label: "INFO" },
+  SUCCESS:  { cls: "lv-ok",    label: "SUCCESS" },
+  WARNING:  { cls: "lv-warn",  label: "WARNING" },
+  ERROR:    { cls: "lv-err",   label: "ERROR" },
+  CRITICAL: { cls: "lv-crit",  label: "CRITICAL" },
+};
+
+const LOG_LEVEL_OPTIONS = [
+  { v: "", label: "全部等级" },
+  { v: "DEBUG", label: "DEBUG" },
+  { v: "INFO", label: "INFO" },
+  { v: "WARNING", label: "WARNING" },
+  { v: "ERROR", label: "ERROR" },
+  { v: "CRITICAL", label: "CRITICAL" },
+];
+
+/* 单次渲染日志行的上限。行数下拉可选到 5000，但每行都要构造 4 段 DOM，
+   一次性铺 5000 行会在主线程上造成明显卡顿（弱机/移动端尤甚）。
+   超出的部分在列表下方如实说明，并引导用户收窄条件。 */
+const LOG_RENDER_MAX = 2000;
+
+/* 把一行日志拆成「时间 | 等级 | 来源 - 正文」。
+   后端返回的是原始行，这里只做展示层的拆解；
+   拆不出来（老格式/手工写入）就整行当正文，绝不丢内容。 */
+function parseLogLine(line) {
+  const m = String(line).match(
+    /^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*\|\s*(\w+)\s*\|\s*([^|]*?)\s*-\s*([\s\S]*)$/
+  );
+  if (!m) return { ts: "", level: "", src: "", body: String(line) };
+  return { ts: m[1], level: m[2].toUpperCase(), src: m[3], body: m[4] };
+}
+
+function logLevelBadge(level) {
+  if (!level) return "";
+  const meta = LOG_LEVEL_META[level] || { cls: "lv-other", label: level };
+  return `<span class="log-lv ${meta.cls}">${esc(meta.label)}</span>`;
+}
+
+async function loadLogsPane(opts = {}) {
+  const body = $("mainBody");
+  const seq = ++S.logSeq;
+  const isStale = () => S.logSeq !== seq || S.view !== "logs";
+
+  $("mainActs").innerHTML =
+    `<button class="btn btn-sm" data-log="refresh">↻ 刷新</button>`;
+
+  if (!opts.silent) {
+    body.innerHTML = '<div class="loading-row"><span class="spinner"></span>载入日志…</div>';
+  }
+
+  // 下拉需要完整的机器人列表，以及"本密钥能不能看全部"的角色信息。
+  // 登录时取过一次，但若那次失败了 S.bots 会为空；角色还可能因为旧版本
+  // 的缓存/直接进入视图而缺失 —— 任一缺失都补一次，否则「全部」选项会
+  // 莫名其妙地不出现。
+  if (!S.bots.length || !S.role) {
+    try {
+      const rb = await api("/api/bots");
+      const d = rb.data || {};
+      if (!S.bots.length) S.bots = d.bots || [];
+      S.role = d.role || "";
+      S.canManageAll = !!d.can_manage_all;
+      if (isStale()) return;
+    } catch (e) { /* 取不到就按无列表渲染，不阻断日志本身 */ }
+  }
+  // 机器人密钥：默认就选自己，避免"全部机器人"这个它其实拿不到的选项被误选
+  if (!S.canManageAll && !S.logAppId && S.bots.length === 1) {
+    S.logAppId = S.bots[0].app_id || "";
+  }
+
+  const parts = [`lines=${encodeURIComponent(S.logLines)}`];
+  if (S.logKeyword) parts.push("keyword=" + encodeURIComponent(S.logKeyword));
+  if (S.logLevel) parts.push("level=" + encodeURIComponent(S.logLevel));
+  if (S.logReverse) parts.push("reverse=1");
+  // 日志的机器人范围由视图自己的下拉决定，**不**跟随顶栏：
+  // 顶栏选的是"当前操作哪个机器人"，而看日志经常需要跨机器人对照。
+  // 空串时不带 app_id —— 后端对全局密钥返回全部机器人的日志。
+  if (S.logAppId) parts.push("app_id=" + encodeURIComponent(S.logAppId));
+
+  let d = null;
+  try {
+    const r = await api("/api/logs?" + parts.join("&"));
+    if (isStale()) return;
+    d = r.data || {};
+  } catch (e) {
+    if (isStale()) return;
+    S.logMeta = null;
+    body.innerHTML = `<div class="empty"><div class="empty-ico">⚠️</div>载入失败<br>
+      <span style="font-size:11.5px">${esc(e.message)}</span></div>`;
+    bindLogsBar();
+    return;
+  }
+  S.logMeta = d;
+
+  // 顶部统计：文件、总量、返回量、是否不限制大小
+  const unlimited = d.unlimited
+    ? '<span class="log-warn">不限制文件大小</span>'
+    : `上限 ${esc(String(d.max_log_length))} 条`;
+  // 范围以**请求时的选择**为准，而不是响应里的 app_id：
+  // 机器人密钥下即使选了「全部机器人」，后端也会强制收窄成自己并回填 app_id，
+  // 直接照抄会把"你以为在看全部"显示成"只看了一个"，反而看不清实际范围。
+  // 只有确实收窄了（选了全局但拿回了具体 app_id）时额外说明一句。
+  const narrowed = !S.logAppId && d.app_id;
+  const scope = S.logAppId
+    ? `<span class="log-stat-i">🤖 <b>${esc(S.logAppId)}</b></span>`
+    : `<span class="log-stat-i">🌐 <b>全部机器人</b></span>`;
+  const narrowTip = narrowed
+    ? `<span class="log-warn" title="本密钥只能查看自己的日志">已收窄到 ${esc(d.app_id)}</span>`
+    : "";
+  const stat = `
+    <div class="log-stat">
+      <span class="log-stat-i">📄 <b>${esc(d.file_name || "-")}</b></span>
+      <span class="log-stat-i">共 <b>${d.total || 0}</b> 条</span>
+      <span class="log-stat-i">命中 <b>${d.matched || 0}</b> 条</span>
+      <span class="log-stat-i">显示 <b>${d.returned || 0}</b> 条</span>
+      <span class="log-stat-i">${unlimited}</span>
+      ${scope}
+      ${narrowTip}
+    </div>`;
+
+  // 机器人下拉：全局密钥才提供「全部机器人」；
+  // 机器人密钥不显示（后端反正只会返回它自己的日志，给了是误导）。
+  const scopeOpts = (S.canManageAll
+    ? `<option value=""${S.logAppId === "" ? " selected" : ""}>🌐 全部机器人</option>`
+    : "") + S.bots.map(b => {
+      const nm = botLabel(b);
+      // 机器人密钥下 S.bots 只有它自己，这一项仍是唯一可选的
+      const label = nm === b.app_id ? nm : `${nm} · ${b.app_id}`;
+      return `<option value="${esc(b.app_id)}"${b.app_id === S.logAppId ? " selected" : ""}>${esc(label)}</option>`;
+    }).join("");
+
+  const bar = `
+    <div class="log-bar">
+      <select id="logApp" class="inp" style="width:auto; min-width:150px; max-width:220px">
+        ${scopeOpts}
+      </select>
+      <input id="logKw" class="inp" placeholder="搜索关键词…" value="${esc(S.logKeyword)}"
+             style="flex:1; min-width:120px">
+      <select id="logLv" class="inp" style="width:auto; min-width:110px">
+        ${LOG_LEVEL_OPTIONS.map(o =>
+          `<option value="${esc(o.v)}"${o.v === S.logLevel ? " selected" : ""}>${esc(o.label)}</option>`
+        ).join("")}
+      </select>
+      <select id="logN" class="inp" style="width:auto; min-width:96px">
+        ${[100, 200, 500, 1000, 2000, 5000].map(n =>
+          `<option value="${n}"${n === S.logLines ? " selected" : ""}>${n} 行</option>`
+        ).join("")}
+      </select>
+      <button class="btn btn-sm" data-log="order">${S.logReverse ? "↓ 最新在前" : "↑ 最早在前"}</button>
+    </div>`;
+
+  const lines = d.lines || [];
+  let list;
+  if (!d.exists) {
+    // 文件不存在是正常状态（enable_log=0 时只输出控制台）
+    list = `<div class="empty"><div class="empty-ico">📄</div>暂无日志文件<br>
+      <span style="font-size:11.5px">${esc(d.hint || "")}</span></div>`;
+  } else if (!lines.length) {
+    list = `<div class="empty"><div class="empty-ico">🔍</div>没有匹配的日志<br>
+      <span style="font-size:11.5px">试试放宽关键词或等级筛选</span></div>`;
+  } else {
+    /* 单次最多渲染这么多行。日志源可选到 5000 行，而每行都是一个 4 段
+       结构的 DOM，全量 innerHTML 会在主线程上一次性构造几千个节点并
+       触发一次超长重排（弱机/移动端会明显卡住）。
+       超出部分如实告知并提示缩小范围，而不是默默截断让人以为日志就这些。 */
+    const shown = lines.slice(0, LOG_RENDER_MAX);
+    const hidden = lines.length - shown.length;
+    list = `<div class="log-list">${shown.map(renderLogLine).join("")}</div>`;
+    if (hidden > 0) {
+      list += `<div class="empty" style="padding:14px">
+        <div style="font-size:12.5px">还有 ${hidden} 行未显示（单次最多渲染 ${LOG_RENDER_MAX} 行）</div>
+        <div style="font-size:11.5px;color:var(--ink-3);margin-top:5px">
+          可缩小「行数」、加关键词或按等级筛选后再看</div></div>`;
+    }
+  }
+
+  body.innerHTML = stat + bar + list;
+  bindLogsBar();
+}
+
+function renderLogLine(line) {
+  const p = parseLogLine(line);
+  return `<div class="log-row">
+    <span class="log-ts">${esc(p.ts || "")}</span>
+    ${logLevelBadge(p.level)}
+    <span class="log-src" title="${esc(p.src)}">${esc(p.src)}</span>
+    <span class="log-body">${esc(p.body)}</span>
+  </div>`;
+}
+
+function bindLogsBar() {
+  const body = $("mainBody");
+  const rf = document.querySelector('[data-log="refresh"]');
+  if (rf) rf.addEventListener("click", () => loadLogsPane());
+
+  const od = document.querySelector('[data-log="order"]');
+  if (od) od.addEventListener("click", () => {
+    S.logReverse = !S.logReverse;
+    loadLogsPane({ silent: true });
+  });
+
+  const kw = body.querySelector("#logKw");
+  if (kw) {
+    // 输入防抖：每敲一个字就请求会打爆后端，也让人看不清结果
+    let t = 0;
+    kw.addEventListener("input", () => {
+      clearTimeout(t);
+      t = setTimeout(() => {
+        S.logKeyword = kw.value.trim();
+        loadLogsPane({ silent: true });
+      }, 350);
+    });
+    kw.addEventListener("keydown", e => { if (e.key === "Enter") kw.blur(); });
+  }
+
+  const lv = body.querySelector("#logLv");
+  if (lv) lv.addEventListener("change", () => {
+    S.logLevel = lv.value;
+    loadLogsPane({ silent: true });
+  });
+
+  // 机器人范围：空值即「全部机器人」（不带 app_id）
+  const ap = body.querySelector("#logApp");
+  if (ap) ap.addEventListener("change", () => {
+    S.logAppId = ap.value || "";
+    loadLogsPane({ silent: true });
+  });
+
+  const n = body.querySelector("#logN");
+  if (n) n.addEventListener("change", () => {
+    S.logLines = parseInt(n.value, 10) || 200;
+    loadLogsPane({ silent: true });
+  });
+}
+
+/* ============================================================
+   13. 配置视图
    ------------------------------------------------------------
    配置编辑状态放在模块作用域：行内编辑面板是独立函数渲染的，
    需要共享「当前项 / 待保存改动 / 展开项」这些状态。
@@ -5158,6 +5527,11 @@ function resetMemSelection() {
   S.memMaps = null;
   S.memIdent = "";
   S.memKeyword = "";
+  /* 记忆条目缓存一并清空：它与 memIdent 是同一条命的。
+     留在 window 上（旧写法）时切换目标若漏清一次，编辑/删除会拿
+     上一个目标的条目去索引，可能误改他人记忆。 */
+  S.memItems = [];
+  S.memEnabled = false;
 }
 
 /* 记忆视图的 identifier：global/bot 用当前选中的机器人；
@@ -5224,6 +5598,12 @@ async function loadMemoryPane() {
     const lv = S.memLevel;
     const wrap = $("memTarget");
     if (lv === "global" || lv === "bot") {
+      if (!S.botId) {
+        wrap.innerHTML = `<span class="mem-badge">🤖 未选择机器人</span>
+          <span style="font-size:11.5px;color:var(--ink-3)">
+            记忆需要指定机器人，请在顶栏选择一个</span>`;
+        return;
+      }
       const b = (S.bots || []).find(x => x.app_id === S.botId);
       wrap.innerHTML = `<span class="mem-badge">🤖 ${esc(b ? (b.desc || b.app_id) : S.botId)}</span>
         <span style="font-size:11.5px;color:var(--ink-3)">
@@ -5297,7 +5677,7 @@ async function loadMemoryPane() {
 
   $("memKw").addEventListener("input", e => {
     S.memKeyword = e.target.value.trim();
-    renderMemList(window.__memItems || [], window.__memEnabled);
+    renderMemList(S.memItems || [], S.memEnabled);
   });
 
   // 卡片头与工具条按钮
@@ -5328,7 +5708,7 @@ async function loadMemList() {
     $("memCount").textContent = "";
     $("memState").textContent = "";
     $("memState").className = "mem-badge off";
-    window.__memItems = [];
+    S.memItems = [];
     return;
   }
 
@@ -5337,20 +5717,20 @@ async function loadMemList() {
     const q = `/api/memory/list?level=${encodeURIComponent(lv)}&identifier=${encodeURIComponent(ident)}`;
     const r = await api(withBot(q));
     const d = r.data || {};
-    window.__memItems = d.items || [];
-    window.__memEnabled = !!d.enabled;
+    S.memItems = d.items || [];
+    S.memEnabled = !!d.enabled;
     $("memCount").textContent =
       `${memLevelMeta(lv).label} · ${memTargetLabel(lv, ident)} · 共 ${d.total || 0} 条`;
     $("memState").textContent = d.enabled ? "已启用" : "已禁用";
     $("memState").className = "mem-badge" + (d.enabled ? "" : " off");
     $("memToggle").textContent = d.enabled ? "禁用" : "启用";
-    renderMemList(window.__memItems, d.enabled);
+    renderMemList(S.memItems, d.enabled);
   } catch (e) {
     listBox.innerHTML = `<div class="empty"><div class="empty-ico">⚠️</div>
       ${esc(e.message)}</div>`;
     $("memCount").textContent = "";
     $("memState").textContent = "";
-    window.__memItems = [];
+    S.memItems = [];
   }
 }
 
@@ -5443,7 +5823,7 @@ function openMemAdd() {
 function openMemEdit(idx) {
   const c = memWriteCtx();
   if (!c) return;
-  const it = (window.__memItems || []).find(x => x.index === idx);
+  const it = (S.memItems || []).find(x => x.index === idx);
   const cur = it ? String(it.content || "") : "";
   openModal(`编辑记忆 #${idx}`, `
     <div class="field">
@@ -5467,7 +5847,7 @@ function openMemEdit(idx) {
 async function delMemItem(idx) {
   const c = memWriteCtx();
   if (!c) return;
-  const it = (window.__memItems || []).find(x => x.index === idx);
+  const it = (S.memItems || []).find(x => x.index === idx);
   const preview = it ? shortId(String(it.content || ""), 60) : "";
   /* 删除不可撤销，用确认弹窗而不是 toast+自动执行。
      先展示将被删除的内容，避免用户凭索引猜错条目。 */
@@ -5489,7 +5869,7 @@ async function delMemItem(idx) {
 async function toggleMemLevel() {
   const c = memWriteCtx();
   if (!c) return;
-  const on = !!window.__memEnabled;
+  const on = !!S.memEnabled;
   try {
     await api(withBot("/api/memory/toggle"), {
       method: "POST",
@@ -5661,6 +6041,7 @@ function closeModal() {
    14. 轮询
    ============================================================ */
 const CHAT_POLL_MS = 20000;   // 聊天内容自动刷新间隔
+const TASK_POLL_MS = 30000;   // 推送/唤醒任务列表自动刷新间隔
 
 function startPolling() {
   stopPolling();
@@ -5671,7 +6052,7 @@ function startPolling() {
     // 轮询一律走静默刷新：不显示 loading、不打断滚动、不重建 DOM
     if (S.view === "push") loadTaskPane("push", { silent: true });
     else if (S.view === "wakeup") loadTaskPane("wakeup", { silent: true });
-  }, 30000);
+  }, TASK_POLL_MS);
   startChatPolling();
 }
 
@@ -5686,12 +6067,18 @@ function startChatPolling() {
     if ($("mask").classList.contains("open")) return;  // 弹窗操作中不打扰
     loadHistory(true, true);              // silent + quiet：无感
   }, CHAT_POLL_MS);
-  // 回到前台时立刻补一次，避免切回来要等一整个周期
+  /* 回到前台时立刻补一次，避免切回来要等一整个周期。
+     addEventListener 对「同一函数引用」不会重复登记，但这里仍显式先 remove
+     再 add：一来语义清楚（本函数只保证「有且仅有一个」），二来不依赖
+     浏览器去重这个隐含行为。相应地 stopChatPolling 里也要摘掉，
+     否则反复 start/stop（登录、切服务器、登出）会累积常驻回调。 */
+  document.removeEventListener("visibilitychange", onVisibilityChange);
   document.addEventListener("visibilitychange", onVisibilityChange);
 }
 
 function stopChatPolling() {
   if (S.chatTimer) { clearInterval(S.chatTimer); S.chatTimer = null; }
+  document.removeEventListener("visibilitychange", onVisibilityChange);
 }
 
 function onVisibilityChange() {
@@ -5714,6 +6101,25 @@ function bindEvents() {
   $("lgBtn").addEventListener("click", () => doLogin());
   $("lgKey").addEventListener("keydown", e => { if (e.key === "Enter") doLogin(); });
   $("lgBase").addEventListener("keydown", e => { if (e.key === "Enter") doLogin(); });
+  // 登录页：勾选「记住密钥」后立刻改写存储位置，并重写服务器列表，
+  // 否则要等到下次登录才生效，用户会以为没起作用。
+  if ($("lgRemember")) {
+    $("lgRemember").addEventListener("change", e => {
+      setRememberKeys(e.target.checked);
+      const cur = S.key || LS.key || "";
+      writeStoredKey(cur);
+      const list = readServers();
+      const me = normBase(S.base || LS.base);
+      if (me && !list.some(s => s.base === me)) {
+        list.push({ base: me, key: cur, label: "", bot: LS.bot || "", last: Date.now() });
+      }
+      writeServers(list);
+      toast(e.target.checked
+        ? "已记住密钥（下次打开免输入）"
+        : "已改为仅本次会话有效（关闭标签页后需重新输入）", "ok", 2600);
+    });
+  }
+
   // 已登录服务器列表：点击条目直接登录，点 ✕ 移除
   $("lgSaved").addEventListener("click", e => {
     const del = e.target.closest("[data-srv-del]");
@@ -5855,6 +6261,17 @@ function bindEvents() {
 
   // 模态框遮罩点击关闭
   $("mask").addEventListener("click", e => { if (e.target === $("mask")) closeModal(); });
+  // 关闭按钮（原为内联 onclick，改为委托绑定以便将来启用 CSP）
+  $("mClose").addEventListener("click", () => closeModal());
+
+  /* 缩略图加载失败时隐藏（原为 <img onerror="..."> 内联属性）。
+     注意：error 事件不冒泡，必须用 capture 阶段才能委托到。 */
+  document.addEventListener("error", e => {
+    const el = e.target;
+    if (el && el.tagName === "IMG" && el.classList.contains("media-thumb")) {
+      el.style.display = "none";
+    }
+  }, true);
 
   // 图片查看
   $("lightbox").addEventListener("click", () => $("lightbox").classList.remove("open"));
@@ -6086,6 +6503,7 @@ async function boot() {
   const base = normBase(LS.base) || defaultBase();
   $("lgBase").value = base;
   $("lgKey").value = LS.key || "";
+  if ($("lgRemember")) $("lgRemember").checked = rememberKeysEnabled();
   renderSavedServers();
   fillServerSelector();
 
@@ -6096,9 +6514,10 @@ async function boot() {
     if (res.ok) {
       S.base = base; S.key = LS.key || "";
       S.bots = res.bots;
+      S.role = res.role || "";
+      S.canManageAll = !!res.canManageAll;
       rememberServer(base, LS.key || "", LS.bot || "");
-      await enterApp();
-      startPolling();
+      await enterApp();     // 轮询由 enterApp 内部启动，这里不再重复调用
       return;
     }
     // 需要密钥才提示，其它错误留给用户手点登录时再看
