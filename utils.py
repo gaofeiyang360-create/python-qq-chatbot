@@ -140,6 +140,10 @@ def parse_message_type(args: dict, allow_markdown_only: bool = False) -> tuple:
     allow_markdown_only：传入 markdown 字段（非 None）但未指定 message_type 时，
     是否判定为 Markdown。api_server.py 需要该行为（支持模板对象），工具侧不需要。
 
+    注意：本函数只负责"解析"，不决定任何默认格式 —— 未传 message_type 时一律
+    返回 is_markdown=False。工具侧想让"不写就是 Markdown"，由 tool.py 各调用点
+    在调用本函数前自行补默认值（见 tool.py 的 _default_markdown_args）。
+
     返回 (is_markdown, body)，两者都按需取用。
     """
     if not isinstance(args, dict):

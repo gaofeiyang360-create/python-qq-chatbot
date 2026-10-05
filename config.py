@@ -65,6 +65,10 @@ DEFAULT_CONFIG = {
     #       识别转后台继续跑完并写缓存，AI 可自行调 recognize_media 命中缓存
     "MEDIA_BLOCK": 0,
     "TOOL_CHOICE": 1,                         # 工具调用策略：1=每次必须调用工具（required），0=不强制（auto）
+    # 工具层消息默认格式：1=send_text/push_message/schedule_push 不传 message_type 时按 Markdown 发送（默认）
+    #                   0=不传时按纯文本发送（早期行为）
+    # 实时读取，改完即生效；只影响 AI 工具，不影响 api_server 的 /api/push（那里不传仍为纯文本）
+    "TOOL_DEFAULT_MARKDOWN": 1,
     "SYSTEM_PROMPT": "you are a helpful ai",  # 全局系统提示词（可作为后备）
 
     # ==================== 全局 API 服务 ====================
@@ -536,6 +540,32 @@ def get_global_system_prompt() -> str:
 def get_tool_choice() -> int:
     """获取全局工具调用策略：1=每次必须调用工具（required），0=不强制（auto）"""
     return int(get_config().get("TOOL_CHOICE", 1))
+
+
+def get_tool_default_markdown() -> int:
+    """工具层消息默认格式（实时读取 config.json，无需重启）。
+
+    1 = send_text / push_message / schedule_push 在不传 message_type 时按
+        Markdown 富文本发送（默认）；
+    0 = 不传时按纯文本发送（早期行为）。
+
+    只作用于 AI 工具（tool.py 的 _default_markdown_args），不影响
+    api_server.py 的 /api/push —— 那里不传 message_type 仍是纯文本。
+
+    取值兼容字符串写法（"0"/"1"/"true"/"false" 等），无法识别时按默认 1 处理。
+    """
+    raw = get_config().get("TOOL_DEFAULT_MARKDOWN", 1)
+    if isinstance(raw, bool):
+        return 1 if raw else 0
+    try:
+        return 1 if int(raw) else 0
+    except (TypeError, ValueError):
+        s = str(raw).strip().lower()
+        if s in ("false", "no", "off", "否", "关", "n", "f"):
+            return 0
+        if s in ("true", "yes", "on", "是", "开", "y", "t"):
+            return 1
+        return 1
 
 
 # ==================== 日志配置获取 ====================

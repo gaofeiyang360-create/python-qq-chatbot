@@ -15,7 +15,8 @@ from config import get_executor, \
     get_bot_allow_manage_all_push, get_bots, \
     get_bot_allow_cross_wakeup, get_bot_allow_cross_wakeup_incoming, \
     get_bot_allow_cross_get_list, get_bot_allow_cross_get_list_incoming, \
-    get_bot_allow_cross_history, get_bot_allow_cross_history_incoming
+    get_bot_allow_cross_history, get_bot_allow_cross_history_incoming, \
+    get_tool_default_markdown
 from client import BotClient, send_with_policy
 from memory import (
     get_cached_media_summary, set_cached_media, get_media_cache_key, get_url_cache_key,
@@ -543,6 +544,43 @@ def _describe_filters(meta: Dict[str, Any]) -> str:
 # 双发判定见 utils.needs_dual_send，发送编排见 client.send_with_policy。
 
 
+# ==================== 工具侧消息格式默认值 ====================
+# 工具层是否"不传 message_type 就按 markdown 发送"，由 config.json 根层的
+# TOOL_DEFAULT_MARKDOWN 控制（1=开，默认；0=关，回退成早期"不传即纯文本"）。
+# get_tool_default_markdown() 每次实时读盘，所以改完配置即生效、无需重启。
+# 只在 tool.py 生效 —— utils.parse_message_type 保持纯粹的"解析"语义不变，
+# api_server 的 /api/push 等外部入口也仍是不传即 text，不受这里影响。
+
+
+def _default_markdown_args(arguments: dict) -> dict:
+    """按配置把"未声明格式"的工具参数补成 markdown，供 parse_message_type 解析。
+
+    仅当 TOOL_DEFAULT_MARKDOWN 开启、且 message_type / msg_type 两个参数
+    都没给（或给了空串/None）时才补，因此：
+      - 开关关闭 → 原样返回，行为与早期版本完全一致（不传即纯文本）；
+      - 显式 message_type="text"（或 "0"/"plain"）→ 原样保留，仍是纯文本；
+      - 显式 message_type="markdown" → 原样保留；
+      - 传了无法识别的取值（如 "MD格式"）→ 也原样保留，由 parse_message_type
+        按非 markdown 处理（语义不明时保持保守，不擅自升级成富文本）。
+
+    配置读取放在"已确认未声明格式"之后：参数齐全的调用不会白白读一次 config.json。
+    返回浅拷贝，不修改调用方传入的 arguments 本身。
+    """
+    for key in ("message_type", "msg_type"):
+        raw = arguments.get(key)
+        if raw is not None and str(raw).strip() != "":
+            return arguments
+    try:
+        if not get_tool_default_markdown():
+            return arguments
+    except Exception:
+        # 配置读取异常时不阻断发送：退回纯文本（保守，与开关关闭一致）
+        return arguments
+    args = dict(arguments)
+    args["message_type"] = "markdown"
+    return args
+
+
 # ==================== 默认请求头（通用） ====================
 DEFAULT_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -569,7 +607,7 @@ def get_tools_description() -> str:
     base_desc = (
         "你可以使用工具来完成任务：通过 http_request 发起任意网络请求获取信息；"
         "使用 send_media 发送图片、视频或文件（支持 HTTP/HTTPS URL ，系统会自动处理上传）。调用 send_media 时必须明确传入 file_type 与 file_name，不得省略；file_type 取值：1=图片（jpg/jpeg/png/gif/webp/bmp 等），2=视频（mp4/mov/mkv 等），3=语音（通用音频如 mp3/wav/ogg 填 3 或 4 都可以），4=文件（文档、压缩包等其余类型）；"
-        "使用 send_text 向当前会话发送纯文本文字（当你需要通过工具发送自定义文本时使用，发送后请调用 skip_reply 以结束工具调用循环，避免重复发送）；"
+        "使用 send_text 向当前会话发送文字（默认按 Markdown 富文本发送，单聊与群聊都支持；当你需要通过工具发送自定义文本时使用，发送后请调用 skip_reply 以结束工具调用循环，避免重复发送）；"
         "使用 recognize_media 主动识别媒体内容并获取摘要（可选传入 prompt 从特定角度重新识别，结果会追加到原摘要之后）；"
         "使用 search_music 搜索歌曲；"
         "使用 play_music 根据歌曲ID播放音乐（仅限非VIP歌曲）。"
@@ -583,6 +621,10 @@ def get_tools_description() -> str:
         "使用 list_scheduled_push 查看所有定时推送任务列表（含全部状态：pending/sent/已完成及消息ID）；"
         "使用 delete_scheduled_push 删除一个定时推送任务（task_id）；"
         "使用 update_scheduled_push 修改一个定时推送任务的内容/目标/时间/媒体/调度类型。"
+        "注意：push_message、schedule_push、update_scheduled_push 以及 send_text 的正文（content 参数）"
+        "都不要使用任何 HTML 语法：不支持 <b>、<i>、<u>、<br>、<p>、<div>、<span>、<a href>、<font> 等任何标签，"
+        "也不要用 &nbsp;、&amp; 之类的 HTML 实体，写了不会被渲染，只会原样显示成乱码字符；"
+        "需要换行就直接换行，需要加粗/斜体请改用 Markdown（**加粗**、_斜体_），需要链接请用 Markdown 的 [文字](链接)。"
         "使用 revoke_push 撤回已发送的推送消息，可撤回整个推送任务（按 task_id 撤回所有目标）或部分目标的消息（指定 target_ids），"
         "系统会自动根据存储的消息ID调用撤回API。注意：发送超过2分钟的消息不可撤回。"
         "使用 create_scheduled_wakeup 创建定时唤醒任务（在指定时间向指定会话模拟用户消息唤醒机器人），"
@@ -618,6 +660,13 @@ def get_tools_description() -> str:
                   "    - 如果 member_role 为 member（普通成员）：机器人没有管理权限，不能执行禁言/解禁操作。\n"
                   "  第三步：有权限时调用 get_group_mute_status 查看禁言详情，或调用 mute_member 禁言（需指定禁言到期时间 RFC3339 格式）/ unmute_member 解禁。")
     base_desc += (" 重要：你回复内容中的『思考/分析文本』用户是看不到的。要发送任何文字给用户，必须使用 send_text 工具。无论是纯文字回复、查询结果还是任何需要用户看到的内容，都要通过 send_text 发送。\n")
+    base_desc += (" 不要使用任何 HTML 语法：不支持 <b>、<i>、<u>、<br>、<p>、<div>、<span>、<a href>、<font> 等任何标签，也不要用 &nbsp;、&amp; 之类的 HTML 实体，写了不会被渲染，只会原样显示成乱码字符。需要换行就直接换行；需要加粗/斜体请改用 Markdown（**加粗**、_斜体_），需要链接请用 Markdown 的 [文字](链接)。\n")
+    # 默认格式随 TOOL_DEFAULT_MARKDOWN 实时变化，措辞也要跟着变，
+    # 否则关掉开关后提示词仍在骗模型"不写就是 Markdown"。
+    if get_tool_default_markdown():
+        base_desc += (" 消息格式默认就是 Markdown：send_text、push_message、schedule_push 在不传 message_type 时一律按 markdown 发送，你不需要为了用 Markdown 而特意传 message_type=markdown，直接写正文即可（**加粗**、# 标题、- 列表等都会正常渲染）。只有确实想发纯文本、不希望 Markdown 符号被渲染时，才显式传 message_type=text。\n")
+    else:
+        base_desc += (" 消息格式默认是纯文本：send_text、push_message、schedule_push 在不传 message_type 时会按纯文本发送，Markdown 符号不会被渲染。需要用 Markdown 富文本时必须显式传 message_type=markdown。\n")
     base_desc += " 需要工具时请直接调用，不要在文本中描述工具调用。"
     return base_desc
 
@@ -726,7 +775,9 @@ def get_tools_definition() -> List[Dict]:
                     "向当前会话发送文本内容。当你需要通过工具发送一段自定义文字，而不是让AI直接生成文本回复时使用此工具。"
                     "支持 Markdown 格式：将 message_type 设为 \"markdown\"，正文仍填入 content，即可发送富文本样式消息"
                     "（标题、加粗、斜体、删除线、链接、图片、有序/无序列表、块引用、分割线等）。"
-                    "注意：单聊场景 Markdown 可发送但对方无法渲染为富文本，群聊场景收发均支持 Markdown。"
+                    "单聊与群聊都支持 Markdown。不传 message_type 时的默认格式由配置 TOOL_DEFAULT_MARKDOWN 决定（开启时按 markdown 发送）；只有确实想发纯文本时才传 text。"
+                    "不要使用任何 HTML 语法：不支持 <b>、<i>、<br>、<p>、<div>、<a href> 等标签以及 &nbsp; 之类的 HTML 实体，"
+                    "写了不会被渲染，只会原样显示成乱码；需要加粗请用 **加粗**，换行请直接换行。"
                     "发送后必须紧接着调用 skip_reply（skip_reply 会结束工具调用循环，防止 AI 再生成多余文本回复）。"
                 ),
                 "parameters": {
@@ -736,14 +787,16 @@ def get_tools_definition() -> List[Dict]:
                             "type": "string",
                             "description": (
                                 "要发送的正文，建议不超过2000字。纯文本与 Markdown 都统一用此参数传入，"
-                                "格式由 message_type 决定。Markdown 支持：# 标题、**加粗**、_斜体_、~~删除线~~、"
+                                "格式由 message_type 决定，不传时的默认格式由配置 TOOL_DEFAULT_MARKDOWN 决定。Markdown 支持：# 标题、**加粗**、_斜体_、~~删除线~~、"
                                 "- 无序列表、1. 有序列表、> 块引用、*** 分割线、[文字](链接)、![](图片URL)。"
+                                "不要使用任何 HTML 语法（不支持 <b>、<br>、<p>、<div>、<a href> 等标签"
+                                "以及 &nbsp; 等 HTML 实体），写了不会被渲染，只会原样显示成乱码。"
                             )
                         },
                         "message_type": {
                             "type": "string",
                             "enum": ["text", "markdown"],
-                            "description": "消息格式。text=纯文本（默认）；markdown=富文本消息。"
+                            "description": "消息格式（可选）。不传时的默认格式由配置 TOOL_DEFAULT_MARKDOWN 决定：开启（默认）时按 markdown 富文本发送，关闭时按纯文本发送。想发纯文本、不希望 Markdown 符号被渲染时传 text；想明确用富文本时传 markdown。"
                         }
                     },
                     "required": ["content"]
@@ -918,6 +971,10 @@ def get_tools_definition() -> List[Dict]:
                     "每个目标需指定 type（user/group）、id（openid）、app_id（所属机器人 ID）。支持跨机器人推送。"
                     "消息末尾自动标注发起者信息。有媒体时先发媒体再单独发文本确保可见。"
                     "支持 Markdown：将 message_type 设为 \"markdown\"，正文仍填入 content。""发媒体时需同时提供 media_source 与 file_type；只发文本则无需二者。"
+                    "不传 message_type 时的默认格式由配置 TOOL_DEFAULT_MARKDOWN 决定；只有确实想发纯文本时才传 text。"
+                    "不要使用任何 HTML 语法：不支持 <b>、<i>、<u>、<br>、<p>、<div>、<span>、<a href>、<font> 等任何标签，"
+                    "也不要用 &nbsp;、&amp; 之类的 HTML 实体，写了不会被渲染，只会原样显示成乱码字符。"
+                    "需要换行就直接换行；需要加粗/斜体请改用 Markdown（**加粗**、_斜体_），需要链接请用 Markdown 的 [文字](链接)。"
                 ),
                 "parameters": {
                     "type": "object",
@@ -925,15 +982,18 @@ def get_tools_definition() -> List[Dict]:
                         "content": {
                             "type": "string",
                             "description": (
-                                "要推送的正文。纯文本与 Markdown 都统一用此参数传入，格式由 message_type 决定。"
+                                "要推送的正文。纯文本与 Markdown 都统一用此参数传入，格式由 message_type 决定，"
+                                "不传时的默认格式由配置 TOOL_DEFAULT_MARKDOWN 决定。"
                                 "Markdown 支持：# 标题、**加粗**、_斜体_、~~删除线~~、- 列表、1. 有序列表、"
                                 "> 块引用、*** 分割线、[文字](链接)、![](图片URL)。"
+                                "不要使用任何 HTML 语法（不支持 <b>、<br>、<p>、<div>、<a href> 等标签"
+                                "以及 &nbsp; 等 HTML 实体），写了不会被渲染，只会原样显示成乱码。"
                             )
                         },
                         "message_type": {
                             "type": "string",
                             "enum": ["text", "markdown"],
-                            "description": "消息格式。text=纯文本（默认）；markdown=富文本消息。"
+                            "description": "消息格式（可选）。不传时的默认格式由配置 TOOL_DEFAULT_MARKDOWN 决定：开启（默认）时按 markdown 富文本发送，关闭时按纯文本发送。想发纯文本、不希望 Markdown 符号被渲染时传 text；想明确用富文本时传 markdown。"
                         },
                         "targets": {
                             "type": "array",
@@ -986,6 +1046,10 @@ def get_tools_definition() -> List[Dict]:
                     "支持三种调度类型：one_time=一次性（按 schedule_time 执行一次）、daily=每天（每天同一时间执行）、"
                     "interval=间隔（按 interval_seconds 间隔执行）。支持多媒体推送（图片/视频/语音/文件）。"
                     "支持 Markdown：将 message_type 设为 \"markdown\"，正文仍填入 content。"
+                    "不传 message_type 时的默认格式由配置 TOOL_DEFAULT_MARKDOWN 决定；只有确实想发纯文本时才传 text。"
+                    "不要使用任何 HTML 语法：不支持 <b>、<i>、<u>、<br>、<p>、<div>、<span>、<a href>、<font> 等任何标签，"
+                    "也不要用 &nbsp;、&amp; 之类的 HTML 实体，写了不会被渲染，只会原样显示成乱码字符。"
+                    "需要换行就直接换行；需要加粗/斜体请改用 Markdown（**加粗**、_斜体_），需要链接请用 Markdown 的 [文字](链接)。"
                     "返回 task_id 供后续管理。"
                 ),
                 "parameters": {
@@ -994,15 +1058,18 @@ def get_tools_definition() -> List[Dict]:
                         "content": {
                             "type": "string",
                             "description": (
-                                "要推送的正文。纯文本与 Markdown 都统一用此参数传入，格式由 message_type 决定。"
+                                "要推送的正文。纯文本与 Markdown 都统一用此参数传入，格式由 message_type 决定，"
+                                "不传时的默认格式由配置 TOOL_DEFAULT_MARKDOWN 决定。"
                                 "Markdown 支持：# 标题、**加粗**、_斜体_、~~删除线~~、- 列表、1. 有序列表、"
                                 "> 块引用、*** 分割线、[文字](链接)、![](图片URL)。"
+                                "不要使用任何 HTML 语法（不支持 <b>、<br>、<p>、<div>、<a href> 等标签"
+                                "以及 &nbsp; 等 HTML 实体），写了不会被渲染，只会原样显示成乱码。"
                             )
                         },
                         "message_type": {
                             "type": "string",
                             "enum": ["text", "markdown"],
-                            "description": "消息格式。text=纯文本（默认）；markdown=富文本消息。"
+                            "description": "消息格式（可选）。不传时的默认格式由配置 TOOL_DEFAULT_MARKDOWN 决定：开启（默认）时按 markdown 富文本发送，关闭时按纯文本发送。想发纯文本、不希望 Markdown 符号被渲染时传 text；想明确用富文本时传 markdown。"
                         },
                         "targets": {
                             "type": "array",
@@ -1145,7 +1212,7 @@ def get_tools_definition() -> List[Dict]:
             "type": "function",
             "function": {
                 "name": "update_scheduled_push",
-                "description": "修改一个定时推送任务的内容、目标、计划时间、媒体或调度类型。只传需要修改的字段。只能修改当前机器人发起的任务，除非 allow_manage_all_push=1。",
+                "description": "修改一个定时推送任务的内容、目标、计划时间、媒体或调度类型。只传需要修改的字段。只能修改当前机器人发起的任务，除非 allow_manage_all_push=1。不要使用任何 HTML 语法：不支持 <b>、<i>、<u>、<br>、<p>、<div>、<span>、<a href>、<font> 等任何标签，也不要用 &nbsp;、&amp; 之类的 HTML 实体，写了不会被渲染，只会原样显示成乱码字符。需要换行就直接换行；需要加粗/斜体请改用 Markdown（**加粗**、_斜体_），需要链接请用 Markdown 的 [文字](链接)。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1159,6 +1226,8 @@ def get_tools_definition() -> List[Dict]:
                                 "新的消息正文（可选，不传则不修改）。纯文本与 Markdown 都统一用此参数传入，"
                                 "格式由 message_type 决定。Markdown 支持：# 标题、**加粗**、_斜体_、"
                                 "~~删除线~~、- 列表、> 块引用、*** 分割线、[文字](链接)。"
+                                "不要使用任何 HTML 语法（不支持 <b>、<br>、<p>、<div>、<a href> 等标签"
+                                "以及 &nbsp; 等 HTML 实体），写了不会被渲染，只会原样显示成乱码。"
                             )
                         },
                         "message_type": {
@@ -2368,7 +2437,8 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
     # ==================== 发送纯文本 ====================
     elif function_name == "send_text":
         # 格式与正文统一解析（content 为准，兼容 markdown_content/text_content）
-        use_markdown, payload_content = parse_message_type(arguments)
+        # 工具层默认：不传 message_type 时按 Markdown 发送（见 _default_markdown_args）
+        use_markdown, payload_content = parse_message_type(_default_markdown_args(arguments))
 
         if not payload_content or not str(payload_content).strip():
             result_content = ("错误：send_text 缺少 content 参数"
@@ -3453,7 +3523,8 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
     # ==================== 主动推送消息（含跨机器人支持 + 多媒体） ====================
     elif function_name == "push_message":
         # 格式与正文统一解析（content 为准，兼容 markdown_content/text_content）
-        use_md, body_content = parse_message_type(arguments)
+        # 工具层默认：不传 message_type 时按 Markdown 推送（见 _default_markdown_args）
+        use_md, body_content = parse_message_type(_default_markdown_args(arguments))
 
         targets = arguments.get("targets", [])
         media_source = arguments.get("media_source")
@@ -3663,7 +3734,8 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
     # ==================== 定时推送 ====================
     elif function_name == "schedule_push":
         # 格式与正文统一解析（content 为准，兼容 markdown_content/text_content）
-        use_md, body = parse_message_type(arguments)
+        # 工具层默认：不传 message_type 时按 Markdown 建立任务（见 _default_markdown_args）
+        use_md, body = parse_message_type(_default_markdown_args(arguments))
         targets = arguments.get("targets", [])
         schedule_type = arguments.get("schedule_type", "one_time")
         schedule_time = arguments.get("schedule_time", "")
