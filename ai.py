@@ -1126,6 +1126,7 @@ def build_system_prompt(thread_key: str, user_message: str, username: str,
     )
     return system_prompt
 
+
 # ==================== 生成回复（含记忆注入 + 群禁言状态 + 工具提示，支持 msg_id，支持复用上下文） ====================
 async def generate_reply(
     thread_key: str,
@@ -1147,6 +1148,9 @@ async def generate_reply(
     task_start: 本轮对话「最初」开始时的历史条数。首次调用传 None（自动取当前值）；
       被消息打断后重新调用时，由调用方把首次的值传回来 —— 否则反复打断会让
       起点不断后移，「已发送消息」清单失效、模型重复回复。
+
+    注意：本函数发出的文本回复**不带引用**。是否引用完全由 AI 自主决定 ——
+      需要引用时由模型调用 send_text 并自行传 quote_msg_idx（见 tool.py）。
     """
     ctx = LogCtx(app_id=bot_client.app_id, thread_key=thread_key, msg_id=msg_id or "")
 

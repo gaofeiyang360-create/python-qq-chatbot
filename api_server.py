@@ -334,7 +334,8 @@ STRICT_PARAMS = {
     "/api/users":         {"app_id", "search", "key"},
     "/api/send":          {"target_type", "target_id", "app_id",
                            "content", "message_type", "markdown", "markdown_content",
-                           "media_source", "file_type", "file_name", "key"},
+                           "media_source", "file_type", "file_name",
+                           "quote_msg_idx", "key"},
     "/api/bot_state":     {"target_id", "app_id", "key"},
     "/api/mute/status":   {"target_id", "app_id", "with_names", "key"},
     "/api/revoke":        {"target_type", "target_id", "message_ids", "app_id", "key"},
@@ -1013,6 +1014,11 @@ async def h_send(request: web.Request) -> web.Response:
       {target_type, target_id, message_type:"markdown", markdown_content:"# 标题..."}
       {target_type, target_id, message_type:"markdown", content:"# 标题..."}   ← 与普通消息一致
       markdown 也可传对象：{"content": "..."} 或 {"custom_template_id":"...","params":[...]}
+
+    引用回复：传 quote_msg_idx（被引用消息的 msg_idx，形如 REFIDX_xxxxxx==），
+      本条消息即以「引用」形式展示。注意取值是**索引**而非 msg_id —— 官方
+      message_reference.message_id 接收的是索引，传 msg_id 会被判为无效引用。
+      索引可从 /api/history 返回的 msg_idx 字段获取。
     """
     auth = request["auth"]
     app_id, err = _resolve_app_id(auth, request)
@@ -1033,6 +1039,8 @@ async def h_send(request: web.Request) -> web.Response:
     media_source = body.get("media_source")
     file_type = body.get("file_type")
     file_name = body.get("file_name")
+    # 引用回复：被引用消息的 msg_idx（REFIDX_...），不是 msg_id
+    quote_msg_idx = str(body.get("quote_msg_idx") or "").strip() or None
 
     # ---------- Markdown ----------
     markdown = body.get("markdown")
@@ -1091,6 +1099,7 @@ async def h_send(request: web.Request) -> web.Response:
             "file_type": file_type,
             "file_name": file_name,
             "msg_id": None,
+            "quote_msg_idx": quote_msg_idx,
         }
         if use_md:
             send_kwargs["markdown"] = markdown
@@ -1133,12 +1142,14 @@ async def h_send(request: web.Request) -> web.Response:
     except Exception as e:
         warn(f"[API] 写入历史失败: {e}", ctx=ctx)
 
-    info(f"[API] 主动发送成功 app={app_id} {thread_key} msg_id={send_id}", ctx=ctx)
+    info(f"[API] 主动发送成功 app={app_id} {thread_key} msg_id={send_id}"
+         + (f" 引用={quote_msg_idx}" if quote_msg_idx else ""), ctx=ctx)
     return ok({
         "app_id": app_id,
         "thread_key": thread_key,
         "msg_id": send_id,
         "msg_idx": send_idx,
+        "quote_msg_idx": quote_msg_idx,
         "media_url": media_source or None,
     })
 

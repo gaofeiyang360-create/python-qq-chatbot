@@ -6,6 +6,7 @@ import asyncio
 import requests
 import json as _json
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta, timezone
 
@@ -111,6 +112,37 @@ def _safe_int(value, default: int = 0) -> int:
         return 1
     if s in ("no", "false", "off", "否", "关", "n", "f"):
         return 0
+    try:
+        return int(float(s))     # 兼容 "1.0" / "3.7"
+    except (ValueError, TypeError, OverflowError):
+        return default
+
+
+def _safe_count(value, default: int = 0) -> int:
+    """把模型给的「数量 / 偏移」类参数安全转成 int。
+
+    与 _safe_int 的区别：**不把真值词当成 1**。
+    _safe_int 是为开关（confirm / dry_run / use_file）设计的 —— 那里
+    "yes" 等价于 1 是正确的；但用在 limit/offset 上就成了 bug：
+    模型传 limit="yes" 会变成"只返回 1 首"，而它本意显然是没给出有效数字。
+
+    语义：
+      - int / float / 纯数字字符串（含 "10"、"3.7"）→ 取整数值
+      - 其它一律 → default（调用方再按业务钳制范围）
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        # True/False 在数量位置上没有意义，按未提供处理
+        return default
+    if isinstance(value, (int, float)):
+        try:
+            return int(value)
+        except (ValueError, OverflowError):
+            return default
+    s = str(value).strip()
+    if not s:
+        return default
     try:
         return int(float(s))     # 兼容 "1.0" / "3.7"
     except (ValueError, TypeError, OverflowError):
@@ -581,6 +613,40 @@ def _default_markdown_args(arguments: dict) -> dict:
     return args
 
 
+# ==================== 网易云音乐：判断重定向是否指向「404 页」 ====================
+def _is_netease_404(url: str) -> bool:
+    """判断网易云音乐外链的真实重定向地址是否指向其 404 页（= VIP/不可播放）。
+
+    背景：play_music 通过 `requests.get(..., allow_redirects=False)` 拿 Location，
+    网易对 VIP/下架歌曲会重定向到 https://music.163.com/404 这类地址。
+    判定必须**精确**，不能用 `"404" in url` —— 那是整串子串匹配，
+    而网易 CDN 路径里出现 404 这三个数字完全正常（歌曲ID/哈希/时间戳），
+    一旦命中就会把能正常播放的歌误报成「VIP歌曲」，用户侧表现为
+    「明明能听却提示要会员」。
+
+    规则：主机为 music.163.com（或其子域）且路径首段为 404，才算 404 页。
+    非 music.163.com 的其它域名（如 m801.music.126.net 的 CDN）一律不算，
+    因为那一定是真实音频地址。
+
+    解析失败时返回 False（宁可当作可播放去试，也不误判为 VIP）。
+    """
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+
+    host = (parsed.netloc or "").split("@")[-1].split(":")[0].lower()
+    # 仅限网易主站及其子域（music.163.com / *.music.163.com）
+    if host != "music.163.com" and not host.endswith(".music.163.com"):
+        return False
+
+    # 路径去掉首尾斜杠后取第一段，必须正好是 "404"
+    first_seg = parsed.path.strip("/").split("/")[0]
+    return first_seg == "404"
+
+
 # ==================== 默认请求头（通用） ====================
 DEFAULT_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -643,6 +709,10 @@ def get_tools_description() -> str:
     base_desc += (" 可使用 query_history 查询聊天历史记录。支持多关键词搜索（keywords 数组，OR 逻辑）、按时间范围过滤（start_time/end_time RFC3339）。"
                    "可跨机器人跨群查询：传入 app_id 指定目标机器人（如 \"1905417157\"）、target_type=\"group\"/\"c2c\"、target_id 为目标openid，即可读取任意机器人的任意群/私聊聊天记录（受 ALLOW_CROSS_BOT_HISTORY/INCOMING 配置约束）。"
                    "如果不传跨群参数则默认查询当前会话的记录。")
+    base_desc += (" 需要以「引用」形式回复某条消息时（例如群里多人同时提问、要明确你在回应哪一句），"
+                   "用 send_text 并传 quote_msg_idx=该条消息的 msg_idx（query_history 结果里的 msg_idx=... 即是，"
+                   "形如 REFIDX_xxxxxx==；注意不是 msg_id）。是否引用、引用哪一条完全由你自己判断，"
+                   "不传就是不引用。\n")
     base_desc += (" 可使用 search_memory 搜索记忆库，传入多个关键词和可选的记忆层级（global=全局, bot=机器人, group=群聊, c2c=私聊, all=全部），按相关性返回匹配的记忆内容。")
     base_desc += (" 可使用 revoke_message 撤回消息，支持传入单条或多条消息ID进行批量撤回。"
                    "支持跨机器人撤回：传入 app_id=目标机器人APP_ID（如 \"1905417157\"）、target_type + target_id 指定目标会话，即可撤回其他机器人发在群里的消息（受 ALLOW_CROSS_BOT_HISTORY/INCOMING 配置约束）。"
@@ -762,7 +832,7 @@ def get_tools_definition() -> List[Dict]:
                             "description": "文件名（必填），用于辅助判断类型和显示，请带上正确的扩展名。"
                         }
                     },
-                    "required": ["source", "file_type"]
+                    "required": ["source", "file_type", "file_name"]
                 }
             }
         },
@@ -797,6 +867,18 @@ def get_tools_definition() -> List[Dict]:
                             "type": "string",
                             "enum": ["text", "markdown"],
                             "description": "消息格式（可选）。不传时的默认格式由配置 TOOL_DEFAULT_MARKDOWN 决定：开启（默认）时按 markdown 富文本发送，关闭时按纯文本发送。想发纯文本、不希望 Markdown 符号被渲染时传 text；想明确用富文本时传 markdown。"
+                        },
+                        "quote_msg_idx": {
+                            "type": "string",
+                            "description": (
+                                "引用回复（可选）。填写后本条消息会以「引用」形式展示，并关联到被引用的那条消息。"
+                                "取值是被引用消息的 msg_idx（形如 REFIDX_xxxxxx==），**不是** msg_id —— 两者不能混用，"
+                                "传 msg_id 会被服务端判为无效引用。"
+                                "索引获取：调用 query_history 查看聊天记录，每条消息后面的 msg_idx=... 即为可用索引；"
+                                "机器人与用户的历史消息都可用。"
+                                "是否需要引用、引用哪一条，完全由你自行判断（例如群里多人同时提问、需要明确"
+                                "你在回应哪一句时），无所谓就不传该参数。"
+                            )
                         }
                     },
                     "required": ["content"]
@@ -874,7 +956,7 @@ def get_tools_definition() -> List[Dict]:
                         },
                         "limit": {
                             "type": "integer",
-                            "description": "返回结果数量，默认10，最大30"
+                            "description": "返回结果数量，默认10"
                         },
                         "offset": {
                             "type": "integer",
@@ -1112,7 +1194,7 @@ def get_tools_definition() -> List[Dict]:
                         },
                         "file_name": {
                             "type": "string",
-                            "description": "文件名（必填），辅助判断媒体类型，请带上正确的扩展名。"
+                            "description": "文件名，辅助判断媒体类型，请带上正确的扩展名。仅在同时传了 media_source（要发媒体）时填写；只发纯文本/Markdown 时不要传。"
                         }
                     },
                     "required": ["content", "targets", "file_type"]
@@ -1276,7 +1358,7 @@ def get_tools_definition() -> List[Dict]:
                         },
                         "file_name": {
                             "type": "string",
-                            "description": "文件名（必填），请带上正确的扩展名。"
+                            "description": "文件名，请带上正确的扩展名。仅在本次修改要更换媒体（传了 media_source）时填写；只改文字或时间时不要传。"
                         }
                     },
                     "required": ["task_id"]
@@ -2447,10 +2529,14 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
         elif not recipient_id:
             result_content = "错误：无法获取当前会话的接收者ID，请检查上下文"
         else:
+            # 引用回复：只接受被引用消息的 msg_idx（REFIDX_...），不是 msg_id
+            quote_msg_idx = str(arguments.get("quote_msg_idx") or "").strip() or None
+
             send_kwargs = {
                 "msg_type": msg_type,
                 "recipient_id": recipient_id,
                 "msg_id": msg_id,
+                "quote_msg_idx": quote_msg_idx,
             }
             if use_markdown:
                 send_kwargs["markdown"] = payload_content
@@ -2463,6 +2549,8 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                 send_id = bot_client.get_last_send_id()
                 send_msg_idx = bot_client.get_last_send_msg_idx()
                 result_content = f"{kind}发送成功（长度 {len(str(payload_content))} 字）\n消息ID: {send_id}"
+                if quote_msg_idx:
+                    result_content += f"\n已引用消息索引: {quote_msg_idx}"
                 # 将实际发送的内容写入历史记录
                 if thread_key:
                     append_message(thread_key, "assistant", payload_content,
@@ -2498,8 +2586,20 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
     # ==================== 搜索音乐（禁用压缩，避免乱码） ====================
     elif function_name == "search_music":
         keywords = arguments.get("keywords")
-        limit = arguments.get("limit", 10)
-        offset = arguments.get("offset", 0)
+        # limit / offset 是"数量/偏移"而非开关，不能直接用 _safe_int：
+        # 它把 "yes"/"on"/"是" 这类真值词映射成 1，那是为 confirm/dry_run
+        # 这类开关设计的语义，用在 limit 上会把 "yes" 变成"只要1首"。
+        # 这里只认真正的数字，其余（含 "yes"、中文、乱码）一律回退默认值。
+        limit = _safe_count(arguments.get("limit", 10), default=10)
+        offset = _safe_count(arguments.get("offset", 0), default=0)
+        # 负偏移会被网易接口当作非法参数（可能返回空结果或报错），
+        # 语义上也只可能是模型笔误，统一夹到 0。
+        if offset < 0:
+            offset = 0
+        # limit 仅保证为正数：描述里没有承诺上限（刻意不设），
+        # 但 0/负数会让接口返回空列表，与"想搜索"的意图相悖，故回退默认值。
+        if limit <= 0:
+            limit = 10
         if not keywords:
             result_content = "错误：search_music 缺少 keywords 参数"
         else:
@@ -2547,8 +2647,13 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
         song_id = arguments.get("song_id")
         caption = arguments.get("caption", "")
         use_file = arguments.get("use_file", 0)  # 默认 0
-        # 转换为布尔值
-        force_file = bool(use_file) or use_file == "1" or use_file == 1
+        # 统一转成布尔：schema 上是整数 0/1，但模型/API 调用方可能传来
+        # "1"、"true"、true 等写法，一并视为"强制文件模式"。
+        # 原写法 `bool(use_file) or use_file == "1" or use_file == 1` 中，
+        # 后两项已被 bool(use_file) 完全覆盖（永远不可能单独起作用），
+        # 且 bool("0") 为 True —— 传字符串 "0" 会被误判成"强制文件"，
+        # 因此这里显式列举"真"的取值，而不是依赖真值判断。
+        force_file = use_file in (1, "1", True, "true", "True", "yes")
 
         if not song_id:
             result_content = "错误：play_music 缺少 song_id 参数"
@@ -2568,7 +2673,12 @@ async def execute_tool_call(tool_call: Dict, bot_client, group_id: str = None,
                     real_url = resp.headers.get("Location")
                     if not real_url:
                         result_content = "获取音乐链接失败，未找到重定向地址。"
-                    elif "404" in real_url or "music.163.com/404" in real_url:
+                    elif _is_netease_404(real_url):
+                        # 只有「指向网易 404 页」才算 VIP/不可播放。
+                        # 原先写的是 `"404" in real_url`，这是整串子串匹配 ——
+                        # 网易 CDN 路径里出现 404 三个数字（歌曲ID/哈希/时间戳）
+                        # 会把可正常播放的歌误判成 VIP 歌曲，因此收紧为
+                        # 「主机是 music.163.com 且路径为 /404」的精确判定。
                         result_content = f"该歌曲（ID: {song_id}）为VIP歌曲或无法播放，请尝试其他版本。"
                     else:
                         file_name = "1.mp3"

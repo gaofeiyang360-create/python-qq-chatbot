@@ -946,6 +946,11 @@ def render_history_for_ai(msg: Dict) -> Dict:
     模型需要的是可读的一行 "[时间]昵称(id): 正文"，而存储层保持结构化。
     同时剥离只服务于 API/撤回的元数据字段。
 
+    例外：msg_id 与 msg_idx 会被**保留**下来，以 "\\n[msg_id=... | msg_idx=...]"
+    的形式追加在正文末尾（仅模型可见，存储层不写这些后缀），
+    让模型能直接用它们撤回消息、或作为 send_text 的 quote_msg_idx 做引用。
+    其余字段（ref_msg_idx / is_markdown / is_wakeup / media_url 等）仍然剥离。
+
     被标记 is_hide=1 的记录返回 None，表示「这条不应出现在上下文里」，
     由调用方过滤掉（见 strip_message_meta / get_history）。
     不在这里直接抛异常或返回空对象：那会让模型看到一条空消息，
@@ -975,7 +980,25 @@ def render_history_for_ai(msg: Dict) -> Dict:
     if m.get("revoked") and not str(body).startswith("[已撤回]"):
         prefix = "[已撤回]"
 
-    out = {"role": role, "content": f"{prefix}{header}{body}"}
+    # 末尾追加本条消息的 ID 元信息（仅模型可见，存储层不写这些后缀）：
+    #   msg_id  → 服务端消息 ID，撤回、判断"这条是否真发出去了"时用
+    #   msg_idx → 引用索引（REFIDX_...），send_text 的 quote_msg_idx 用它
+    # 两者是不同东西，都给出，避免模型拿 msg_id 去引用（会被判无效引用）。
+    # 放在正文**末尾**（不是行首）：正文里的换行/列表不会被这个后缀打断，
+    # 前缀行仍保持"[时间]昵称(id): 正文"的既有可读形态。
+    # tool 消息（工具调用结果）不追加 —— 它们本就不是"用户可见的消息"，
+    # 且 content 里常已自带消息 ID，再加一遍纯属噪音。
+    suffix = ""
+    if role != "tool":
+        meta = []
+        if m.get("msg_id"):
+            meta.append(f"msg_id={m['msg_id']}")
+        if m.get("msg_idx"):
+            meta.append(f"msg_idx={m['msg_idx']}")
+        if meta:
+            suffix = "\n[" + " | ".join(meta) + "]"
+
+    out = {"role": role, "content": f"{prefix}{header}{body}{suffix}"}
     # tool 消息的 tool_call_id 必须保留，否则回放上下文的工具调用链会断
     if m.get("tool_call_id"):
         out["tool_call_id"] = m["tool_call_id"]
@@ -1067,9 +1090,12 @@ def strip_message_meta(msg: Dict) -> Dict:
     """把一条历史记录渲染为「发给 AI」的 messages 条目。
 
     保留此函数名以兼容既有调用点；实际工作已交给 render_history_for_ai
-    （它会剥离 msg_id / msg_idx / ref_msg_idx / is_markdown / is_wakeup /
-    media_url / username / user_id / ts 等仅服务于 API 与展示的字段，
+    （它会剥离 ref_msg_idx / is_markdown / is_wakeup / media_url /
+    username / user_id / ts 等仅服务于 API 与展示的字段，
     并把 ts 与用户名拼回 content）。
+
+    注意：msg_id 与 msg_idx **不剥离**，会以 "[msg_id=... | msg_idx=...]"
+    追加在正文末尾，供模型撤回消息 / 引用回复（用户消息与机器人消息都有）。
 
     对 is_hide=1 的记录返回 None（filter_hidden_for_ai 会据此剔除）。
     """

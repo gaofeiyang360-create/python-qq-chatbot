@@ -65,6 +65,17 @@ DEFAULT_CONFIG = {
     #       识别转后台继续跑完并写缓存，AI 可自行调 recognize_media 命中缓存
     "MEDIA_BLOCK": 0,
     "TOOL_CHOICE": 1,                         # 工具调用策略：1=每次必须调用工具（required），0=不强制（auto）
+    # 大文件分块上传兜底（实时读取，改完即生效）：
+    #   URL 直传（/files 带 url）失败时，是否允许自动「先下载到本地、再走官方分片上传」重试。
+    #   1 = 开启（默认）：直传失败后自动兜底，仅对不超过 CHUNK_UPLOAD_MAX_SIZE(200MB) 的文件生效；
+    #   0 = 关闭：直传失败即判定失败，不下载、不占用磁盘与带宽。
+    #   关闭后 client.upload_media_chunked 也不会被调用。
+    "ENABLE_CHUNKED_UPLOAD": 1,
+    # 分块上传兜底的下载重试次数（实时读取，改完即生效）。
+    # 含义：单次下载「含首次在内」最多尝试几次，用于网络中断/超时/5xx 的自动重试。
+    #   1 = 不重试（失败即放弃）；2 = 最多两次（默认）；上限 10。
+    # 不适用于「文件超上限」与「HTTP 4xx」——那两类重试不会变好，一律不重试。
+    "CHUNK_UPLOAD_DOWNLOAD_RETRIES": 2,
     # 工具层消息默认格式：1=send_text/push_message/schedule_push 不传 message_type 时按 Markdown 发送（默认）
     #                   0=不传时按纯文本发送（早期行为）
     # 实时读取，改完即生效；只影响 AI 工具，不影响 api_server 的 /api/push（那里不传仍为纯文本）
@@ -568,6 +579,50 @@ def get_tool_default_markdown() -> int:
         return 1
 
 
+def get_enable_chunked_upload() -> int:
+    """大文件分块上传兜底开关（实时读取 config.json，无需重启）。
+
+    1 = 开启（默认）：URL 直传失败后，自动「下载到本地 → 官方分片上传」重试，
+        仅对不超过 client.CHUNK_UPLOAD_MAX_SIZE（200MB）的文件生效；
+    0 = 关闭：直传失败即判定失败，不下载任何内容。
+
+    取值兼容字符串写法（"0"/"1"/"true"/"false" 等），无法识别时按默认 1 处理。
+    """
+    raw = get_config().get("ENABLE_CHUNKED_UPLOAD", 1)
+    if isinstance(raw, bool):
+        return 1 if raw else 0
+    try:
+        return 1 if int(raw) else 0
+    except (TypeError, ValueError):
+        s = str(raw).strip().lower()
+        if s in ("false", "no", "off", "否", "关", "n", "f"):
+            return 0
+        if s in ("true", "yes", "on", "是", "开", "y", "t"):
+            return 1
+        return 1
+
+
+def get_chunk_upload_download_retries() -> int:
+    """分块上传兜底的下载重试次数（实时读取 config.json，无需重启）。
+
+    语义是「含首次在内最多尝试几次」：
+      1 = 不重试；2 = 最多两次（默认）；上限 CHUNK_UPLOAD_DOWNLOAD_RETRIES_MAX。
+
+    只对可重试的失败生效（网络中断 / 超时 / HTTP 5xx）；
+    「超过大小上限」与「HTTP 4xx」一律不重试。
+
+    取值做上下限钳制：配 0 或负数没有意义（等于一次都不试），
+    配成很大的数则会长时间卡住发送流程（每次失败都要等待退避+超时），
+    因此统一夹到 [1, 10]。非法值回退默认 2。
+    """
+    raw = get_config().get("CHUNK_UPLOAD_DOWNLOAD_RETRIES", 2)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 2
+    return max(1, min(CHUNK_UPLOAD_DOWNLOAD_RETRIES_MAX, value))
+
+
 # ==================== 日志配置获取 ====================
 def get_enable_log() -> int:
     """获取是否启用文件日志：0=禁用（仅控制台），1=启用"""
@@ -799,6 +854,12 @@ _executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 def get_executor() -> ThreadPoolExecutor:
     return _executor
 
+
+# ==================== 分块上传兜底的参数上限 ====================
+# CHUNK_UPLOAD_DOWNLOAD_RETRIES 允许配置的最大值。
+# 每次失败都要等「退避 + 下载超时」才结束，次数配得过大等于把
+# 一次发送拖成几十分钟，因此设硬上限并在 getter 里钳制。
+CHUNK_UPLOAD_DOWNLOAD_RETRIES_MAX = 10
 
 # ==================== 数据目录 ====================
 MEMORY_FILE = BASE_DIR / "memory.json"

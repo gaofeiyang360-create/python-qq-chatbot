@@ -3,15 +3,130 @@
 import json
 import time
 import asyncio
+import hashlib
 import requests
 import websockets
 import os
+import shutil
+import tempfile
+from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, List
+from urllib.parse import urlparse
 
 from config import (get_executor, get_bot_name, set_bot_name, get_bots,
-                    get_bot_enabled, get_media_block)
+                    get_bot_enabled, get_media_block, get_enable_chunked_upload,
+                    get_chunk_upload_download_retries,
+                    MEDIA_CACHE_DIR)
 from log import info, warn, error, debug, LogCtx
 from utils import infer_file_type, needs_dual_send
+
+
+# ==================== 大文件分块上传（URL 直传失败后的兜底通道） ====================
+# 官方 URL 直传（/files 带 url 字段）要求 QQ 服务端能自己去拉那个 URL，
+# 对防盗链、需要鉴权、内网地址、以及大文件都容易失败。兜底方案是：
+#   本机把文件下载下来 → 走官方分片上传 → 拿到 file_info。
+# 分片上传三步（单聊用 /v2/users/...，群聊用 /v2/groups/...，路径仅前缀不同）：
+#   1) POST /v2/{users|groups}/{openid}/upload_prepare   取 upload_id + 分片预签名地址
+#   2) PUT  <presigned_url> 传数据；再 POST /upload_part_finish 上报该片
+#   3) POST /v2/{users|groups}/{openid}/files           带 upload_id 换取 file_info
+#
+# 仅当直传失败且文件不超过 CHUNK_UPLOAD_MAX_SIZE 时才走这条路，避免为了
+# 一个几百 MB 的文件白下载一场。
+
+# 触发下载重试的大小上限（200MB）。超过此值不下载，直接判定失败。
+CHUNK_UPLOAD_MAX_SIZE = 200 * 1024 * 1024
+
+# 探测远端大小时的超时（秒）。HEAD 被拒时会退化为 GET 流式读首块。
+_REMOTE_SIZE_PROBE_TIMEOUT = 20
+
+# 下载整体超时（秒）与单次读块大小
+_DOWNLOAD_TIMEOUT = 600
+_DOWNLOAD_CHUNK = 1024 * 1024
+
+# 分片 PUT / finish 的重试次数
+_CHUNK_RETRIES = 3
+
+# 下载网络失败的重试次数现由配置项 CHUNK_UPLOAD_DOWNLOAD_RETRIES 实时决定
+# （见 config.get_chunk_upload_download_retries，默认 2，范围 [1,10]）。
+# 仅对可重试的失败生效：网络中断/超时/5xx 会重试；
+# 超过大小上限与 HTTP 4xx 不重试（重试也不会变好）。
+# 调用点：_download_to_temp —— 每次都重新读配置，改完即生效。
+
+# 临时文件目录（分块上传需要真实文件落盘）。放在 media_cache 下，
+# 与项目其他缓存同级，便于运维统一清理。
+UPLOAD_TMP_DIR = MEDIA_CACHE_DIR / "_upload_tmp"
+
+
+class _DownloadTooLarge(Exception):
+    """下载过程中发现文件超过上限。用于把「超限」从下载线程里抛出来，
+    与普通网络异常区分开 —— 两者都需要删除临时文件，但日志语义不同。"""
+
+    def __init__(self, size: int):
+        super().__init__(f"文件超过上限（已下载 {size} 字节）")
+        self.size = size
+
+
+def _fmt_mb(n: int) -> str:
+    """把字节数格式化成 MB 字符串，仅用于日志。"""
+    try:
+        return f"{int(n) / 1024 / 1024:.2f}MB"
+    except Exception:
+        return "?"
+
+
+def _probe_remote_size(url: str) -> Optional[int]:
+    """探测远端文件大小（字节）。拿不到返回 None（表示"未知"，不是"太大"）。
+
+    先试 HEAD（大多数站点会返回 Content-Length）；被拒或没有该头时，
+    退化为 GET 流式只读首块、从响应头里取 Content-Length。
+
+    注意：这里**不下载正文**（HEAD 无正文；GET 只读一次就关闭），
+    因此即便目标是几百 MB 也不会产生实际流量。
+    """
+    try:
+        r = requests.head(url, timeout=_REMOTE_SIZE_PROBE_TIMEOUT, allow_redirects=True)
+        if r.status_code < 400:
+            cl = r.headers.get("Content-Length")
+            if cl and str(cl).isdigit():
+                return int(cl)
+    except Exception:
+        pass
+
+    # HEAD 不可用（405/403/无 Content-Length）→ 用 GET 流式拿响应头
+    try:
+        with requests.get(url, timeout=_REMOTE_SIZE_PROBE_TIMEOUT,
+                          stream=True, allow_redirects=True) as r:
+            cl = r.headers.get("Content-Length")
+            if cl and str(cl).isdigit():
+                return int(cl)
+    except Exception:
+        pass
+    return None
+
+
+def _sha1_and_md5(path: Path) -> Tuple[str, str, str]:
+    """流式计算文件的 md5 / sha1 / md5_10m，返回 (md5, sha1, md5_10m)。
+
+    md5_10m 是官方要求的前 10,002,432 字节的 md5（不是 10MB=10485760）。
+    分块读取（8MB/次），避免大文件一次性读进内存。
+    """
+    MD5_10M_SIZE = 10_002_432
+    md5 = hashlib.md5()
+    sha1 = hashlib.sha1()
+    md5_10m = hashlib.md5()
+    read_10m = 0
+    with open(path, "rb") as f:
+        while True:
+            buf = f.read(8 * 1024 * 1024)
+            if not buf:
+                break
+            md5.update(buf)
+            sha1.update(buf)
+            if read_10m < MD5_10M_SIZE:
+                take = min(len(buf), MD5_10M_SIZE - read_10m)
+                md5_10m.update(buf[:take])
+                read_10m += take
+    return md5.hexdigest(), sha1.hexdigest(), md5_10m.hexdigest()
 
 
 # 正在处理的消息任务集合（持有引用，防止任务被 GC 提前回收）。
@@ -22,6 +137,47 @@ _message_tasks: set = set()
 # create_task 的返回值若不持有，任务可能在运行中被 GC 回收 —— 心跳一旦
 # 被回收，连接就不会再发 op=1，服务端会在心跳超时后判定掉线并断开。
 _background_tasks: set = set()
+
+
+def _derive_media_name(source: str, file_name: Optional[str] = None) -> str:
+    """推导媒体文件名，规则固定为：**传入优先，其次从 URL 推导，最后兜底**。
+
+    三级回退：
+      1) file_name  —— 调用方显式传入的名字，优先级最高，有值就一定用它，
+                       **不会被 URL 里的名字覆盖**（本例最容易踩的坑）；
+      2) URL 路径的最后一段 —— urlparse 取 path，自动剥离 ?query；
+      3) "media"   —— 前两者都拿不到时的兜底，保证返回值永不为空。
+
+    细节与理由：
+      - 空串 / 纯空白视为「没传」：调用方常用 "" 表示未指定，
+        因此这里先 strip 再判真值，与既有的 `file_name or ...` 行为一致；
+      - 传 "  x.bin  " 这类带空白的名字会被 strip，避免生成带空格的文件名；
+      - URL 以 / 结尾（如 https://x.com/a/b/）时 Path().name 得 "b" 而非空，
+        名字不好看但可用；
+      - 只有域名或根路径（https://x.com、https://x.com/）时 path 为 "" 或 "/",
+        落到兜底 "media"。
+
+    返回值保证是非空字符串，调用方无需再判空。
+    """
+    # ---- 1. 传入优先 ----
+    name = ""
+    try:
+        name = str(file_name).strip() if file_name else ""
+    except Exception:
+        name = ""
+    if name:
+        return name
+
+    # ---- 2. 从 URL 推导（去掉查询串，只取路径最后一段）----
+    try:
+        derived = Path(urlparse(source or "").path).name
+        if derived:
+            return derived
+    except Exception:
+        pass
+
+    # ---- 3. 兜底 ----
+    return "media"
 
 
 def _spawn_background(coro, name: str, ctx=None):
@@ -132,6 +288,458 @@ class BotClient:
         return await loop.run_in_executor(get_executor(), self.get_websocket_url)
 
     # ========== 媒体上传（仅支持 URL 直接上传） ==========
+    async def _download_to_temp(self, source: str, file_name: Optional[str],
+                                ctx: LogCtx) -> Tuple[Optional[Path], Optional[str]]:
+        """把远端文件下载到临时目录，返回 (临时文件路径, 错误信息)。
+
+        网络中断等**可重试**失败会按配置 CHUNK_UPLOAD_DOWNLOAD_RETRIES
+        （实时读取，默认 2，含首次在内）重试；每次尝试都是全新的临时文件，
+        不会把两次的字节拼在一起。
+
+        以下两类**不重试**（重试没有意义，只会浪费时间/流量）：
+          - 文件超过上限（_DownloadTooLarge）：内容本身就不合规；
+          - HTTP 4xx（如 404/403）：URL 或权限问题，重试结果一样。
+
+        成功时调用方**必须**负责删除返回的临时文件（见 upload_media_chunked
+        的 finally）。失败返回 (None, 原因)。
+        """
+        loop = asyncio.get_event_loop()
+        try:
+            UPLOAD_TMP_DIR.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            return None, f"无法创建临时目录 {UPLOAD_TMP_DIR}: {e}"
+
+        # 文件名保留原扩展名，便于服务端后续按名字识别类型。
+        # 走共用的 _derive_media_name（传入优先 → URL 推导 → media），
+        # 保证与下面 upload_media_chunked 里给 QQ 用的名字同源、规则一致。
+        suffix = ""
+        try:
+            suffix = Path(_derive_media_name(source, file_name)).suffix
+        except Exception:
+            suffix = ""
+
+        def _attempt() -> Path:
+            """单次下载尝试。失败会删掉自己的临时文件再抛出。"""
+            # delete=False：句柄关闭后文件仍需存在，由调用方删除
+            fd, tmp_name = tempfile.mkstemp(prefix="qqup_", suffix=suffix,
+                                            dir=str(UPLOAD_TMP_DIR))
+            os.close(fd)
+            tmp_path = Path(tmp_name)
+            total = 0
+            try:
+                with requests.get(source, timeout=_DOWNLOAD_TIMEOUT,
+                                  stream=True, allow_redirects=True) as r:
+                    r.raise_for_status()
+
+                    # 若响应头就带了 Content-Length 且已超限，连第一个字节都不用写
+                    cl = r.headers.get("Content-Length")
+                    if cl and str(cl).isdigit() and int(cl) > CHUNK_UPLOAD_MAX_SIZE:
+                        raise _DownloadTooLarge(int(cl))
+
+                    with open(tmp_path, "wb") as f:
+                        for block in r.iter_content(chunk_size=_DOWNLOAD_CHUNK):
+                            if not block:
+                                continue
+                            total += len(block)
+                            # ★ 边下边判：拿不到 Content-Length（分块传输、
+                            #   动态生成等）时只能靠这里兜住，一旦超限立刻
+                            #   停止下载，不再继续拉取剩余字节。
+                            if total > CHUNK_UPLOAD_MAX_SIZE:
+                                raise _DownloadTooLarge(total)
+                            f.write(block)
+            except BaseException:
+                # 任何失败（含超限、网络中断）都要删掉半截文件，
+                # 否则 media_cache/_upload_tmp 会堆积垃圾。
+                # 每次尝试各自清理，重试不会留下上一次的残骸。
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
+                raise
+            return tmp_path
+
+        def _is_retryable(exc: Exception) -> bool:
+            """判断该异常是否值得重试。"""
+            # 超限不重试：内容本身超规，重试还是超
+            if isinstance(exc, _DownloadTooLarge):
+                return False
+            # HTTP 4xx 不重试（URL 错误/无权限），5xx 与网络异常可重试
+            if isinstance(exc, requests.exceptions.HTTPError) and exc.response is not None:
+                code = exc.response.status_code
+                return not (400 <= code < 500)
+            # 其余（连接中断、超时、读流中断等）一律视为可重试
+            return True
+
+        last_exc: Optional[Exception] = None
+        # 实时读取重试次数（默认 2，范围 [1,10]）：每次下载都重新读配置，
+        # 改完即生效，无需重启。读失败时回退 2，绝不因为配置异常而放弃下载。
+        try:
+            max_attempts = get_chunk_upload_download_retries()
+        except Exception:
+            max_attempts = 2
+
+        for attempt in range(max_attempts):
+            try:
+                tmp_path = await loop.run_in_executor(get_executor(), _attempt)
+            except _DownloadTooLarge as e:
+                warn(f"[分块上传] 下载中已超过上限（{_fmt_mb(e.size)} > "
+                     f"{_fmt_mb(CHUNK_UPLOAD_MAX_SIZE)}），已停止下载并删除临时文件", ctx=ctx)
+                return None, f"文件超过 {_fmt_mb(CHUNK_UPLOAD_MAX_SIZE)} 上限"
+            except Exception as e:
+                last_exc = e
+                # 不可重试的失败直接返回，不做无谓的重试
+                if not _is_retryable(e):
+                    error(f"[分块上传] 下载失败（不可重试）: {e}", ctx=ctx)
+                    return None, f"下载失败: {e}"
+                if attempt < max_attempts - 1:
+                    warn(f"[分块上传] 下载失败（{type(e).__name__}: {e}），"
+                         f"重试 {attempt + 1}/{max_attempts - 1}", ctx=ctx)
+                    await asyncio.sleep(2 * (attempt + 1))  # 递增退避
+                    continue
+                error(f"[分块上传] 下载失败，已重试 {max_attempts} 次: {e}", ctx=ctx)
+                return None, f"下载失败: {e}"
+            else:
+                break
+
+        if tmp_path is None:
+            # 理论上到不了这里（循环内每条失败路径都已 return/break），
+            # 保留兜底以防将来改动遗漏
+            return None, f"下载失败: {last_exc}"
+
+        try:
+            size = tmp_path.stat().st_size
+        except Exception as e:
+            return None, f"下载后无法读取文件: {e}"
+
+        if size <= 0:
+            # 空文件同样上传不了，且会让后续 md5 计算失去意义
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+            return None, "下载得到的文件为空"
+
+        info(f"[分块上传] 下载完成: {_fmt_mb(size)} -> {tmp_path.name}", ctx=ctx)
+        return tmp_path, None
+
+    async def _upload_prepare(self, endpoint: str, recipient_id: str, file_size: int,
+                              file_name: str, hashes: Dict[str, str],
+                              file_type: int, ctx: LogCtx) -> Optional[Dict]:
+        """Step 1：申请分片上传，返回 prepare 响应（含 upload_id 与分片地址）。"""
+        token = await self.get_access_token_async()
+        url = f"https://api.sgroup.qq.com/v2/{endpoint}/{recipient_id}/upload_prepare"
+        headers = {"Authorization": f"QQBot {token}", "Content-Type": "application/json"}
+        payload = {
+            "file_type": file_type,
+            # 官方要求 file_size 为字符串
+            "file_size": str(file_size),
+            "file_name": file_name,
+            "md5": hashes["md5"],
+            "sha1": hashes["sha1"],
+            "md5_10m": hashes["md5_10m"],
+        }
+        loop = asyncio.get_event_loop()
+        try:
+            resp = await loop.run_in_executor(
+                get_executor(),
+                lambda: requests.post(url, json=payload, headers=headers, timeout=60)
+            )
+        except Exception as e:
+            error(f"[分块上传] upload_prepare 请求异常: {e}", ctx=ctx)
+            return None
+        if resp.status_code != 200:
+            error(f"[分块上传] upload_prepare 失败，状态码 {resp.status_code}，"
+                  f"响应: {resp.text[:200]}", ctx=ctx)
+            return None
+        try:
+            data = resp.json()
+        except Exception as e:
+            error(f"[分块上传] upload_prepare 响应非 JSON: {e}", ctx=ctx)
+            return None
+        if not data.get("upload_id"):
+            error(f"[分块上传] upload_prepare 响应缺少 upload_id: {str(data)[:200]}", ctx=ctx)
+            return None
+        return data
+
+    async def _put_part_with_retry(self, presigned_url: str, data: bytes,
+                                   ctx: LogCtx) -> bool:
+        """PUT 分片数据到预签名地址（带重试）。成功返回 True。"""
+        loop = asyncio.get_event_loop()
+        for attempt in range(_CHUNK_RETRIES):
+            try:
+                # 关键：不带 Authorization —— COS 预签名 URL 自带鉴权，
+                # 额外头会导致签名不匹配。
+                resp = await loop.run_in_executor(
+                    get_executor(),
+                    lambda: requests.put(presigned_url, data=data, timeout=300)
+                )
+                if resp.status_code < 400:
+                    return True
+                warn(f"[分块上传] 分片 PUT 返回 {resp.status_code}，"
+                     f"重试 {attempt + 1}/{_CHUNK_RETRIES}", ctx=ctx)
+            except Exception as e:
+                warn(f"[分块上传] 分片 PUT 异常: {e}，重试 {attempt + 1}/{_CHUNK_RETRIES}", ctx=ctx)
+            if attempt < _CHUNK_RETRIES - 1:
+                await asyncio.sleep(2)
+        return False
+
+    async def _finish_part_with_retry(self, endpoint: str, recipient_id: str,
+                                      upload_id: str, idx: int, block_size: int,
+                                      md5: str, ctx: LogCtx) -> bool:
+        """通知服务端某分片已完成（带重试）。成功返回 True。"""
+        token = await self.get_access_token_async()
+        url = f"https://api.sgroup.qq.com/v2/{endpoint}/{recipient_id}/upload_part_finish"
+        headers = {"Authorization": f"QQBot {token}", "Content-Type": "application/json"}
+        payload = {
+            "upload_id": upload_id,
+            "part_index": idx,
+            "block_size": str(block_size),
+            "md5": md5,
+        }
+        loop = asyncio.get_event_loop()
+        for attempt in range(_CHUNK_RETRIES):
+            try:
+                resp = await loop.run_in_executor(
+                    get_executor(),
+                    lambda: requests.post(url, json=payload, headers=headers, timeout=60)
+                )
+                if resp.status_code < 400:
+                    return True
+                warn(f"[分块上传] 分片 finish 返回 {resp.status_code}: {resp.text[:150]}，"
+                     f"重试 {attempt + 1}/{_CHUNK_RETRIES}", ctx=ctx)
+            except Exception as e:
+                warn(f"[分块上传] 分片 finish 异常: {e}，重试 {attempt + 1}/{_CHUNK_RETRIES}", ctx=ctx)
+            if attempt < _CHUNK_RETRIES - 1:
+                await asyncio.sleep(2)
+        return False
+
+    async def _upload_file_chunked(self, endpoint: str, recipient_id: str, path: Path,
+                                   file_name: str, file_type: int,
+                                   ctx: LogCtx) -> Optional[str]:
+        """把一个本地文件走官方分片上传，成功返回 file_info。
+
+        流程：upload_prepare → 逐片 (PUT + upload_part_finish) → /files 换取 file_info。
+        任一步失败返回 None（调用方按整体失败处理）。
+        """
+        loop = asyncio.get_event_loop()
+
+        try:
+            file_size = path.stat().st_size
+        except Exception as e:
+            error(f"[分块上传] 无法读取文件大小: {e}", ctx=ctx)
+            return None
+
+        # 计算三个校验值（官方 upload_prepare 必填）
+        try:
+            md5, sha1, md5_10m = await loop.run_in_executor(
+                get_executor(), lambda: _sha1_and_md5(path)
+            )
+        except Exception as e:
+            error(f"[分块上传] 计算校验值失败: {e}", ctx=ctx)
+            return None
+
+        hashes = {"md5": md5, "sha1": sha1, "md5_10m": md5_10m}
+        info(f"[分块上传] 文件 {_fmt_mb(file_size)}，md5={md5[:16]}...", ctx=ctx)
+
+        # ---- Step 1 ----
+        prepare = await self._upload_prepare(endpoint, recipient_id, file_size,
+                                             file_name, hashes, file_type, ctx)
+        if not prepare:
+            return None
+
+        upload_id = prepare["upload_id"]
+        try:
+            block_size = int(prepare.get("block_size") or 0)
+        except Exception:
+            block_size = 0
+
+        # 兼容 parts / part_list 两种字段名
+        parts = None
+        for key in ("parts", "part_list"):
+            if isinstance(prepare.get(key), list):
+                parts = prepare[key]
+                break
+        if not parts:
+            error(f"[分块上传] 响应中找不到分片列表，字段: {list(prepare.keys())}", ctx=ctx)
+            return None
+        if block_size <= 0:
+            error(f"[分块上传] 响应中 block_size 无效: {prepare.get('block_size')}", ctx=ctx)
+            return None
+
+        total = len(parts)
+        info(f"[分块上传] upload_id={upload_id}，block_size={_fmt_mb(block_size)}，"
+             f"共 {total} 片", ctx=ctx)
+
+        # ---- Step 2：逐片上传 ----
+        try:
+            with open(path, "rb") as f:
+                for i, part in enumerate(parts):
+                    if not isinstance(part, dict):
+                        error(f"[分块上传] 第 {i + 1} 个分片不是对象: {part!r}", ctx=ctx)
+                        return None
+                    # 官方 index 从 1 开始；缺失时按顺序回退
+                    try:
+                        idx = int(part.get("index", i + 1))
+                    except Exception:
+                        idx = i + 1
+                    presigned_url = part.get("presigned_url") or part.get("url")
+                    if not presigned_url:
+                        error(f"[分块上传] 分片 {idx} 缺少上传地址，字段: {list(part.keys())}",
+                              ctx=ctx)
+                        return None
+
+                    # index 从 1 开始 → 文件偏移量用 (idx - 1)
+                    f.seek((idx - 1) * block_size)
+                    chunk = f.read(block_size)
+                    if not chunk:
+                        # 分片数超出文件实际大小：服务端给的列表与文件不匹配
+                        error(f"[分块上传] 分片 {idx} 读取到空数据"
+                              f"（文件可能小于服务端预期）", ctx=ctx)
+                        return None
+                    chunk_md5 = hashlib.md5(chunk).hexdigest()
+
+                    if not await self._put_part_with_retry(presigned_url, chunk, ctx):
+                        error(f"[分块上传] 分片 {idx}/{total} 上传失败", ctx=ctx)
+                        return None
+                    if not await self._finish_part_with_retry(endpoint, recipient_id, upload_id,
+                                                              idx, len(chunk), chunk_md5, ctx):
+                        error(f"[分块上传] 分片 {idx}/{total} 上报失败", ctx=ctx)
+                        return None
+
+                    if idx % 10 == 0 or idx == total:
+                        info(f"[分块上传] 进度 {idx}/{total}", ctx=ctx)
+        except Exception as e:
+            error(f"[分块上传] 分片上传异常: {e}", ctx=ctx)
+            return None
+
+        # ---- Step 3：换取 file_info ----
+        token = await self.get_access_token_async()
+        url = f"https://api.sgroup.qq.com/v2/{endpoint}/{recipient_id}/files"
+        headers = {"Authorization": f"QQBot {token}", "Content-Type": "application/json"}
+        payload = {
+            "file_type": file_type,
+            "file_name": file_name,
+            "upload_id": upload_id,
+            "srv_send_msg": False,
+        }
+        try:
+            resp = await loop.run_in_executor(
+                get_executor(),
+                lambda: requests.post(url, json=payload, headers=headers, timeout=60)
+            )
+        except Exception as e:
+            error(f"[分块上传] 换取 file_info 请求异常: {e}", ctx=ctx)
+            return None
+        if resp.status_code != 200:
+            error(f"[分块上传] 换取 file_info 失败，状态码 {resp.status_code}，"
+                  f"响应: {resp.text[:200]}", ctx=ctx)
+            return None
+        try:
+            file_info = (resp.json() or {}).get("file_info")
+        except Exception as e:
+            error(f"[分块上传] 换取 file_info 响应异常: {e}", ctx=ctx)
+            return None
+        if not file_info:
+            error(f"[分块上传] 响应缺少 file_info: {resp.text[:200]}", ctx=ctx)
+            return None
+        info(f"[分块上传] 成功，file_info: {file_info[:20]}...", ctx=ctx)
+        return file_info
+
+    async def upload_media_chunked(self, msg_type: str, recipient_id: str, source: str,
+                                   file_type: Optional[int] = None,
+                                   file_name: Optional[str] = None) -> Optional[str]:
+        """下载远端文件后走分片上传，返回 file_info；失败返回 None。
+
+        这是 URL 直传失败后的兜底通道，调用方见 upload_media_by_url。
+        仅当文件不超过 CHUNK_UPLOAD_MAX_SIZE 时才会真正下载。
+        """
+        ctx = LogCtx(app_id=self.app_id,
+                     thread_key=f"{'c2c' if msg_type == 'c2c' else 'group'}_{recipient_id}")
+
+        if file_type is None:
+            file_type = infer_file_type(file_name, source)
+
+        # ---------- 1. 先探大小：过大就不下载 ----------
+        size = await asyncio.get_event_loop().run_in_executor(
+            get_executor(), lambda: _probe_remote_size(source)
+        )
+        if size is not None and size > CHUNK_UPLOAD_MAX_SIZE:
+            warn(f"[分块上传] 文件 {_fmt_mb(size)} 超过上限 "
+                 f"{_fmt_mb(CHUNK_UPLOAD_MAX_SIZE)}，放弃下载重试", ctx=ctx)
+            return None
+        if size is None:
+            # 拿不到大小（站点不支持 HEAD、分块传输等）→ 保守尝试下载。
+            # 此时由 _download_to_temp 边下边判：一旦超过上限立刻停止并删除，
+            # 不会把超大文件完整拖到本地。
+            info("[分块上传] 无法探测文件大小，保守尝试下载（超限会立即中止）", ctx=ctx)
+        else:
+            info(f"[分块上传] 探测到文件大小 {_fmt_mb(size)}，开始下载重试", ctx=ctx)
+
+        tmp_path = None
+        try:
+            # ---------- 2. 下载到临时文件（超限会中途停止并删除） ----------
+            tmp_path, err = await self._download_to_temp(source, file_name, ctx)
+            if not tmp_path:
+                warn(f"[分块上传] {err}", ctx=ctx)
+                return None
+
+            # 兜底复核：正常路径下 _download_to_temp 已在下载途中卡住上限，
+            # 这里再核一次实际落盘大小，防止「边下边判」被绕过（例如未来
+            # 改动下载实现、或文件系统报告的大小与写入量不一致）。
+            try:
+                actual = tmp_path.stat().st_size
+            except Exception:
+                actual = 0
+            if actual > CHUNK_UPLOAD_MAX_SIZE:
+                warn(f"[分块上传] 实际下载到 {_fmt_mb(actual)} 超过上限，放弃", ctx=ctx)
+                return None
+
+            # ---------- 3. 分片上传 ----------
+            endpoint = "users" if msg_type == "c2c" else "groups"
+            # 上传用的文件名：传入优先，其次从 URL 推导，最后 media
+            # （规则集中在 _derive_media_name，返回值保证非空）
+            upload_name = _derive_media_name(source, file_name)
+            return await self._upload_file_chunked(endpoint, recipient_id, tmp_path,
+                                                   upload_name, file_type, ctx)
+        finally:
+            # 无论成败都清理临时文件，避免 media_cache/_upload_tmp 无限增长
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink()
+                    debug(f"[分块上传] 已清理临时文件 {tmp_path.name}", ctx=ctx)
+                except Exception as e:
+                    warn(f"[分块上传] 临时文件清理失败 {tmp_path}: {e}", ctx=ctx)
+
+    async def _fallback_chunked(self, msg_type: str, recipient_id: str, source: str,
+                                file_type: Optional[int], file_name: Optional[str],
+                                ctx: LogCtx, reason: str) -> Optional[str]:
+        """直传失败后的统一兜底入口：按开关决定是否走「下载 + 分片上传」。
+
+        开关 ENABLE_CHUNKED_UPLOAD 实时读取，改完即生效（无需重启）：
+          1 = 开启 → 调 upload_media_chunked（内部还会判 200MB 上限）
+          0 = 关闭 → 直接返回 None，不下载任何内容
+
+        把开关判断收在这一处，是为了三个失败分支（请求异常 / 非 200 / 无
+        file_info）行为完全一致，不会出现某个分支漏判开关的情况。
+        """
+        if not get_enable_chunked_upload():
+            warn(f"[上传URL] {reason}；分块上传兜底已关闭"
+                 f"（ENABLE_CHUNKED_UPLOAD=0），放弃", ctx=ctx)
+            return None
+        warn(f"[上传URL] {reason}；转分块上传重试...", ctx=ctx)
+        return await self.upload_media_chunked(msg_type, recipient_id, source,
+                                               file_type, file_name)
+
+    # ========== 媒体上传（URL 直传，失败后回退分块上传） ==========
+    async def upload_media_by_url(self, msg_type: str, recipient_id: str,
+                                  source: str, file_type: Optional[int] = None,
+                                  file_name: Optional[str] = None) -> Optional[str]:
+        """
+        使用官方 /files 接口直接传入 URL 上传。
+        直传失败时，若文件不超过 CHUNK_UPLOAD_MAX_SIZE，自动回退为
+        「先下载再分块上传」（见 upload_media_chunked）。
+        返回 file_info，失败返回 None。
+        """
     async def upload_media_by_url(self, msg_type: str, recipient_id: str,
                                   source: str, file_type: Optional[int] = None,
                                   file_name: Optional[str] = None) -> Optional[str]:
@@ -176,17 +784,25 @@ class BotClient:
             )
         except Exception as e:
             error(f"[上传URL] 请求异常: {e}", ctx=ctx)
-            return None
+            return await self._fallback_chunked(msg_type, recipient_id, source,
+                                                file_type, file_name, ctx,
+                                                "直传请求异常")
 
         if resp.status_code != 200:
             error(f"[上传URL] 失败，状态码 {resp.status_code}，响应: {resp.text[:200]}", ctx=ctx)
-            return None
+            # 直传失败 → 兜底走「下载 + 分块上传」（超限的文件会在其中直接放弃）
+            return await self._fallback_chunked(msg_type, recipient_id, source,
+                                                file_type, file_name, ctx,
+                                                f"直传失败（HTTP {resp.status_code}）")
 
         resp_json = resp.json()
         file_info = resp_json.get('file_info')
         if not file_info:
             warn(f"[上传URL] 响应无 file_info: {resp_json}", ctx=ctx)
-            return None
+            # 直传"成功"但拿不到 file_info，同样视为失败并兜底
+            return await self._fallback_chunked(msg_type, recipient_id, source,
+                                                file_type, file_name, ctx,
+                                                "直传响应无 file_info")
         info(f"[上传URL] 成功，file_info: {file_info[:20]}...", ctx=ctx)
         return file_info
 
@@ -238,6 +854,7 @@ class BotClient:
                            file_name: Optional[str] = None,
                            msg_seq: Optional[int] = None,   # 新增可选参数
                            markdown: Optional[Any] = None,  # Markdown 消息（msg_type=2）
+                           quote_msg_idx: Optional[str] = None,  # 引用回复：被引用消息的 msg_idx
                            max_retries: int = 3) -> Optional[str]:
         """
         发送消息，支持文本、富媒体、Markdown。
@@ -249,6 +866,15 @@ class BotClient:
           - str：自定义 markdown 文本 → {"markdown": {"content": "..."}}
           - dict：完整透传（可含 content / custom_template_id / params）
           - 模板：{"custom_template_id": "...", "params": [...]}
+
+        quote_msg_idx: 引用回复（官方 message_reference）。取值必须是**被引用消息的
+          msg_idx**（形如 REFIDX_xxxxxx==），而不是 msg_id —— 官方文档明确
+          message_reference.message_id 接收的是索引，两者不可混用：
+            - 别人发的消息：从消息事件 message_scene.ext 的 msg_idx 字段取
+              （本项目已在 parse_message 中解析并随历史记录保存）
+            - 机器人自己发的消息：从发消息响应 ext_info.ref_idx 取
+              （本项目已保存为该条历史的 msg_idx，见 get_last_send_msg_idx）
+          因此这里只接受 msg_idx；消息类型不限（文本/媒体/引用可同发）。
 
         注意：富媒体(msg_type=7)与 Markdown(msg_type=2)互斥，同时传入时富媒体优先。
         返回: 消息ID（str）表示成功，None 表示失败。
@@ -323,6 +949,17 @@ class BotClient:
                 payload["msg_seq"] = msg_seq
             if embed:
                 payload["embed"] = embed
+            # ---------- 引用回复（message_reference）----------
+            # 官方两种响应体（单聊/群聊一致）：{"message_id": "<被引用消息的 msg_idx>"}。
+            # 注意字段名是 message_id 但收的是**索引**（REFIDX_...），
+            # 传真正的消息 id 会被判为无效（40034024 / 304061），
+            # 所以参数入口就叫 quote_msg_idx，避免调用方误传 msg_id。
+            # 与 msg_id 无关：引用是"展示形式"，被动回复是"回复凭证"，两者可同时存在。
+            # 先 strip 再判空：空白串不是有效索引，落到 payload 里会变成
+            # {"message_id": ""} 被服务端判为无效引用（40034024）。
+            _quote_idx = str(quote_msg_idx).strip() if quote_msg_idx else ""
+            if _quote_idx:
+                payload["message_reference"] = {"message_id": _quote_idx}
             if is_media_msg:
                 payload["msg_type"] = 7
                 payload["media"] = media_obj
